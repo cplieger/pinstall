@@ -53,6 +53,18 @@ type command struct {
 // runCommand is the manager's process-execution seam.
 type runCommand func(ctx context.Context, c *command) ([]byte, error)
 
+// waitDelay is the grace period after a timed-out command is killed, before its
+// output pipes are force-closed.
+//
+// It is what makes the timeout a real bound. exec.CommandContext kills the child
+// on the deadline, but the wait still blocks on the output pipes — and a child
+// that forked before dying leaves a grandchild holding the write end, so without
+// a delay the call returns only when that grandchild exits. An installer script
+// backgrounding a helper is exactly that shape, so a wedged one would stall a
+// start indefinitely despite the timeout. A package variable so the tests can
+// shorten it.
+var waitDelay = 5 * time.Second
+
 // execRunner is the production runner: one bounded, context-cancellable
 // subprocess with no shell in the path.
 func execRunner(ctx context.Context, c *command) ([]byte, error) {
@@ -62,6 +74,7 @@ func execRunner(ctx context.Context, c *command) ([]byte, error) {
 	// the operator-supplied pin, never from request data, and they are passed as
 	// separate argv elements so no shell parses them.
 	cmd := exec.CommandContext(ctx, c.Path, c.Args...)
+	cmd.WaitDelay = waitDelay
 	if len(c.Env) > 0 {
 		cmd.Env = append(os.Environ(), c.Env...)
 	}

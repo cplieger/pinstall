@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -703,4 +704,123 @@ func TestWriteFileDurablyLeavesNoTempOnFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestExecRunnerBoundsAndIsolatesASubprocess pins the production runner, the one
+// boundary the harness replaces everywhere else. Every subprocess this library
+// spawns — the archive's installer, the version probe, every assertion — goes
+// through it, so its three properties are worth pinning directly: the argv is
+// passed as separate elements with no shell in the path, the extra environment is
+// appended rather than replacing the process environment, and the timeout bounds a
+// command that never returns.
+func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("no POSIX shell available: %v", err)
+	}
+	// Shortened for the two timeout cases below; without cmd.WaitDelay they run
+	// for the wedged command's full lifetime instead, which is what they detect.
+	restore := waitDelay
+	waitDelay = 100 * time.Millisecond
+	t.Cleanup(func() { waitDelay = restore })
+
+	t.Run("returns stdout and passes argv unsplit", func(t *testing.T) {
+		out, err := execRunner(context.Background(), &command{
+			Path:    sh,
+			Args:    []string{"-c", `printf '%s\n' "$1"`, "sh", "one two; three"},
+			Timeout: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("execRunner: %v", err)
+		}
+		// A shell would have split on the space and the semicolon; the runner
+		// hands the whole string over as one argv element.
+		if got := strings.TrimSpace(string(out)); got != "one two; three" {
+			t.Errorf("stdout = %q, want the argument passed through unsplit", got)
+		}
+	})
+
+	t.Run("appends the extra environment to the process environment", func(t *testing.T) {
+		out, err := execRunner(context.Background(), &command{
+			Path:    sh,
+			Args:    []string{"-c", `printf '%s|%s\n' "$PINSTALL_TEST_HOME" "${PATH:+set}"`},
+			Env:     []string{"PINSTALL_TEST_HOME=/private/home"},
+			Timeout: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("execRunner: %v", err)
+		}
+		if got, want := strings.TrimSpace(string(out)), "/private/home|set"; got != want {
+			t.Errorf("output = %q, want %q (the extra variable present AND PATH inherited)", got, want)
+		}
+	})
+
+	t.Run("stderr is folded in only when asked", func(t *testing.T) {
+		args := []string{"-c", `printf 'to-err\n' >&2; printf 'to-out\n'`}
+		quiet, err := execRunner(context.Background(), &command{Path: sh, Args: args, Timeout: 10 * time.Second})
+		if err != nil {
+			t.Fatalf("execRunner: %v", err)
+		}
+		if strings.Contains(string(quiet), "to-err") {
+			t.Errorf("output = %q, want stderr excluded without CaptureStderr", quiet)
+		}
+		loud, err := execRunner(context.Background(), &command{Path: sh, Args: args, Timeout: 10 * time.Second, CaptureStderr: true})
+		if err != nil {
+			t.Fatalf("execRunner: %v", err)
+		}
+		for _, want := range []string{"to-err", "to-out"} {
+			if !strings.Contains(string(loud), want) {
+				t.Errorf("combined output = %q, want it to carry %q", loud, want)
+			}
+		}
+	})
+
+	t.Run("a non-zero exit is an error", func(t *testing.T) {
+		if _, err := execRunner(context.Background(), &command{
+			Path: sh, Args: []string{"-c", "exit 3"}, Timeout: 10 * time.Second,
+		}); err == nil {
+			t.Error("execRunner returned nil for a command that exited non-zero")
+		}
+	})
+
+	t.Run("the timeout bounds a command that never returns", func(t *testing.T) {
+		start := time.Now()
+		_, err := execRunner(context.Background(), &command{
+			Path: sh, Args: []string{"-c", "sleep 30"}, Timeout: 50 * time.Millisecond,
+		})
+		if err == nil {
+			t.Fatal("execRunner returned nil for a command that outlived its timeout")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("execRunner took %v; the timeout did not bound the run", elapsed)
+		}
+	})
+
+	// The shape that defeats a naive timeout: the child forks a helper that
+	// inherits the output pipe and then dies. Killing the child does not close the
+	// pipe, so the wait blocks on the grandchild unless a wait delay force-closes
+	// it. Without cmd.WaitDelay this case runs for the grandchild's full lifetime.
+	t.Run("a backgrounded grandchild holding the output pipe cannot outlast the bound", func(t *testing.T) {
+		start := time.Now()
+		_, err := execRunner(context.Background(), &command{
+			Path:    sh,
+			Args:    []string{"-c", "sleep 30 & printf 'started\\n'; sleep 30"},
+			Timeout: 50 * time.Millisecond,
+		})
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("execRunner returned nil for a command that outlived its timeout")
+		}
+		if elapsed > 5*time.Second {
+			t.Errorf("execRunner took %v; the wait delay did not bound the run", elapsed)
+		}
+	})
+
+	t.Run("an absent program is an error, not a panic", func(t *testing.T) {
+		if _, err := execRunner(context.Background(), &command{
+			Path: filepath.Join(t.TempDir(), "nope"), Timeout: time.Second,
+		}); err == nil {
+			t.Error("execRunner returned nil for a program that does not exist")
+		}
+	})
 }
