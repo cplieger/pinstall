@@ -4,7 +4,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/pinstall)](https://github.com/cplieger/pinstall/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/pinstall/badges/coverage.json)](https://github.com/cplieger/pinstall/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/pinstall/badges/mutation.json)](https://github.com/cplieger/pinstall/issues?q=label%3Agremlins-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13867/badge)](https://www.bestpractices.dev/projects/13867)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/pinstall/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/pinstall)
 
 > Digest-pinned installs of an upstream release: version-addressed, revalidated, with a verdict
