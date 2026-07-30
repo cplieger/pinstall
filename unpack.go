@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/cplieger/pathinside"
 )
 
 // Extraction ceilings. A pinned archive is commonly hundreds of megabytes, so
@@ -110,6 +112,14 @@ func extractFile(entry *zip.File, dst string, budget int64) (int64, error) {
 // or any traversal rather than sanitising one: a legitimate archive has no such
 // entries, so quietly rewriting `../../x` into `x` would hide a hostile archive
 // instead of reporting it.
+//
+// Two gates, both on pathinside's separator-precise rule: the entry NAME must not
+// escape before it is joined (pathinside.RelEscapes), and the joined path must
+// still be inside dir afterwards (pathinside.Inside). The second cannot fail once
+// the first has passed for a relative name; it stays as the check on the value
+// actually returned, so a future change to how dst is built cannot ship an escape
+// on the strength of the name check alone. Absoluteness is refused here rather
+// than by pathinside, which deliberately does not judge it.
 func safeJoin(dir, name string) (string, error) {
 	if name == "" {
 		return "", errors.New("archive holds an entry with an empty name")
@@ -123,12 +133,11 @@ func safeJoin(dir, name string) (string, error) {
 		// extraction directory itself, which already exists.
 		return dir, nil
 	}
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	if pathinside.RelEscapes(clean) {
 		return "", fmt.Errorf("archive entry %q escapes the extraction directory", name)
 	}
 	dst := filepath.Join(dir, clean)
-	rel, err := filepath.Rel(dir, dst)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !pathinside.Inside(dir, dst) {
 		return "", fmt.Errorf("archive entry %q escapes the extraction directory", name)
 	}
 	return dst, nil

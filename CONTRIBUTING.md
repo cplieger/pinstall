@@ -7,10 +7,11 @@ of the library, so most of this guide is about preserving them.
 ## What the library is
 
 `pinstall` installs a digest-pinned upstream release into a version-addressed
-directory, activates it, and reports whether the result is usable. It has no
-dependencies outside the standard library, and it is Linux-only: the publish
-protocol relies on a same-filesystem rename plus `fsync` of a directory, and every
-delete is confined by `os.Root`.
+directory, activates it, and reports whether the result is usable. Its only
+dependency outside the standard library is `cplieger/pathinside` (the lexical
+path-containment predicate, itself standard-library-only), and it is Linux-only:
+the publish protocol relies on a same-filesystem rename plus `fsync` of a
+directory, and every delete is confined by `os.Root`.
 
 Five invariants are load-bearing. A change that weakens one is a breaking change
 even if the API is untouched.

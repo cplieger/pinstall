@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/cplieger/pathinside"
 )
 
 // Release is everything true of the PACKAGE, independent of any deployment: the
@@ -349,6 +351,14 @@ func validateComponent(field, value string) error {
 // validateRelPath rejects an absolute or traversing relative path. Every one of
 // these is joined onto a directory this package owns, so refusing at
 // construction beats discovering the escape after a download.
+//
+// The escape test is pathinside.RelEscapes, the same separator-precise rule
+// safeJoin applies to archive entry names: it cleans the name first, so a
+// traversal buried mid-string is caught, and it refuses "../a" without refusing
+// a legitimate "..extras/bin". Absoluteness and the empty-value decision stay
+// here — pathinside deliberately judges neither, and whether an empty path means
+// "the root of whichever directory applies" or "a missing required field" is this
+// package's business, not the library's.
 func validateRelPath(field, value string, allowEmpty bool) error {
 	if value == "" {
 		if allowEmpty {
@@ -359,8 +369,7 @@ func validateRelPath(field, value string, allowEmpty bool) error {
 	if filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
 		return fmt.Errorf("pinstall: %s %q must be relative", field, value)
 	}
-	clean := filepath.Clean(value)
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	if pathinside.RelEscapes(value) {
 		return fmt.Errorf("pinstall: %s %q must not escape its directory", field, value)
 	}
 	return nil
