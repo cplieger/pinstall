@@ -44,6 +44,7 @@ func selfContained(path string) bool {
 func (m *Manager) probeVersion(ctx context.Context, bin string) (string, error) {
 	out, err := m.run(ctx, &command{
 		Path:    bin,
+		Env:     binPathEnv(bin),
 		Args:    m.cfg.Release.ProbeArgs,
 		Timeout: probeTimeout,
 	})

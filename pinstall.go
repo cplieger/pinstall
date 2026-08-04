@@ -511,6 +511,19 @@ func (m *Manager) versionDir(version string) string {
 	return filepath.Join(m.versionsDir, version)
 }
 
+// binPathEnv returns the environment overlay that leads PATH with bin's own
+// directory. Every command pinstall runs AGAINST an installed or staged
+// binary carries it, because a multi-binary release's primary executable may
+// resolve its sidecars by BARE NAME on PATH rather than beside its own
+// executable — kiro-cli is the live case: `kiro-cli settings` delegates to
+// the kiro-cli-chat sidecar via PATH only, so without this overlay every
+// settings assertion fails with ENOENT even though the sidecar sits right
+// next to the asserted binary. The caller's process environment keeps
+// working because exec.Cmd deduplicates Env taking the LAST entry.
+func binPathEnv(bin string) []string {
+	return []string{"PATH=" + filepath.Dir(bin) + string(os.PathListSeparator) + os.Getenv("PATH")}
+}
+
 // applyAssertions runs every configured assertion against bin. A required
 // failure is returned (it withholds readiness); a best-effort failure only
 // warns.
@@ -519,6 +532,7 @@ func (m *Manager) applyAssertions(ctx context.Context, bin string) error {
 	for _, a := range m.cfg.Assert {
 		_, err := m.run(ctx, &command{
 			Path:    bin,
+			Env:     binPathEnv(bin),
 			Args:    a.Args,
 			Timeout: assertionTimeout,
 		})
@@ -548,6 +562,7 @@ func (m *Manager) applyRequiredAssertions(ctx context.Context, bin string) error
 		}
 		if _, err := m.run(ctx, &command{
 			Path:    bin,
+			Env:     binPathEnv(bin),
 			Args:    a.Args,
 			Timeout: assertionTimeout,
 		}); err != nil {

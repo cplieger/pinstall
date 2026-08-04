@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -557,5 +558,52 @@ func TestSleepCtxHonoursCancellation(t *testing.T) {
 	}
 	if err := sleepCtx(context.Background(), time.Millisecond); err != nil {
 		t.Errorf("sleepCtx error = %v, want nil", err)
+	}
+}
+
+// TestProbeAndAssertionsLeadPATHWithTheBinaryDir pins the sidecar-delegation
+// contract: a multi-binary release's primary executable may resolve its
+// sidecars by BARE NAME on PATH rather than beside its own executable
+// (kiro-cli's `settings` delegates to the kiro-cli-chat sidecar that way).
+// Every command pinstall runs against an installed or staged binary must
+// therefore lead PATH with that binary's own directory, or every assertion
+// fails with ENOENT while the sidecar sits right next to the asserted binary.
+func TestProbeAndAssertionsLeadPATHWithTheBinaryDir(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	var mu sync.Mutex
+	envsByBin := map[string][]string{}
+	inner := m.run
+	m.run = func(ctx context.Context, c *command) ([]byte, error) {
+		if !env.isInstaller(c.Path) {
+			mu.Lock()
+			envsByBin[c.Path] = append([]string(nil), c.Env...)
+			mu.Unlock()
+		}
+		return inner(ctx, c)
+	}
+
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(envsByBin) == 0 {
+		t.Fatal("no probe or assertion commands ran; the test proved nothing")
+	}
+	for bin, cmdEnv := range envsByBin {
+		want := "PATH=" + filepath.Dir(bin) + string(os.PathListSeparator)
+		var found bool
+		for _, kv := range cmdEnv {
+			if strings.HasPrefix(kv, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("command against %s ran without its directory leading PATH; env = %v", bin, cmdEnv)
+		}
 	}
 }
