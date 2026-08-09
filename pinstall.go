@@ -166,10 +166,17 @@ type Manager struct {
 	versionsDir string
 	statePath   string
 
-	// opMu serialises the long filesystem operations (Ensure, Rescan). It is
+	// opSem serialises the long filesystem operations (Ensure, Rescan). It is
 	// deliberately NOT the state lock: it IS held across I/O, which is the whole
 	// point, so the readers must never take it.
-	opMu sync.Mutex
+	//
+	// A buffered channel rather than a sync.Mutex because the WAIT must be
+	// cancellable. A mutex's Lock is not selectable, so a second caller parked
+	// behind a running operation could not abandon: an HTTP handler driving
+	// Rescan would hold its goroutine inside the library until the operation it
+	// never started finished. Consumers were compensating for that with their own
+	// admission gates; the wait belongs here, with the lock it is waiting on.
+	opSem chan struct{}
 
 	// mu guards active, state, phase, assertionsOK and purged, and is never
 	// held across I/O.
@@ -236,6 +243,7 @@ func New(cfg *Config) (*Manager, error) {
 		template = c.Release.URLTemplate
 	}
 	return &Manager{
+		opSem:        make(chan struct{}, 1),
 		fetch:        httpFetch,
 		run:          execRunner,
 		fsync:        fsyncPath,
@@ -321,6 +329,34 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// acquireOp waits for the single operation slot, honouring ctx while WAITING.
+// Returns ctx.Err() if the caller gave up first, in which case nothing was
+// acquired and the caller must not release.
+//
+// The free slot is probed FIRST, non-blocking, and that ordering is load-bearing:
+// a select with both cases ready chooses pseudo-randomly, so a single select
+// would sometimes refuse a slot nobody is holding to a caller whose context is
+// already done. Cancellation is meant to end a WAIT, never to deny immediate
+// service — an already-expired deadline would otherwise make an uncontended
+// operation fail at random.
+func (m *Manager) acquireOp(ctx context.Context) error {
+	select {
+	case m.opSem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case m.opSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseOp frees the operation slot. Only a caller whose acquireOp returned nil
+// may call it.
+func (m *Manager) releaseOp() { <-m.opSem }
+
 // Ensure brings the pinned version online and is idempotent: on a start that
 // already has the pin complete and activatable it downloads nothing and still
 // re-asserts every assertion.
@@ -333,8 +369,13 @@ func (c *Config) validate() error {
 // re-asserted against whatever was selected, then the convenience link is
 // republished, and only then may pruning run.
 func (m *Manager) Ensure(ctx context.Context) error {
-	m.opMu.Lock()
-	defer m.opMu.Unlock()
+	// Cancellable wait, then the work keeps the caller's context: Ensure is
+	// driven by boot and shutdown, where cancelling a long download is exactly
+	// what a caller wants. Rescan is the one that detaches (see there).
+	if err := m.acquireOp(ctx); err != nil {
+		return err
+	}
+	defer m.releaseOp()
 
 	m.purgeOnce()
 	m.prunePartials()
@@ -434,8 +475,24 @@ func (m *Manager) backoff(n int) time.Duration {
 // wedged artifact — observable without a fresh process. It returns whether a
 // version is active afterwards.
 func (m *Manager) Rescan(ctx context.Context) (bool, error) {
-	m.opMu.Lock()
-	defer m.opMu.Unlock()
+	// Waiting is cancellable; the admitted work is NOT. Both halves are
+	// load-bearing and neither is sufficient alone.
+	//
+	// Cancellable wait: a queued caller (a second POST to a repair hook) must be
+	// able to give up without holding a goroutine inside the library.
+	//
+	// Detached work: every candidate probe runs through exec.CommandContext, and
+	// a probe sweep that fails records the release UNAVAILABLE, clearing the
+	// active version. So a caller that cancels mid-rescan — a curl --max-time, a
+	// browser tab closing — would convert a healthy manager into one that reports
+	// itself unready until the next successful rescan. A rescan that has STARTED
+	// must therefore finish on its own terms. Nothing is lost by detaching: the
+	// probes are individually bounded by probeTimeout, so this cannot hang.
+	if err := m.acquireOp(ctx); err != nil {
+		return false, err
+	}
+	defer m.releaseOp()
+	ctx = context.WithoutCancel(ctx)
 
 	sel, ok := m.selectActive(ctx)
 	if !ok {

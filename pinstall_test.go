@@ -607,3 +607,118 @@ func TestProbeAndAssertionsLeadPATHWithTheBinaryDir(t *testing.T) {
 		}
 	}
 }
+
+// The operation slot has two halves and neither is sufficient alone: WAITING for
+// it honours the caller's context, and the work that has been ADMITTED does not.
+// Consumers were compensating for the absence of both with their own admission
+// gates plus a context.WithoutCancel wrapper, which is library knowledge that
+// nothing kept in step (one of two consumers had neither).
+
+// A caller that gives up while queued must return promptly instead of holding a
+// goroutine inside the library until an operation it never started finishes.
+func TestOperationWaitIsCancellable(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	// Occupy the slot exactly as a running operation would.
+	if err := m.acquireOp(context.Background()); err != nil {
+		t.Fatalf("acquireOp: %v", err)
+	}
+	defer m.releaseOp()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.acquireOp(ctx) }()
+
+	// It must still be waiting: the slot is taken.
+	select {
+	case err := <-done:
+		t.Fatalf("acquireOp returned %v while the slot was held", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("acquireOp err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquireOp did not return after its context was cancelled; the wait is not cancellable")
+	}
+}
+
+// A queued Rescan whose caller disconnects must not run, and must not disturb the
+// manager's state.
+func TestRescanQueuedCallerCanAbandon(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	m := env.manager()
+	if _, err := m.Rescan(context.Background()); err != nil {
+		t.Fatalf("priming Rescan: %v", err)
+	}
+	readyBefore, _ := m.Ready()
+
+	if err := m.acquireOp(context.Background()); err != nil {
+		t.Fatalf("acquireOp: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the caller is already gone
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Rescan(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Rescan err = %v, want context.Canceled for an abandoned queued caller", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an abandoned queued Rescan never returned")
+	}
+	m.releaseOp()
+
+	if ready, why := m.Ready(); ready != readyBefore {
+		t.Errorf("Ready() = (%v, %v) after an abandoned rescan, want it unchanged (%v)", ready, why, readyBefore)
+	}
+}
+
+// The half that matters most: an ADMITTED rescan finishes on its own terms. Its
+// probes run through exec.CommandContext and a failed probe sweep records the
+// release unavailable, so honouring the caller's cancellation here would let a
+// `curl --max-time` turn a healthy manager into an unready one.
+func TestAdmittedRescanIgnoresCallerCancellation(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	m := env.manager()
+
+	// Cancelled BEFORE the call, so the detachment is the only thing that can
+	// make this succeed: an undetached implementation fails every probe.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ok, err := m.Rescan(ctx)
+	if err != nil || !ok {
+		t.Fatalf("Rescan = (%v, %v) with an already-cancelled caller, want (true, nil): the admitted work must be detached", ok, err)
+	}
+	if ready, why := m.Ready(); !ready {
+		t.Errorf("Ready() = false (%s) after a rescan whose caller had cancelled; the cancellation cleared the active version", why)
+	}
+}
+
+// Ensure deliberately does NOT detach: it is driven by boot and shutdown, where
+// cancelling a long download is exactly what the caller wants. Only the wait
+// became cancellable.
+func TestEnsureStillHonoursCancellation(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := m.Ensure(ctx); err == nil {
+		t.Fatal("Ensure returned nil for an already-cancelled context; a shutdown could no longer stop an install")
+	}
+}
