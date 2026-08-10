@@ -461,3 +461,139 @@ func TestParsePOSIXACLNamesTheOwningGroupFromTheList(t *testing.T) {
 		})
 	}
 }
+
+// TestParsePOSIXACLExemptsOnlyOtherFromTheMask pins the split the OTHER fix rests on, which
+// the fix's own table could not: every case there omits the MASK entry, so posixMask returns
+// all-permissions and masked and unmasked are indistinguishable.
+//
+// OTHER is genuinely outside the mask in POSIX.1e -- the mask caps named entries and the
+// owning group, never OTHER -- so a write grant there counts however restrictive the mask
+// is. GROUP_OBJ is the opposite and must stay capped. Getting either backwards is a silent
+// error in one direction or the other, and the two are one line apart.
+func TestParsePOSIXACLExemptsOnlyOtherFromTheMask(t *testing.T) {
+	const rwx, rw, rx = 7, 6, 5
+	const owningGid = 8888
+
+	tests := map[string]struct {
+		mask      uint16
+		other     uint16
+		groupObj  uint16
+		wantEvery bool
+		wantGroup bool
+	}{
+		"other writes under a mask that withholds write": {
+			mask: rx, other: rw, groupObj: rx, wantEvery: true,
+		},
+		"the owning group writes under the same mask, and is capped": {
+			mask: rx, other: rx, groupObj: rw,
+		},
+		"both write, mask permits: both reported": {
+			mask: rwx, other: rw, groupObj: rw, wantEvery: true, wantGroup: true,
+		},
+		"both write, mask withholds: only other survives": {
+			mask: rx, other: rw, groupObj: rw, wantEvery: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			entries := []posixACLEntry{
+				{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+				{tag: posixTagGroupObj, perm: tc.groupObj, id: aclUndefinedID},
+				{tag: posixTagMask, perm: tc.mask, id: aclUndefinedID},
+				{tag: posixTagOther, perm: tc.other, id: aclUndefinedID},
+			}
+
+			writers, err := parsePOSIXACL(encodePOSIXACL(entries), &syscall.Stat_t{Gid: owningGid})
+			if err != nil {
+				t.Fatalf("parsePOSIXACL: %v", err)
+			}
+			gotEvery := slices.Contains(writers, principal{kind: principalEveryone})
+			gotGroup := slices.Contains(writers, principal{kind: principalGroup, id: owningGid})
+			if gotEvery != tc.wantEvery {
+				t.Errorf("named everyone = %v, want %v (mask=%#o other=%#o, writers=%v)",
+					gotEvery, tc.wantEvery, tc.mask, tc.other, writers)
+			}
+			if gotGroup != tc.wantGroup {
+				t.Errorf("named the owning group = %v, want %v (mask=%#o group_obj=%#o, writers=%v)",
+					gotGroup, tc.wantGroup, tc.mask, tc.groupObj, writers)
+			}
+		})
+	}
+}
+
+// TestControllersOfAnswersOnlyForNFSv4 pins both branches the sticky fix added and neither of
+// which had a witness: an unreadable list must propagate, and POSIX.1e must answer "nothing"
+// because the dialect genuinely cannot express either control grant -- chmod and chown stay
+// with the owner, whom the caller checks separately.
+//
+// The second half is the one worth pinning: answering "nothing" for POSIX.1e looks exactly
+// like a fail-open and is not one, so a later cycle needs to see the distinction stated.
+func TestControllersOfAnswersOnlyForNFSv4(t *testing.T) {
+	const stranger = 4242
+	const rwx = 7
+
+	t.Run("an NFSv4 list granting WRITE_OWNER names the principal", func(t *testing.T) {
+		blob := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteOwner, stranger)
+		old := getxattrFn
+		getxattrFn = serveOne(xattrNFS4XDR, blob)
+		defer func() { getxattrFn = old }()
+
+		got, err := controllersOf("/irrelevant", &syscall.Stat_t{Gid: 9})
+		if err != nil {
+			t.Fatalf("controllersOf: %v", err)
+		}
+		if !slices.Contains(got, principal{kind: principalUser, id: stranger}) {
+			t.Errorf("controllers = %v, want uid %d, who can take ownership and clear the sticky bit", got, stranger)
+		}
+	})
+
+	t.Run("a POSIX.1e list answers nothing, because it cannot grant either", func(t *testing.T) {
+		// A list granting a named user everything POSIX.1e can express. None of it is
+		// WRITE_ACL or WRITE_OWNER, which is the point.
+		entries := []posixACLEntry{
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagUser, perm: rwx, id: stranger},
+			{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rwx, id: aclUndefinedID},
+		}
+		old := getxattrFn
+		getxattrFn = serveOne(xattrPOSIXACL, encodePOSIXACL(entries))
+		defer func() { getxattrFn = old }()
+
+		got, err := controllersOf("/irrelevant", &syscall.Stat_t{Gid: 9})
+		if err != nil {
+			t.Fatalf("controllersOf: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("controllers = %v, want none: POSIX.1e cannot grant WRITE_ACL or WRITE_OWNER", got)
+		}
+	})
+
+	t.Run("an unreadable list propagates rather than reading as none", func(t *testing.T) {
+		old := getxattrFn
+		getxattrFn = func(string, string, []byte) (int, error) { return 0, syscall.EIO }
+		defer func() { getxattrFn = old }()
+
+		if got, err := controllersOf("/irrelevant", &syscall.Stat_t{Gid: 9}); err == nil {
+			t.Errorf("controllersOf = %v, nil; want the read error, because not looking is not the same as finding nothing", got)
+		}
+	})
+}
+
+// serveOne answers one attribute name with blob and ENODATA for every other, for the tests
+// that drive a parser through the getxattr seam without a real filesystem.
+func serveOne(attr string, blob []byte) func(string, string, []byte) (int, error) {
+	return func(_, name string, dest []byte) (int, error) {
+		if name != attr {
+			return 0, syscall.ENODATA
+		}
+		if dest == nil {
+			return len(blob), nil
+		}
+		if len(dest) < len(blob) {
+			return 0, syscall.ERANGE
+		}
+		return copy(dest, blob), nil
+	}
+}

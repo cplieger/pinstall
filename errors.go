@@ -27,8 +27,11 @@ var (
 	// mode, or an access-control list whose entries the mode does not show. Fix the
 	// volume, or set [Config.InstallWithoutCustody] to proceed anyway.
 	//
-	// Its absence is not a proof of safety. The check reads Unix ownership, the mode
-	// and the ACL-dialect attributes; a filesystem that does not make the mode its
+	// Its absence is not a proof of safety. Two limits are worth knowing before relying
+	// on a clean verdict. Group 0 is trusted, so a host where the root GROUP has members
+	// is not covered — those accounts can write a root:root group-writable tree and this
+	// check will not say so (see the reasoning on trustedWriters.allows). And the check
+	// reads Unix ownership, the mode and the ACL-dialect attributes; a filesystem that does not make the mode its
 	// access decision at all — a cifs mount with noperm, a FUSE filesystem without
 	// default_permissions — returns a clean verdict from inside the process no matter
 	// who can write. If that is your volume, you know something this library cannot

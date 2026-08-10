@@ -519,7 +519,16 @@ func (m *Manager) assemble(stage *stageTree, src string) error {
 	// MaxAttempts exists to prevent exactly that loop, and cannot, because each attempt
 	// succeeds.
 	if wide := m.wideArtifact(stage.versionDir); wide != "" {
-		return fmt.Errorf("refusing to publish a version directory another principal could modify (%s), because selection would never activate it", wide)
+		// Same wording discipline as selectActive's refusal twenty lines away, because
+		// this is the same verdict reached one step earlier: name what is wrong in terms
+		// the operator can act on rather than echoing wideArtifact's "." marker, and wrap
+		// ErrNoCustody so a caller can tell a custody refusal from a fetch failure.
+		what := fmt.Sprintf("an entry in it (%s) is", wide)
+		if wide == "." {
+			what = "the directory itself is"
+		}
+		return fmt.Errorf("%w: refusing to publish the version directory %s because %s writable by another principal, and selection would therefore never activate it%s",
+			ErrNoCustody, stage.versionDir, what, m.trust.hint())
 	}
 	if err := m.fsync(stage.versionDir); err != nil {
 		return fmt.Errorf("syncing the staged version directory: %w", err)
