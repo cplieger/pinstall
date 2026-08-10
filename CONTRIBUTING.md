@@ -65,10 +65,13 @@ behaviour that varies per package, the order of preference is:
    way to keep that promise is to hand it primitives instead of instructions. An
    `Unpacker` takes a reader over the open, digest-verified archive rather than its
    path (a path is re-resolvable, and the archive has no name anyway), and an
-   `os.Root` on the destination rather than a directory name, so containment is the
-   kernel's answer on every write instead of a rule a third-party implementation
-   has to remember. The previous shape asked custom unpackers to refuse traversing
-   entry names themselves; documentation is the weakest mechanism available.
+   `os.Root` on the destination rather than a directory name, so the contained write
+   is the shortest one an implementation can reach for and the kernel answers every
+   name it is given. The previous shape asked custom unpackers to refuse traversing
+   entry names themselves, and documentation is the weakest mechanism available. It is
+   a better tool, not a sandbox: a callback is ordinary in-process Go code and can read
+   `dst.Name()` and call `os.OpenFile` itself, so do not write down that escape is
+   impossible.
 3. **Nothing** — where one strategy exists and no consumer differs on it. The
    private-staging-home approach is deliberately not a knob; `Installer.HomeEnv`
    plus `ArtifactDir` is all the genericity it needs.
@@ -165,9 +168,9 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `install_test.go`: the happy path, the digest refusal, per-architecture digest
   selection, a sync failure at every point of the durability protocol, the publish
   boundary, the staged gates, the `Installer == nil` axis, `ArtifactDir`'s two
-  meanings, the `Unpacker` seam's contract (including that it cannot write outside
-  the root it is handed), that the verified archive has no name while it is being
-  read, and the fetch boundary.
+  meanings, the `Unpacker` seam's contract (including that the destination's own
+  methods refuse a name outside the root), that the verified archive has no name while
+  it is being read, and the fetch boundary.
 - `versions_test.go`: every incomplete directory shape, partial pruning, a
   replaced artifact under an intact sentinel, the `Untrusted` contract, the
   retention table across every `Retain` value, and version ordering.

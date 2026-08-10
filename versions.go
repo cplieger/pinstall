@@ -148,17 +148,23 @@ func (m *Manager) completeVersions() []string {
 // the strongest available claim in a situation the caller has been told about, not a
 // guarantee equivalent to custody.
 func (m *Manager) trusted(version string) bool {
-	if m.cfg.Untrusted {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		return m.installed[version]
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.custodyErr == nil {
-		return true
+	switch {
+	case m.cfg.Untrusted:
+		// The waiver's degraded mode: the caller accepted a tree it shares, and the
+		// mitigation on offer is that only what this process published from a verified
+		// archive is activated.
+		return m.installed[version]
+	case m.custodyErr != nil:
+		// No custody and no waiver. Nothing here is evidence, INCLUDING what this
+		// process installed earlier: that fact proves a publish at some past instant,
+		// not the bytes at this one, and in a writable tree the directory or the
+		// artifact can be renamed between the checks and the exec. Readiness is
+		// withheld rather than granted on a claim the library cannot make.
+		return false
 	}
-	return m.installed[version]
+	return true
 }
 
 // artifactPrivate reports whether path is a file that only this process's identity
@@ -193,8 +199,38 @@ func artifactPrivate(path string) bool {
 	return err == nil && name == ""
 }
 
+// dirPrivate reports whether a version directory is one only this process's identity
+// (or root) may add to, remove from or rename within.
+//
+// The custody walk stops at the installation root, so this is the check for one level
+// below it. It matters because a version directory is not always one this process
+// created: an operator is encouraged to reshape the volume, and a tree restored from a
+// backup can hold a directory with another owner or a wider mode. Without it, a
+// foreign-owned version directory passes on the strength of its artifacts' modes while
+// its owner can replace those entries between the check and the exec.
+func dirPrivate(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsDir() {
+		return false
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	if owner := int(stat.Uid); owner != os.Geteuid() && owner != 0 {
+		return false
+	}
+	name, err := aclXattrPresent(path)
+	return err == nil && name == ""
+}
+
 // wideArtifact returns the name of the first artifact in dir that another principal
-// could rewrite, or "" when every one of them is private.
+// could rewrite, or "" when every one of them is private. It also answers for the
+// DIRECTORY itself, as "." — a directory another principal can write makes the modes
+// of the entries inside it irrelevant, since the entries can simply be replaced.
 //
 // Required AND optional, because both are executed. [Manager.PathEntry] hands the
 // whole version directory to the front of PATH, and a multi-binary release's primary
@@ -206,6 +242,9 @@ func artifactPrivate(path string) bool {
 // A missing optional artifact reads as private rather than wide — absence is the
 // documented, warned-about case, not a rewritable binary.
 func (m *Manager) wideArtifact(dir string) string {
+	if !dirPrivate(dir) {
+		return "."
+	}
 	for _, name := range m.cfg.Require {
 		if !artifactPrivate(filepath.Join(dir, name)) {
 			return name
@@ -239,9 +278,9 @@ func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict(), "untrusted", m.cfg.Untrusted)
 			continue
 		}
-		if verdict := m.custodyVerdict(); verdict != nil || m.cfg.Untrusted {
-			slog.Error("activating a version on degraded evidence: this process installed it from a verified archive earlier, but the tree is not under its exclusive control, so nothing here proves the artifacts are unchanged since",
-				"package", m.cfg.Release.Name, "version", version, "reason", verdict, "untrusted", m.cfg.Untrusted)
+		if m.cfg.Untrusted {
+			slog.Error("activating a version on degraded evidence: Config.Untrusted waives custody of the tree, so all that is known is that this process published this version from a verified archive earlier, not that its artifacts are unchanged since",
+				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict())
 		}
 		dir := m.versionDir(version)
 		if wide := m.wideArtifact(dir); wide != "" {
@@ -400,9 +439,12 @@ func (m *Manager) pruneSuperseded(active string) {
 // runs while no staging tree of this manager exists — Ensure holds opMu and
 // creates its stage later.
 //
-// Untrusted is deliberately NOT a delete trigger here: a foreign-writable root
-// invalidates a directory for ACTIVATION (see trusted), and turning that flag
-// into a mass delete would throw away the fallback set.
+// Untrusted does not change WHAT is swept, only whether sweeping happens at all: its
+// caller runs this and the purge only when Manager.mayMutateTree allows, and the flag
+// is one of the two ways that returns true. A foreign-writable tree invalidates a
+// directory for ACTIVATION (see trusted); it has never been a reason to delete more
+// than the incomplete directories this sweep already targets, because that would throw
+// away the fallback set.
 func (m *Manager) prunePartials() {
 	entries, err := os.ReadDir(m.versionsDir)
 	if err != nil {

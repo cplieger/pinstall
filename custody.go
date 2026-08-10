@@ -112,10 +112,12 @@ var listxattrNames = syscall.Listxattr
 //
 // A verdict is a statement about one instant, and the operations it authorises happen
 // afterwards. What makes that gap safe is not the timing but the content of the
-// verdict: repointing any component of either chain needs write access to a directory
-// this walk has just proved nobody else has, so the only principal who can invalidate
-// the answer is one who could already do anything. Root is outside the model
-// entirely, as it is for every check of this kind.
+// verdict: replacing any component of either chain needs write access to the directory
+// holding it, and the walk has refused every chain where another principal has that.
+// The one place another principal CAN create entries is a world-writable sticky
+// ancestor, and sticky is exactly the rule that stops them touching an entry they do
+// not own — which is why the ownership of a symlink is demanded there and nowhere
+// else. Root is outside the model entirely, as it is for every check of this kind.
 //
 // It also cannot see a filesystem that does not make the mode its access decision at
 // all — a cifs mount with noperm, a FUSE filesystem without default_permissions —
@@ -153,13 +155,33 @@ func walkChain(path string, euid int) error {
 	components := ancestors(path)
 	parentSticky := false
 	for i, component := range components {
-		mode, err := checkComponent(component, euid, i == len(components)-1, parentSticky)
-		if err != nil {
+		if err := checkComponent(component, euid, i == len(components)-1, parentSticky); err != nil {
 			return err
 		}
-		parentSticky = mode.Perm()&0o022 != 0 && mode&os.ModeSticky != 0
+		parentSticky = worldWritableSticky(component)
 	}
 	return nil
+}
+
+// worldWritableSticky reports whether path DENOTES a world-writable sticky directory,
+// following a symlink to answer it.
+//
+// Following is the whole point. A symlink's own mode is 0777 with no sticky bit on
+// every Linux system, so asking the link would answer "not sticky" however sticky the
+// directory it points at is — and the next component down lives in that directory, not
+// in the link. Reading this off the component's own Lstat mode is what let an
+// attacker-owned symlink inside /tmp be accepted when it was reached through a private
+// link to /tmp, while being correctly refused when named directly.
+//
+// A path that cannot be stat'ed answers false, which is the conservative direction:
+// the next component's own checks still apply, and this only ever ADDS the ownership
+// demand [checkSymlink] makes.
+func worldWritableSticky(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	return fi.Mode().Perm()&0o022 != 0 && fi.Mode()&os.ModeSticky != 0
 }
 
 // ancestors returns every component of an absolute, resolved path from the
@@ -184,43 +206,49 @@ func ancestors(path string) []string {
 // to a stricter rule than its ancestors (see [checkWritable]). parentSticky says the
 // containing directory was world-writable with the sticky bit, which is the only
 // case where a symlink's ownership is load-bearing.
-func checkComponent(path string, euid int, leaf, parentSticky bool) (os.FileMode, error) {
+func checkComponent(path string, euid int, leaf, parentSticky bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
-		return 0, fmt.Errorf("%w: examining %s: %w", ErrNoCustody, path, err)
+		return fmt.Errorf("%w: examining %s: %w", ErrNoCustody, path, err)
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, fmt.Errorf("%w: %s: the filesystem reported no ownership information", ErrNoCustody, path)
+		return fmt.Errorf("%w: %s: the filesystem reported no ownership information", ErrNoCustody, path)
 	}
 	mode := fi.Mode()
 	owner := int(stat.Uid)
 	if mode&os.ModeSymlink != 0 {
-		return mode, checkSymlink(path, owner, euid, parentSticky)
+		return checkSymlink(path, owner, euid, parentSticky)
 	}
 	// For a directory, ownership is load-bearing on its own: the owner can widen the
 	// mode whenever it likes, so a directory belonging to another user tells us
 	// nothing about what its permissions will be a moment from now.
 	if owner != euid && owner != 0 {
-		return mode, fmt.Errorf("%w: %s is owned by uid %d rather than uid %d or root, so its permissions are that user's to change",
+		return fmt.Errorf("%w: %s is owned by uid %d rather than uid %d or root, so its permissions are that user's to change",
 			ErrNoCustody, path, owner, euid)
 	}
 	if !mode.IsDir() {
-		return mode, fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
+		return fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
 	}
 	if writeErr := checkWritable(path, mode, leaf); writeErr != nil {
-		return mode, writeErr
+		return writeErr
 	}
-	name, aclErr := aclXattrPresent(path)
-	if aclErr != nil {
-		return mode, fmt.Errorf("%w: %s: cannot read the attribute list that would reveal an access-control list, so custody cannot be established: %w",
-			ErrNoCustody, path, aclErr)
+	return checkACL(path, mode)
+}
+
+// checkACL refuses a directory carrying an access-control list whose mode is not an
+// upper bound on write access, and refuses one whose attribute list cannot be read.
+func checkACL(path string, mode os.FileMode) error {
+	name, err := aclXattrPresent(path)
+	if err != nil {
+		return fmt.Errorf("%w: %s: cannot read the attribute list that would reveal an access-control list, so custody cannot be established: %w",
+			ErrNoCustody, path, err)
 	}
 	if name != "" {
-		return mode, fmt.Errorf("%w: %s carries an NFSv4-family access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
+		return fmt.Errorf("%w: %s carries an NFSv4-family access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
 			ErrNoCustody, path, name, mode.Perm())
 	}
-	return mode, nil
+	return nil
 }
 
 // checkSymlink judges a symlink on the path.

@@ -569,24 +569,62 @@ func TestVerifyCustodyRetriesAGrownAttributeList(t *testing.T) {
 }
 
 // TestEnsureDeletesNothingInATreeItRefuses pins that the read-only precondition is
-// actually read-only in the whole operation, not only in its own function. The
-// legacy purge and the partial sweep are both DELETES, and running them inside a
-// tree the library then refuses would assert exactly the authority the refusal
-// exists to disclaim.
+// actually read-only across the whole operation, not only inside its own function. The
+// legacy purge, the partial sweep, the retention prune, the convenience link and the
+// state record are all mutations under Root, and running any of them inside a tree the
+// library then refuses would assert exactly the authority the refusal disclaims.
+//
+// Both branches that regressed once are covered: a tree where the versions directory
+// already exists, and one where it does not — the latter because a clean verdict used
+// to be recorded for an absent directory, which let the purge sweep Root on the
+// strength of a verdict about nothing.
 func TestEnsureDeletesNothingInATreeItRefuses(t *testing.T) {
-	env := newFakeEnv(t)
-	partial := env.placePartial("1.0.0")
-	if err := os.Chmod(env.root, 0o777); err != nil {
-		t.Fatalf("chmod the install root: %v", err)
-	}
-	m := env.manager()
+	t.Run("the versions directory exists", func(t *testing.T) {
+		env := newFakeEnv(t)
+		partial := env.placePartial("1.0.0")
+		if err := os.Chmod(env.root, 0o777); err != nil {
+			t.Fatalf("chmod the install root: %v", err)
+		}
+		m := env.manager()
 
-	if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
-		t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
-	}
-	if !exists(partial) {
-		t.Errorf("Ensure deleted %s inside a tree it refused to install into", partial)
-	}
+		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
+		}
+		if !exists(partial) {
+			t.Errorf("Ensure deleted %s inside a tree it refused to install into", partial)
+		}
+		if exists(env.statePath()) {
+			t.Errorf("Ensure wrote %s inside a tree it refused to install into", env.statePath())
+		}
+	})
+
+	t.Run("the versions directory does not exist yet", func(t *testing.T) {
+		env := newFakeEnv(t)
+		legacy := filepath.Join(env.root, "bin", toolName)
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := writeFakeBinary(legacy, "0.9.0"); err != nil {
+			t.Fatalf("writeFakeBinary: %v", err)
+		}
+		if err := os.Chmod(env.root, 0o777); err != nil {
+			t.Fatalf("chmod the install root: %v", err)
+		}
+		m := env.manager(func(c *Config) {
+			c.LinkDir = "bin"
+			c.Purge = &Purge{Names: []string{toolName}}
+		})
+
+		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
+		}
+		if !exists(legacy) {
+			t.Errorf("the legacy purge deleted %s before any verdict about the tree existed", legacy)
+		}
+		if exists(env.statePath()) {
+			t.Errorf("Ensure wrote %s inside a tree it refused to install into", env.statePath())
+		}
+	})
 }
 
 // TestSelectActiveExcludesAVersionWithAWritableArtifact pins the check custody of
@@ -711,5 +749,101 @@ func TestPruneKeepsAUsablePredecessorWhenANewerVersionIsUnactivatable(t *testing
 	}
 	if !exists(wide) {
 		t.Error("pruning deleted 2.0.0, which it should leave exactly as found for the operator to look at")
+	}
+}
+
+// TestVerifyCustodyRefusesAForeignSymlinkReachedThroughAnotherLink pins the sticky
+// rule against the shape that reopened it. parentSticky used to be read off the
+// component's own Lstat mode, and a symlink's mode is 0777 with no sticky bit on every
+// Linux system, so an intermediate symlink reported "not sticky" whatever it pointed
+// at and the ownership demand never fired for the component below it.
+//
+// Named directly, the foreign link inside the sticky directory was refused; reached
+// through a private link to that same directory, it was accepted.
+func TestVerifyCustodyRefusesAForeignSymlinkReachedThroughAnotherLink(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("planting a foreign-owned symlink needs root")
+	}
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "pkg-versions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// A world-writable sticky directory, i.e. /tmp's shape, which the ancestor rule
+	// deliberately accepts.
+	if err := os.Chmod(shared, 0o777|os.ModeSticky); err != nil {
+		t.Fatalf("chmod sticky: %v", err)
+	}
+	hop := filepath.Join(shared, "hop")
+	if err := os.Symlink(real, hop); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	// Owned by somebody else, which inside a sticky directory means only THEY can
+	// remove or replace it.
+	if err := os.Lchown(hop, 12345, 12345); err != nil {
+		t.Skipf("cannot chown a symlink here (%v), so the foreign-link case is untested", err)
+	}
+
+	t.Run("named directly", func(t *testing.T) {
+		err := verifyCustody(filepath.Join(hop, "pkg-versions"))
+		if !errors.Is(err, ErrNoCustody) {
+			t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
+		}
+		if !strings.Contains(err.Error(), "12345") {
+			t.Errorf("error %q does not name the uid that can repoint the link", err)
+		}
+	})
+
+	t.Run("reached through a private link to the sticky directory", func(t *testing.T) {
+		via := filepath.Join(base, "via")
+		if err := os.Symlink(shared, via); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		err := verifyCustody(filepath.Join(via, "hop", "pkg-versions"))
+		if !errors.Is(err, ErrNoCustody) {
+			t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the same foreign link is on the path, one indirection further", err)
+		}
+	})
+}
+
+// TestFinishDoesNotMutateATreeWithoutCustody pins the last two writes. The retention
+// prune deletes version directories and the convenience link writes a symlink, both
+// under Root, and both are reachable with a failed verdict: this process installs under
+// a clean one, the volume is re-permissioned, and the waiver's installed set still
+// authorises selection. A run that has logged that it will not touch the tree must not
+// then delete inside it.
+func TestFinishDoesNotMutateATreeWithoutCustody(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager(func(c *Config) {
+		c.Untrusted = true
+		c.Retain = 0
+		c.LinkDir = "bin"
+	})
+
+	// A clean first install, which populates the installed set and publishes 2.14.2.
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	older := env.placeVersion("1.0.0")
+
+	// Now the volume becomes shared. The waiver keeps the install path open, so
+	// selection still succeeds through the installed set.
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
+	m.checkCustody()
+	if m.custodyVerdict() == nil {
+		t.Fatal("the fixture did not degrade custody, so this test proves nothing")
+	}
+
+	if _, err := m.Rescan(context.Background()); err != nil {
+		t.Fatalf("Rescan: %v", err)
+	}
+	if !exists(older) {
+		t.Error("the retention prune deleted a version directory in a tree the same operation refused to mutate")
 	}
 }

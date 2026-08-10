@@ -195,6 +195,13 @@ type Config struct {
 	// flag is the only way to get the "activate only what this process installed"
 	// behaviour, which it provides unconditionally.
 	//
+	// It also re-authorises the operations the library otherwise declines to perform
+	// in a tree it does not control: the one-shot [Config.Purge], the sweep of partial
+	// directories and orphan staging trees, the retention prune, the convenience
+	// symlink, and the state record. That follows from what the flag means — the
+	// library is installing there, so refusing to tidy up after itself would leave
+	// Purge silently dead and let partial directories accumulate without bound.
+	//
 	// Otherwise leave it false. Fixing the volume is the better answer, and the error
 	// names the path.
 	Untrusted bool

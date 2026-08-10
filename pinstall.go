@@ -436,13 +436,23 @@ func (m *Manager) mayMutateTree() bool {
 func (m *Manager) finish(ctx context.Context, sel selection, installErr error) error {
 	assertErr := m.applyAssertions(ctx, sel.bin)
 	m.commit(sel, installErr, assertErr)
-	m.publishConvenienceLink(sel.bin)
-	// Pruning runs only after a successful install, and therefore only after
-	// publish has synced the parent directory. A FAILED install prunes nothing:
-	// the versions on the volume are the fallback set that makes the failure
-	// survivable.
-	if installErr == nil {
-		m.pruneSuperseded(sel.version)
+	// The last two mutations of the tree, and both go through the same gate as the
+	// sweeps. They are reachable with a failed verdict — this process installs under a
+	// clean one, the volume is re-permissioned, and the next Rescan selects through
+	// the waiver's installed set — and a run that has just logged that it will not
+	// touch the tree must not then delete directories and write a symlink in it.
+	if m.mayMutateTree() {
+		m.publishConvenienceLink(sel.bin)
+		// Pruning runs only after a successful install, and therefore only after
+		// publish has synced the parent directory. A FAILED install prunes nothing:
+		// the versions on the volume are the fallback set that makes the failure
+		// survivable.
+		if installErr == nil {
+			m.pruneSuperseded(sel.version)
+		}
+	} else {
+		slog.Warn("skipping the convenience link and the retention prune: both write inside a tree this process does not exclusively control",
+			"package", m.cfg.Release.Name, "root", m.versionsDir, "reason", m.custodyVerdict())
 	}
 	switch {
 	case assertErr != nil:
@@ -695,6 +705,13 @@ func (m *Manager) commit(sel selection, installErr, assertErr error) {
 // failed" from "nothing was ever installed".
 func (m *Manager) recordUnavailable(installErr error) error {
 	err := installErr
+	// A custody refusal is the more useful answer than "no complete version is
+	// installed": it names the volume and the thing to change, where ErrNoVersion
+	// points the operator at an install that is present and simply not trusted. This
+	// is the path a mid-process verdict flip takes, where no install was even tried.
+	if err == nil {
+		err = m.custodyVerdict()
+	}
 	if err == nil {
 		err = ErrNoVersion
 	}
