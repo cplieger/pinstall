@@ -1384,3 +1384,65 @@ func TestCheckSymlinkJudgesWhoOwnsTheLink(t *testing.T) {
 		})
 	}
 }
+
+// TestPublishRefusesAWidenedSentinel covers the half of the publish gate the
+// directory-level test does not reach. wideArtifact answers on the DIRECTORY first, so a
+// wide directory short-circuits before the entry loop runs at all — which left the sentinel,
+// one of the two entries publish creates, unpinned by the very test added to pin it.
+//
+// The sentinel is the entry a wide mode matters most for: it is the file that says "this
+// directory is complete", so a principal who can rewrite it can mark a half-populated
+// directory ready.
+func TestPublishRefusesAWidenedSentinel(t *testing.T) {
+	const stranger = 4242
+
+	env := newFakeEnv(t)
+	env.produces = map[string]string{toolName: pinnedVersion, toolSidecar: pinnedVersion, toolExtra: pinnedVersion}
+	m := env.manager()
+
+	// Served on the sentinel alone, so the directory itself passes and the entry loop is
+	// what has to catch this.
+	wide := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, stranger)
+	defer serveACLWhere(t, func(path string) bool {
+		return filepath.Base(path) == sentinelName
+	}, xattrNFS4XDR, wide)()
+
+	err := m.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure published a version directory whose completion sentinel another principal can rewrite")
+	}
+	if !errors.Is(err, ErrNoCustody) {
+		t.Errorf("Ensure error = %v, want it to wrap ErrNoCustody so a caller can tell this from a fetch failure", err)
+	}
+	if !strings.Contains(err.Error(), sentinelName) {
+		t.Errorf("error %q does not name the sentinel as the entry refused", err)
+	}
+	if dirs := env.versionDirs(); len(dirs) != 0 {
+		t.Errorf("installation root holds %v, want nothing published", dirs)
+	}
+}
+
+// TestAllowsTrustsGroupZeroWithoutPrivilege is the unprivileged witness for the gid-0 rule.
+// The end-to-end test for it (TestVerifyCustodyAcceptsAGroupOnlyRootCanUse) skips unless the
+// runner is root, so the acceptance was pinned only where privilege exists — the same
+// root-only-green shape that let the trusted-writer knobs be disconnected with CI green.
+//
+// The rule is deliberate and its limit is stated on allows() itself: group-0 membership is
+// not root's privilege, so a host whose root GROUP has members is outside what this check
+// covers. It is kept because refusing gid 0 would refuse a single root:root 0775 ancestor
+// and turn an ordinary tree into a total install outage.
+func TestAllowsTrustsGroupZeroWithoutPrivilege(t *testing.T) {
+	const euid = 1000
+	trust := trustedWriters{}
+
+	if !trust.allows(principal{kind: principalGroup, id: 0}, euid) {
+		t.Error("group 0 is not trusted; refusing it turns a root:root 0775 ancestor into an install outage")
+	}
+	// The neighbouring rules, so a mutant that widens this one is caught here too.
+	if trust.allows(principal{kind: principalGroup, id: 1}, euid) {
+		t.Error("group 1 is trusted, but only group 0 is")
+	}
+	if trust.allows(principal{kind: principalEveryone}, euid) {
+		t.Error("everyone is trusted, which nothing may ever make true")
+	}
+}
