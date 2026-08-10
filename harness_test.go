@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -44,6 +45,15 @@ const (
 // TestMain silences the manager's slog output for the whole package: every
 // install path logs, and the volume drowns real failures in test output.
 func TestMain(m *testing.M) {
+	// The umask is pinned for the whole test binary, and it is not cosmetic. t.TempDir
+	// creates its numbered subdirectory with a plain mkdir(0777), so a developer whose
+	// umask is 002 — the default for a regular user on Debian, Ubuntu and Fedora — gets
+	// a GROUP-WRITABLE fixture root, and this package's custody check then correctly
+	// refuses to install into it. Measured: 48 tests fail under umask 002 and pass under
+	// 022, with the production behaviour right in both cases. CI runs at 022 and so does
+	// the container this suite was written in, which is how three review rounds missed
+	// it. Fixing the harness is the answer; softening the check would not be.
+	syscall.Umask(0o022)
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
 }

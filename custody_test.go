@@ -810,28 +810,77 @@ func TestVerifyCustodyRefusesAForeignSymlinkReachedThroughAnotherLink(t *testing
 	})
 }
 
-// TestFinishDoesNotMutateATreeWithoutCustody pins the last two writes. The retention
-// prune deletes version directories and the convenience link writes a symlink, both
-// under Root, and both are reachable with a failed verdict: this process installs under
-// a clean one, the volume is re-permissioned, and the waiver's installed set still
-// authorises selection. A run that has logged that it will not touch the tree must not
-// then delete inside it.
-func TestFinishDoesNotMutateATreeWithoutCustody(t *testing.T) {
+// TestFinishDoesNotMutateATreeWhoseVerdictFlippedMidOperation pins the last two writes
+// under the tree: the retention prune, which deletes version directories, and the
+// convenience link.
+//
+// The reachable path is narrow and worth spelling out, because the first attempt at this
+// test asserted it from a configuration where the gate was open. Custody is clean when
+// Ensure starts, so selection succeeds; the operator re-permissions the volume while the
+// operation is in flight (driven here from the probe seam, which is where selection
+// crosses into the outside world); install then re-proves custody, refuses, and finish
+// runs with a failed verdict and NO waiver. That is the one state in which
+// mayMutateTree is false with a selection in hand.
+func TestFinishDoesNotMutateATreeWhoseVerdictFlippedMidOperation(t *testing.T) {
 	env := newFakeEnv(t)
-	m := env.manager(func(c *Config) {
-		c.Untrusted = true
-		c.Retain = 0
-		c.LinkDir = "bin"
-	})
+	// Three complete versions, none of them the pin, so selection succeeds on the
+	// newest and 0.8.0 is outside the retained set and would be pruned.
+	env.placeVersion("1.0.0")
+	env.placeVersion("0.9.0")
+	env.placeVersion("0.8.0")
 
-	// A clean first install, which populates the installed set and publishes 2.14.2.
+	var once bool
+	env.onProbe = func(bin string) ([]byte, error) {
+		if !once {
+			once = true
+			// The volume becomes shared while the operation is in flight.
+			if err := os.Chmod(env.root, 0o777); err != nil {
+				t.Fatalf("chmod the install root: %v", err)
+			}
+		}
+		return env.probeAnswer(bin)
+	}
+	m := env.manager(func(c *Config) { c.LinkDir = "bin" })
+
+	err := m.Ensure(context.Background())
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("Ensure error = %v, want ErrNoCustody: the install must refuse once the verdict flips", err)
+	}
+	if m.custodyVerdict() == nil {
+		t.Fatal("the fixture did not flip the verdict, so this test proves nothing")
+	}
+	if !exists(env.versionDir("0.8.0")) {
+		t.Error("the retention prune deleted a version directory in a tree the same operation refused to mutate")
+	}
+	if exists(filepath.Join(env.root, "bin", toolName)) {
+		t.Error("the convenience link was published inside a tree the same operation refused to mutate")
+	}
+}
+
+// TestSelectActiveRefusesEvenItsOwnInstallWithoutCustodyOrAWaiver pins the security
+// decision that regressed twice and took three review rounds to settle, and it is the
+// only test that isolates it: every other custody test sets Config.Untrusted, which
+// takes the waiver branch and would stay green if this rule were reverted.
+//
+// What the installed set proves is that THIS process published a version from a verified
+// archive at some earlier instant, not that the bytes are unchanged now. Once the tree is
+// writable, the directory check, the artifact check and the probe are three path-based
+// operations with gaps between them, and the failed verdict is precisely the fact that
+// makes that race possible. So readiness is withheld rather than granted on a claim the
+// library cannot make.
+func TestSelectActiveRefusesEvenItsOwnInstallWithoutCustodyOrAWaiver(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	// A clean install first, so the installed set holds the pin.
 	if err := m.Ensure(context.Background()); err != nil {
 		t.Fatalf("first Ensure: %v", err)
 	}
-	older := env.placeVersion("1.0.0")
+	if ready, why := m.Ready(); !ready {
+		t.Fatalf("Ready() = false (%s) after a clean install", why)
+	}
 
-	// Now the volume becomes shared. The waiver keeps the install path open, so
-	// selection still succeeds through the installed set.
+	// Now the volume becomes shared, and the caller has NOT waived the precondition.
 	if err := os.Chmod(env.root, 0o777); err != nil {
 		t.Fatalf("chmod the install root: %v", err)
 	}
@@ -840,10 +889,13 @@ func TestFinishDoesNotMutateATreeWithoutCustody(t *testing.T) {
 		t.Fatal("the fixture did not degrade custody, so this test proves nothing")
 	}
 
-	if _, err := m.Rescan(context.Background()); err != nil {
-		t.Fatalf("Rescan: %v", err)
+	if sel, ok := m.selectActive(context.Background()); ok {
+		t.Errorf("selectActive accepted %q on the strength of the installed set alone, with no custody and no waiver", sel.version)
 	}
-	if !exists(older) {
-		t.Error("the retention prune deleted a version directory in a tree the same operation refused to mutate")
+	if _, err := m.Rescan(context.Background()); !errors.Is(err, ErrNoCustody) {
+		t.Errorf("Rescan error = %v, want ErrNoCustody so the operator is pointed at the volume", err)
+	}
+	if ready, why := m.Ready(); ready || why != ReasonUnavailable {
+		t.Errorf("Ready() = (%v, %v), want (false, %v)", ready, why, ReasonUnavailable)
 	}
 }

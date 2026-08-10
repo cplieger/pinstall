@@ -448,7 +448,7 @@ func (m *Manager) finish(ctx context.Context, sel selection, installErr error) e
 		// the versions on the volume are the fallback set that makes the failure
 		// survivable.
 		if installErr == nil {
-			m.pruneSuperseded(sel.version)
+			m.pruneSuperseded(ctx, sel.version)
 		}
 	} else {
 		slog.Warn("skipping the convenience link and the retention prune: both write inside a tree this process does not exclusively control",
@@ -707,9 +707,15 @@ func (m *Manager) recordUnavailable(installErr error) error {
 	err := installErr
 	// A custody refusal is the more useful answer than "no complete version is
 	// installed": it names the volume and the thing to change, where ErrNoVersion
-	// points the operator at an install that is present and simply not trusted. This
-	// is the path a mid-process verdict flip takes, where no install was even tried.
-	if err == nil {
+	// points the operator at an install that is present and simply not trusted. This is
+	// the path a mid-process verdict flip takes, where no install was even tried.
+	//
+	// Only when the verdict is what BLOCKED activation, though. Under
+	// [Config.Untrusted] a failed verdict is the accepted state rather than the
+	// exclusion cause, and reporting it there would send an operator to fix permissions
+	// they deliberately chose while hiding the real reason — a replaced artifact under
+	// an intact sentinel, say, which is ErrVersionMismatch's story to tell.
+	if err == nil && !m.cfg.Untrusted {
 		err = m.custodyVerdict()
 	}
 	if err == nil {

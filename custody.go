@@ -173,19 +173,24 @@ func walkChain(path string, euid int) error {
 // attacker-owned symlink inside /tmp be accepted when it was reached through a private
 // link to /tmp, while being correctly refused when named directly.
 //
-// A path that cannot be stat'ed answers false, which is the conservative direction:
-// the next component's own checks still apply, and this only ever ADDS the ownership
-// demand [checkSymlink] makes.
+// An unreadable answer counts as sticky, which is the FAIL-CLOSED direction: the only
+// thing this fact controls is whether [checkSymlink] demands ownership of the next
+// component, so treating the unknown as sticky can add a demand and can never drop
+// one. The reverse — the shape this function first shipped with — let a transient stat
+// failure on the parent silently retire that demand.
 func worldWritableSticky(path string) bool {
 	fi, err := os.Stat(path)
-	if err != nil || !fi.IsDir() {
+	if err != nil {
+		return true
+	}
+	if !fi.IsDir() {
 		return false
 	}
 	return fi.Mode().Perm()&0o022 != 0 && fi.Mode()&os.ModeSticky != 0
 }
 
-// ancestors returns every component of an absolute, resolved path from the
-// filesystem root down to the path itself, inclusive.
+// ancestors returns every component of an absolute path from the filesystem root down
+// to the path itself, inclusive.
 func ancestors(path string) []string {
 	out := []string{path}
 	for {
@@ -200,12 +205,12 @@ func ancestors(path string) []string {
 	return out
 }
 
-// checkComponent judges one component of a path chain and returns its mode.
+// checkComponent judges one component of a path chain.
 //
-// leaf marks the last component, which is the installation root itself and is held
-// to a stricter rule than its ancestors (see [checkWritable]). parentSticky says the
-// containing directory was world-writable with the sticky bit, which is the only
-// case where a symlink's ownership is load-bearing.
+// leaf marks the last component, which is the installation root itself and is held to a
+// stricter rule than its ancestors (see [checkWritable]). parentSticky says the
+// containing directory was world-writable with the sticky bit, which is the only case
+// where a symlink's ownership is load-bearing.
 func checkComponent(path string, euid int, leaf, parentSticky bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {

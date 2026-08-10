@@ -89,18 +89,57 @@ func (m *Manager) versionDirComplete(version string) bool {
 	return true
 }
 
-// activatableVersions lists the complete version directories selection would
-// consider, newest first: complete, and with no artifact another principal could
-// rewrite. It is what retention counts.
-func (m *Manager) activatableVersions() []string {
-	complete := m.completeVersions()
-	out := make([]string, 0, len(complete))
-	for _, version := range complete {
-		if m.wideArtifact(m.versionDir(version)) == "" {
+// usablePredecessors returns up to want complete versions older than active that could
+// actually serve as a fallback, newest first.
+//
+// "Could serve" is the same question selection asks, and asking it here is what makes
+// the retained predecessor a real fallback rather than a directory nothing will
+// activate: private, and answering the version probe with the version its own directory
+// claims. The README promises N predecessors as the recovery mechanism, so counting a
+// directory that selection would refuse makes that promise false in exactly the
+// situation it exists for.
+//
+// The walk stops as soon as it has want of them, so the cost is normally one bounded
+// probe per prune — and pruning runs after a successful install, not on every start.
+func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) []string {
+	if want <= 0 {
+		return nil
+	}
+	older := make([]string, 0, len(complete))
+	for _, v := range complete {
+		if compareVersions(v, active) < 0 {
+			older = append(older, v)
+		}
+	}
+	sortVersionsDesc(older)
+	out := make([]string, 0, want)
+	for _, version := range older {
+		if len(out) == want {
+			break
+		}
+		if m.usableAsFallback(ctx, version) {
 			out = append(out, version)
 		}
 	}
 	return out
+}
+
+// usableAsFallback reports whether a complete version directory would survive
+// selection, and says why in the log when it would not.
+func (m *Manager) usableAsFallback(ctx context.Context, version string) bool {
+	dir := m.versionDir(version)
+	if wide := m.wideArtifact(dir); wide != "" {
+		slog.Warn("not counting a version directory towards retention: an entry in it is writable by another principal",
+			"package", m.cfg.Release.Name, "version", version, "entry", wide)
+		return false
+	}
+	got, err := m.probeVersion(ctx, filepath.Join(dir, m.primary))
+	if err != nil || got != version {
+		slog.Warn("not counting a version directory towards retention: it would not survive selection's version probe",
+			"package", m.cfg.Release.Name, "version", version, "reported", got, "error", err)
+		return false
+	}
+	return true
 }
 
 // completeVersions lists the completed version directories, newest first.
@@ -127,8 +166,9 @@ func (m *Manager) completeVersions() []string {
 
 // trusted reports whether a version directory may be activated. A sentinel proves
 // nothing on its own — it is a plain file, trivially forgeable, unlike a digest — so
-// when the tree cannot be trusted only a version THIS process installed from a
-// verified archive qualifies.
+// without custody of the tree the answer is no: not for any directory found there, and
+// not even for one this process installed, unless the caller has explicitly waived the
+// precondition and accepted that weaker claim.
 //
 // TWO independent triggers, and both are needed:
 //
@@ -227,36 +267,37 @@ func dirPrivate(path string) bool {
 	return err == nil && name == ""
 }
 
-// wideArtifact returns the name of the first artifact in dir that another principal
-// could rewrite, or "" when every one of them is private. It also answers for the
-// DIRECTORY itself, as "." — a directory another principal can write makes the modes
-// of the entries inside it irrelevant, since the entries can simply be replaced.
+// wideArtifact returns the name of the first entry in dir that another principal could
+// rewrite, or "" when the directory and everything in it is private. The directory
+// itself answers as "." — one another principal can write makes the modes of the
+// entries inside it irrelevant, since the entries can simply be replaced.
 //
-// Required AND optional, because both are executed. [Manager.PathEntry] hands the
+// EVERY top-level entry, not only the declared artifacts. [Manager.PathEntry] hands the
 // whole version directory to the front of PATH, and a multi-binary release's primary
-// artifact resolves its sidecars from there by bare name, so an optional artifact is
-// as much a root-executed binary as a required one. Only the artifacts this
-// deployment declared are examined: anything else in the directory is not on the
-// execution path.
+// artifact resolves its sidecars from there by bare name, so an undeclared executable
+// sitting in that directory is reachable too. A version directory is not always one
+// this process created: an operator is encouraged to reshape the volume, and a tree
+// restored from a backup can hold entries with another owner. Directory permissions
+// govern adding, removing and renaming names; they do not stop the owner of an entry
+// that is already there from rewriting it, which is why dirPrivate alone is not enough.
 //
-// A missing optional artifact reads as private rather than wide — absence is the
-// documented, warned-about case, not a rewritable binary.
+// Top level only, because that is what PATH exposes: an executable in a subdirectory
+// is not reachable by bare name. A directory this library assembled holds exactly the
+// declared artifacts and the sentinel, so this is a handful of stats.
 func (m *Manager) wideArtifact(dir string) string {
 	if !dirPrivate(dir) {
 		return "."
 	}
-	for _, name := range m.cfg.Require {
-		if !artifactPrivate(filepath.Join(dir, name)) {
-			return name
-		}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "."
 	}
-	for _, name := range m.cfg.Optional {
-		path := filepath.Join(dir, name)
-		if _, err := os.Lstat(path); err != nil {
+	for _, e := range entries {
+		if e.IsDir() {
 			continue
 		}
-		if !artifactPrivate(path) {
-			return name
+		if !artifactPrivate(filepath.Join(dir, e.Name())) {
+			return e.Name()
 		}
 	}
 	return ""
@@ -284,8 +325,13 @@ func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 		}
 		dir := m.versionDir(version)
 		if wide := m.wideArtifact(dir); wide != "" {
-			slog.Error("excluding a version directory: one of its artifacts is writable by another principal, so it is a binary this process would execute and somebody else could rewrite",
-				"package", m.cfg.Release.Name, "version", version, "artifact", wide)
+			if wide == "." {
+				slog.Error("excluding a version directory: the directory itself is writable by another principal, who can therefore replace any artifact in it whatever the artifacts' own modes say",
+					"package", m.cfg.Release.Name, "version", version, "dir", dir)
+			} else {
+				slog.Error("excluding a version directory: an entry in it is writable by another principal, so it is a file this process may execute and somebody else could rewrite",
+					"package", m.cfg.Release.Name, "version", version, "entry", wide)
+			}
 			continue
 		}
 		bin := filepath.Join(dir, m.primary)
@@ -408,17 +454,32 @@ func versionsToPrune(complete []string, active string, retain int) []string {
 	return out
 }
 
-// pruneSuperseded removes every ACTIVATABLE version directory outside the retained
-// set, then syncs the installation root again so the removals are durable. Failures
-// warn: disk hygiene must not brick a start.
+// pruneSuperseded removes the version directories outside the retained set, then syncs
+// the installation root again so the removals are durable. Failures warn: disk hygiene
+// must not brick a start.
 //
-// Retention is computed over the activatable set rather than the complete one so a
-// version excluded for holding a rewritable artifact cannot spend the retain slot
-// that the usable predecessor needs — which would delete the fallback and leave the
-// recovery guarantee resting on a directory selection already refuses. Such a version
-// is also not a victim: it is left exactly as found, for the operator to look at.
-func (m *Manager) pruneSuperseded(active string) {
-	victims := versionsToPrune(m.activatableVersions(), active, m.cfg.Retain)
+// The retained set is the active version plus up to Retain predecessors that could
+// ACTUALLY serve (see usablePredecessors). A directory that selection would refuse —
+// one holding a rewritable entry, or whose binary disagrees with its own name — must
+// not spend the slot the usable predecessor needs, because that deletes the fallback
+// and leaves the recovery guarantee resting on something nothing will activate.
+//
+// Such a directory is also never a victim. It is left exactly as found, for the
+// operator to look at: this library did not put it in that state and deleting evidence
+// is not its call.
+func (m *Manager) pruneSuperseded(ctx context.Context, active string) {
+	complete := m.completeVersions()
+	keep := append([]string{active}, m.usablePredecessors(ctx, complete, active, m.cfg.Retain)...)
+	victims := make([]string, 0, len(complete))
+	for _, version := range complete {
+		if slices.Contains(keep, version) {
+			continue
+		}
+		if !m.usableAsFallback(ctx, version) {
+			continue
+		}
+		victims = append(victims, version)
+	}
 	if len(victims) == 0 {
 		return
 	}
