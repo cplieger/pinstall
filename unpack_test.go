@@ -2,6 +2,7 @@ package pinstall
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -236,5 +237,52 @@ func writeZip(t *testing.T, path string, entries map[string]string) {
 	}
 	if err := zw.Close(); err != nil {
 		t.Fatalf("zip Close: %v", err)
+	}
+}
+
+// TestExtractFileVerifiesTheModeItAskedFor pins the mode check on the artifacts
+// themselves. An artifact leaves the extraction tree by RENAME into the version
+// directory, keeping the mode it was created with, and that directory's own
+// verified mode only stops another principal REPLACING an entry — not writing to
+// one whose stored permissions are wider than the create asked for. A
+// group-writable executable in a published version directory is a root-executed
+// binary that can be rewritten in place after the archive digest admitted it,
+// which is the integrity gate the pin exists to provide.
+//
+// The widening is real (see preexistingFileIgnoringTheMode, whose witness skips
+// the test rather than letting it pass vacuously): open(2) ignores the mode
+// argument outright when the path is already occupied, which for an extraction
+// tree is what an archive carrying the same entry name twice produces.
+func TestExtractFileVerifiesTheModeItAskedFor(t *testing.T) {
+	const body = "fake artifact\nversion=2.14.2\n"
+	archive := buildZip(t, map[string]zipEntry{"pkg/dispatcher": {body: body, mode: 0o755}})
+	r, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatalf("zip.NewReader: %v", err)
+	}
+	entry := r.File[0]
+
+	dst := filepath.Join(t.TempDir(), "dispatcher")
+	preexistingFileIgnoringTheMode(t, dst, 0o666, 0o755)
+
+	if _, err := extractFile(entry, dst, maxExtractBytes); err != nil {
+		t.Fatalf("extractFile: %v", err)
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("lstat the extracted artifact: %v", err)
+	}
+	if got, want := fi.Mode().Perm(), os.FileMode(0o755); got != want {
+		t.Fatalf("extracted artifact mode = %#o, want %#o: a group- and other-writable root-executed binary", got, want)
+	}
+	if !selfContained(dst) {
+		t.Error("the extracted artifact is not a self-contained executable, so it would never be published")
+	}
+	raw, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read the extracted artifact: %v", err)
+	}
+	if string(raw) != body {
+		t.Errorf("extracted content = %q, want %q", raw, body)
 	}
 }

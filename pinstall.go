@@ -36,6 +36,11 @@ const (
 
 	dirMode  os.FileMode = 0o755
 	fileMode os.FileMode = 0o600
+	// stageMode is the mode os.MkdirTemp requests for a staging tree. It is
+	// named here only so the value the staging root is VERIFIED against is the
+	// same literal its creation asks for, instead of a number restated at the
+	// check and free to drift from it.
+	stageMode os.FileMode = 0o700
 )
 
 // Bounded deadlines for every external command. A wedged artifact must not stall

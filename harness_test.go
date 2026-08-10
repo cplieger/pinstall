@@ -451,3 +451,82 @@ func digestOf(archive []byte) string {
 	sum := sha256.Sum256(archive)
 	return hex.EncodeToString(sum[:])
 }
+
+// setgidParentThatWidens makes dir setgid and then PROVES that a mkdir inside it
+// stores a mode it did not ask for. It skips the calling test when the widening
+// does not happen.
+//
+// The skip is the point. A create-path mode test on a filesystem that honours
+// every request cannot distinguish a directory whose stored mode was VERIFIED
+// from one whose mode was merely requested, so it would pass vacuously and go on
+// passing after the verification was deleted. Failing as INVALID is the only
+// honest outcome there.
+//
+// The widening is real rather than mocked: Linux propagates S_ISGID from a setgid
+// directory to every new subdirectory, so os.Mkdir(child, 0o700) genuinely stores
+// setgid|0700. It is the same class of surprise as the inheritable group ACL that
+// motivated the checks under test — measured on a ZFS nfs4acl dataset, an
+// inheritable group@:rwx ACE yields 0770 from a 0o700 mkdir — and unlike that one
+// it needs no special filesystem to reproduce.
+func setgidParentThatWidens(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o700|os.ModeSetgid); err != nil {
+		t.Fatalf("chmod %s setgid: %v", dir, err)
+	}
+	witness := filepath.Join(dir, ".mode-witness")
+	if err := os.Mkdir(witness, 0o700); err != nil {
+		t.Fatalf("mkdir the witness under %s: %v", dir, err)
+	}
+	fi, err := os.Lstat(witness)
+	if err != nil {
+		t.Fatalf("lstat the witness: %v", err)
+	}
+	if err := os.RemoveAll(witness); err != nil {
+		t.Fatalf("remove the witness: %v", err)
+	}
+	if fi.Mode()&os.ModeSetgid == 0 {
+		t.Skipf("this kernel did not widen a 0o700 mkdir under a setgid parent (stored %v); "+
+			"the test cannot distinguish a verified create from an unverified one here", fi.Mode())
+	}
+}
+
+// preexistingFileIgnoringTheMode creates path at wide and then PROVES that an
+// O_CREATE|O_TRUNC open asking for ask leaves the stored mode at wide. It leaves
+// path in place at wide, for the production call under test to be handed, and
+// skips the calling test when the kernel honours the mode argument after all.
+//
+// This is the file half of the same "a mode argument is a REQUEST" bug, in the
+// one form this environment can demonstrate. The widening that motivated the
+// checks is an inheritable group ACL storing 0775 for a 0o755 create, which needs
+// a filesystem carrying such an ACL (there is no setfacl here, and overlayfs
+// would not carry one). open(2) ignoring the mode argument outright when the path
+// already exists is the same defect with the same consequence — a file left
+// group- and other-writable by a create that reported success — and it is
+// reachable in production wherever a path can already be occupied, which for the
+// extraction tree is an archive carrying the same entry name twice.
+func preexistingFileIgnoringTheMode(t *testing.T, path string, wide, ask os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, wide); err != nil {
+		t.Fatalf("pre-create %s: %v", path, err)
+	}
+	// WriteFile's own mode goes through umask, so set the wide mode explicitly
+	// rather than assuming the process umask left it alone.
+	if err := os.Chmod(path, wide); err != nil {
+		t.Fatalf("chmod %s to %#o: %v", path, wide, err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, ask)
+	if err != nil {
+		t.Fatalf("open the witness at %s: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close the witness: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat the witness: %v", err)
+	}
+	if fi.Mode().Perm() == ask.Perm() {
+		t.Skipf("this kernel applied the O_CREATE mode %#o to an already-existing file; "+
+			"the test cannot distinguish a verified create from an unverified one here", ask.Perm())
+	}
+}

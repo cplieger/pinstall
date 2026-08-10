@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/pathinside"
 )
 
@@ -78,6 +79,15 @@ func unpackZipEntry(entry *zip.File, dir string, budget int64) (int64, error) {
 }
 
 // extractFile writes one file entry, refusing to exceed budget bytes.
+//
+// The mode is verified on the descriptor the create returned, before any bytes go
+// in. An artifact leaves this tree by RENAME into the version directory, keeping
+// the mode it was created with, and that directory's own verified mode only stops
+// another principal replacing an entry — not writing to one whose permissions the
+// filesystem widened past what was asked for. A group-writable executable in a
+// published version directory is a root-executed binary that can be rewritten in
+// place after the archive digest admitted it, which is exactly the integrity gate
+// the pin exists to provide.
 func extractFile(entry *zip.File, dst string, budget int64) (int64, error) {
 	if budget <= 0 {
 		return 0, fmt.Errorf("archive exceeds the %d byte extraction limit", maxExtractBytes)
@@ -94,6 +104,10 @@ func extractFile(entry *zip.File, dst string, budget int64) (int64, error) {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return 0, fmt.Errorf("creating %s: %w", entry.Name, err)
+	}
+	if _, err := atomicfile.EnforceMode(out, mode); err != nil {
+		_ = out.Close()
+		return 0, fmt.Errorf("extracting %s: %w", entry.Name, err)
 	}
 	written, copyErr := io.Copy(out, io.LimitReader(src, budget+1))
 	closeErr := out.Close()

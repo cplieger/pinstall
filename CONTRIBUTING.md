@@ -7,9 +7,11 @@ of the library, so most of this guide is about preserving them.
 ## What the library is
 
 `pinstall` installs a digest-pinned upstream release into a version-addressed
-directory, activates it, and reports whether the result is usable. Its only
-dependency outside the standard library is `cplieger/pathinside` (the lexical
-path-containment predicate, itself standard-library-only), and it is Linux-only:
+directory, activates it, and reports whether the result is usable. Its
+dependencies outside the standard library are `cplieger/pathinside` (the lexical
+path-containment predicate) and `cplieger/atomicfile` (whose `EnforceMode` proves
+what mode the filesystem actually STORED for a directory or file this library
+created, since a mode argument is only a request), and it is Linux-only:
 the publish protocol relies on a same-filesystem rename plus `fsync` of a
 directory, and every delete is confined by `os.Root`.
 

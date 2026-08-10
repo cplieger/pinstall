@@ -7,13 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/cplieger/atomicfile/v2"
 )
 
 // The placeholders a URL template carries.
@@ -272,13 +276,31 @@ func (m *Manager) downloadArchive(ctx context.Context, dst string) error {
 }
 
 // newStage creates the staging tree under the installation root.
+//
+// The staging root's own stored mode is verified, and it is the one check that
+// covers the whole subtree: at 0700 nothing else on the host can even traverse
+// into it, so the modes of the directories inside it are not a boundary. Widened
+// to 0770 it becomes one, and the exposure is worse than a published directory's
+// — the extracted tree holds the archive's own installer, which this package
+// EXECUTES, so a group member who can write there runs code as whatever user the
+// install runs as. os.MkdirTemp asks for 0700 and, like every other mkdir, does
+// not read the result back.
+//
+// A staging root whose mode cannot be verified is removed before returning
+// rather than left for the next start's prunePartials: the failure means that
+// directory is writable by others, and leaving one sitting under the
+// installation root is the exposure itself.
 func (m *Manager) newStage() (*stageTree, error) {
-	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
-		return nil, fmt.Errorf("creating the installation root: %w", err)
+	if err := m.ensureVersionsDir(); err != nil {
+		return nil, err
 	}
 	root, err := os.MkdirTemp(m.versionsDir, stagePrefix+"*")
 	if err != nil {
 		return nil, fmt.Errorf("creating the staging tree: %w", err)
+	}
+	if err := enforceDirMode(root, stageMode); err != nil {
+		_ = os.RemoveAll(root)
+		return nil, fmt.Errorf("the staging tree is not private to this install: %w", err)
 	}
 	stage := &stageTree{
 		root:       root,
@@ -292,6 +314,40 @@ func (m *Manager) newStage() (*stageTree, error) {
 		}
 	}
 	return stage, nil
+}
+
+// ensureVersionsDir creates the installation root and, when THIS call created it,
+// verifies the mode the filesystem stored for it.
+//
+// The root is the directory every version tree sits in, so group-writable it
+// defeats every check below it: another principal can rename a published version
+// directory away and put its own tree at that name, and nothing re-digests what is
+// inside the substitute.
+//
+// It is created in two steps rather than one os.MkdirAll only so this call can
+// tell that it was the creator — MkdirAll returns nil for a directory that was
+// already there, and os.Mkdir's fs.ErrExist is that answer without the
+// stat-then-act window a pre-check would open. The same directories are created at
+// the same requested mode either way. A PRE-EXISTING root is deliberately left
+// alone: an operator may have widened it on purpose, repairing another principal's
+// directory is not this library's call, and [Config.Untrusted] is the channel that
+// already exists for reporting a root that was writable by others — it refuses to
+// activate any version directory this process did not install itself.
+func (m *Manager) ensureVersionsDir() error {
+	if err := os.MkdirAll(filepath.Dir(m.versionsDir), dirMode); err != nil {
+		return fmt.Errorf("creating the installation root: %w", err)
+	}
+	switch err := os.Mkdir(m.versionsDir, dirMode); {
+	case err == nil:
+	case errors.Is(err, fs.ErrExist):
+		return nil
+	default:
+		return fmt.Errorf("creating the installation root: %w", err)
+	}
+	if err := enforceDirMode(m.versionsDir, dirMode); err != nil {
+		return fmt.Errorf("the installation root was created writable by others: %w", err)
+	}
+	return nil
 }
 
 // runInstaller runs the archive's own installer against the PRIVATE staging home,
@@ -367,9 +423,19 @@ func (m *Manager) gateStaged(ctx context.Context, staged string) error {
 // directory entry or the file data reached stable storage. Any sync failure —
 // ENOSPC included — fails the install, which leaves every complete version
 // already on the volume untouched.
+//
+// The staged directory's stored mode is verified before anything moves into it,
+// and that verdict is what the PUBLISHED directory carries: publish renames this
+// same inode into place, and a rename cannot change a mode. A directory born
+// group-writable would let a group member replace the root-executed binary the
+// digest check just admitted, so a mode the filesystem refused to store fails the
+// install like any other durability failure.
 func (m *Manager) assemble(stage *stageTree, src string) error {
 	if err := os.MkdirAll(stage.versionDir, dirMode); err != nil {
 		return fmt.Errorf("creating the staged version directory: %w", err)
+	}
+	if err := enforceDirMode(stage.versionDir, dirMode); err != nil {
+		return fmt.Errorf("the staged version directory would be published writable by others: %w", err)
 	}
 	moved := make([]string, 0, len(m.cfg.Require)+len(m.cfg.Optional))
 	for _, name := range m.cfg.Require {
@@ -420,15 +486,47 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 // writeSentinel writes the ".complete" marker LAST, holding the version whose
 // full artifact set the directory contains. It lives inside the directory it
 // describes, so it cannot drift from those artifacts.
+//
+// fileMode is verified on the open descriptor before any bytes go in, because the
+// sentinel's own mode is the only thing protecting its contents: the version
+// directory's verified 0755 stops another principal creating, replacing or
+// removing entries, not writing to an entry whose own mode the filesystem
+// widened. A group-writable sentinel is rewritable, and a sentinel that no longer
+// names its directory makes a COMPLETE version read as a partial — which
+// prunePartials then deletes, costing the operator the retained fallback set the
+// availability posture depends on.
 func (m *Manager) writeSentinel(dir string) error {
 	path := filepath.Join(dir, sentinelName)
-	if err := os.WriteFile(path, []byte(m.cfg.Version+"\n"), fileMode); err != nil {
+	if err := writeFileVerifiedMode(path, []byte(m.cfg.Version+"\n"), fileMode); err != nil {
 		return fmt.Errorf("writing the completion sentinel: %w", err)
 	}
 	if err := m.fsync(path); err != nil {
 		return fmt.Errorf("syncing the completion sentinel: %w", err)
 	}
 	return nil
+}
+
+// writeFileVerifiedMode writes data to path with mode, proving the filesystem
+// STORED mode before the content is written rather than trusting the mode the
+// create asked for. Same rule as [enforceDirMode], on the descriptor the create
+// returned: the file never holds content while its permissions are wider than
+// asked for, so there is no window in which a widened file has anything worth
+// rewriting.
+func writeFileVerifiedMode(path string, data []byte, mode os.FileMode) error {
+	// #nosec G304 -- path is built from Root and this package's own constants.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := atomicfile.EnforceMode(f, mode); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // publish renames the staged version directory to its final name and syncs the
@@ -473,6 +571,55 @@ func (m *Manager) writeFileDurably(path string, data []byte, mode os.FileMode) e
 		return err
 	}
 	return m.fsync(dir)
+}
+
+// enforceDirMode proves that the filesystem STORED want for the directory this
+// process just created, instead of trusting that it honoured the mode the mkdir
+// asked for.
+//
+// A mode argument is a REQUEST, not a result. mkdir(2) passes it through umask,
+// and a filesystem carrying an inheritable group ACL can store something wider
+// than what was asked for regardless: measured on a ZFS nfs4acl dataset an
+// inheritable group@:rwx ACE yields 0770 from a 0o700 mkdir, and tightening the
+// parent does not cover it. Consumers of this library keep their installation
+// root on exactly such a volume, and nothing here ever read the mode back.
+//
+// What that costs is the integrity gate the whole version-addressed layout
+// exists to provide. A version directory holds the artifacts a consumer executes
+// AS ROOT, admitted only because the archive they came out of matched the pinned
+// digest. Born group-writable, that directory lets any member of the widening
+// group replace the binary AFTER the digest check passed, and nothing downstream
+// would notice: the completion sentinel is a plain file, so it is forgeable
+// rather than evidence, and the version probe re-reads whatever binary is at the
+// path now. The mode is the only thing standing between a verified install and a
+// substituted one.
+//
+// The verdict comes from an OPEN HANDLE — atomicfile.EnforceMode fchmods and
+// then fstats the same descriptor — so a name swapped in between the repair and
+// the check cannot make it certify a different directory. O_NOFOLLOW makes the
+// kernel refuse a symlink at the final component and O_DIRECTORY refuses
+// anything that is not a directory; O_NONBLOCK is what keeps a planted FIFO from
+// parking this call in open(2) indefinitely with no writer on the other end.
+//
+// It is only ever called on a directory THIS process created, which is what
+// makes the chmod inside it safe: no other writer has ever held that name, so
+// the repair cannot be taking over a directory somebody else made. A directory
+// that was already there when the install started — an installation root a
+// consumer's entrypoint creates and hardens — is never handed to it; see
+// ensureVersionsDir for why repairing one is not this library's call.
+func enforceDirMode(dir string, want os.FileMode) error {
+	// #nosec G304 -- dir is always a path this package just created under Root,
+	// never request data, and the open flags refuse a link or a non-directory in
+	// the kernel rather than after the fact.
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s to verify the mode it was created with: %w", dir, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := atomicfile.EnforceMode(f, want); err != nil {
+		return err
+	}
+	return nil
 }
 
 // fsyncPath commits the file or directory at path to stable storage. fsync on a

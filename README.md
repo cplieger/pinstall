@@ -13,7 +13,7 @@ A Go library for programs that must install a specific version of some other pro
 
 It is the piece you would otherwise write in a shell script, with the failure modes that script usually has: a half-written install directory that looks finished, a binary that silently self-updated out from under the digest you verified, a partial download reported as a checksum mismatch, and no way to tell "still installing" from "gave up".
 
-Nothing here exits your process, reads the environment, or does work at import time. One dependency outside the standard library, `cplieger/pathinside`, which is itself standard-library-only. Linux only.
+Nothing here exits your process, reads the environment, or does work at import time. Two dependencies outside the standard library, `cplieger/pathinside` and `cplieger/atomicfile`, neither of which pulls anything else into your build. Linux only.
 
 ## Why it is shaped this way
 
