@@ -309,7 +309,7 @@ type verifiedArchive struct {
 }
 
 // reader returns a reader over exactly the verified bytes. Each call builds a
-// fresh one: a [io.SectionReader] carries its own offset, so sequential reading
+// fresh one: an [io.SectionReader] carries its own offset, so sequential reading
 // by an unpacker moves nothing on the shared descriptor.
 func (a *verifiedArchive) reader() *io.SectionReader {
 	return io.NewSectionReader(a.file, 0, a.size)
