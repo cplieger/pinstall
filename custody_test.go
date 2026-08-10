@@ -61,7 +61,13 @@ func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
 	}{
 		"group writable, by a group that is not root": {mode: 0o775, chgrp: true, want: "gid 65500"},
 		"other writable": {mode: 0o757, want: "everyone"},
-		"both writable":  {mode: 0o777, want: "everyone"},
+		// Both bits set names the GROUP, not everyone: writersOf enumerates the group
+		// first and firstStranger stops at the first writer the caller has not
+		// accounted for. The group is pinned to a stranger here rather than left as
+		// whatever gid the test process happens to carry, because the root group is
+		// trusted — so as root this case would report everyone and as anyone else the
+		// group, and the assertion would be describing the environment.
+		"both writable, the group reported first":       {mode: 0o777, chgrp: true, want: "gid 65500"},
 		"group write only, by a group that is not root": {mode: 0o720, chgrp: true, want: "gid 65500"},
 	}
 	for name, tc := range tests {
@@ -149,15 +155,26 @@ func TestVerifyCustodyAcceptsADeclaredGroup(t *testing.T) {
 // TestVerifyCustodyNeverTrustsEveryone pins the one identity that cannot be declared. A
 // grant to everyone names no identity, so accepting it would be turning the check off
 // while pretending to narrow it — which is what InstallWithoutCustody is for, honestly.
+//
+// The mode grants everyone write and the group NOTHING, so everyone is the only writer in
+// the set and the assertion cannot be satisfied by some other stranger reported first. At
+// 0777 the group is enumerated ahead of everyone, and the root group is trusted while an
+// ordinary one is not, so that mode would report everyone as root and a gid as anyone
+// else — an assertion about the environment rather than about the rule.
 func TestVerifyCustodyNeverTrustsEveryone(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pkg-versions")
-	if err := os.MkdirAll(root, 0o777); err != nil {
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.Chmod(root, 0o777); err != nil {
+	if err := os.Chmod(root, 0o707); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	trust := trustedWriters{uids: []int{0, 1, 2, 3000, os.Geteuid()}, gids: []int{0, 1, 2, 568}}
+	// Every identity this process could possibly name, including its own group, so the
+	// refusal is not an artifact of an incomplete list.
+	trust := trustedWriters{
+		uids: []int{0, 1, 2, 3000, os.Geteuid()},
+		gids: []int{0, 1, 2, 568, os.Getgid()},
+	}
 	err := verifyCustody(root, trust)
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: no list of identities can cover everyone", err)
