@@ -428,13 +428,12 @@ func validateComponent(field, value string) error {
 // these is joined onto a directory this package owns, so refusing at
 // construction beats discovering the escape after a download.
 //
-// The escape test is pathinside.RelEscapes, the same separator-precise rule
-// safeJoin applies to archive entry names: it cleans the name first, so a
-// traversal buried mid-string is caught, and it refuses "../a" without refusing
-// a legitimate "..extras/bin". Absoluteness and the empty-value decision stay
-// here — pathinside deliberately judges neither, and whether an empty path means
-// "the root of whichever directory applies" or "a missing required field" is this
-// package's business, not the library's.
+// The escape test is pathinside.RelEscapes, a separator-precise rule: it cleans
+// the name first, so a traversal buried mid-string is caught, and it refuses
+// "../a" without refusing a legitimate "..extras/bin". Absoluteness and the
+// empty-value decision stay here — pathinside deliberately judges neither, and
+// whether an empty path means "the root of whichever directory applies" or "a
+// missing required field" is this package's business, not the library's.
 func validateRelPath(field, value string, allowEmpty bool) error {
 	if value == "" {
 		if allowEmpty {

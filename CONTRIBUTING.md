@@ -188,8 +188,10 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `custody_test.go`: the precondition — a private tree accepted including its sticky
   world-writable ancestor, every shape of non-owner write refused at every depth, an
   NFSv4 ACL evaluated and then accepted once its writer is declared, a POSIX ACL whose
-  mask withholds write, the resolved-chain and lexical-chain rules, and each of the three
-  custody-related Config fields end to end.
+  mask withholds write, the resolved-chain and lexical-chain rules, the sticky ancestor's
+  own limit (an ACL granting `WRITE_OWNER` or `WRITE_ACL` there is refused, an ordinary write
+  grant is not), the publish-side gate on the version directory and its sentinel, and each of
+  the four custody-related Config fields end to end.
 - `acl_golden_test.go`: the wire formats, against real captured lists, plus every shape of
   malformed input and every reason an entry grants nothing.
 - `release_test.go`: the profile and sweep validation tables, the package-name
@@ -205,13 +207,34 @@ Conventions that matter here:
   boundary crossings, the readiness reason, the typed error via `errors.Is`. An
   off switch is asserted by ABSENCE (no link, no marker, no directory created).
 - Every untrusted string boundary carries a `testing.F` target with a real
-  invariant, not a crash-only body: `FuzzSafeJoin` (an accepted archive entry
-  resolves strictly inside the extraction directory), `FuzzValidateVersion` (an
-  accepted pin is one benign path component and carries no URL metacharacter), and
-  `FuzzLastFieldOfFirstLine` (the result is always a whitespace-free field of the
-  first line). Add one for any new parsing or validation you introduce.
-- A case that only passes unprivileged (a permission-denied delete) skips
-  explicitly when running as root rather than asserting something weaker.
+  invariant, not a crash-only body: `FuzzUnpackZipEntryNames` (an entry the unpacker
+  accepts lands strictly inside the destination, asserted against the filesystem
+  rather than a lexical helper), `FuzzValidateVersion` (an accepted pin is one benign
+  path component and carries no URL metacharacter), and `FuzzLastFieldOfFirstLine`
+  (the result is always a whitespace-free field of the first line). Add one for any
+  new parsing or validation you introduce.
+- **Run the suite as a non-root user before you push.** A test whose assertion depends
+  on the uid or gid it runs as will pass in a root container and fail in CI, which runs
+  unprivileged, and this has cost two rounds of red CI here. Both directions need care:
+  a case that only passes unprivileged (a permission-denied delete) skips explicitly
+  when running as root rather than asserting something weaker, and a case that only
+  passes AS root is the harder one to notice, because a root-green gate looks finished.
+  Two custody tests asserted a refusal names `everyone` on a `0777` directory; the
+  writer set enumerates the group first and gid 0 is trusted while an ordinary gid is
+  not, so they passed locally and named `gid 1001` on the runner. Fix the fixture so it
+  isolates the property (`0707` grants everyone write and the group nothing) rather than
+  teaching the test which environment it is in.
+- **A `t.Skipf` on an unprivileged runner means the property gates nothing where CI
+  runs**, so ask what else witnesses it. Every end-to-end test for `TrustedUIDs` and
+  `TrustedGIDs` needs `os.Chown` to a stranger gid, so the whole declaration could be
+  disconnected from the manager with the unprivileged suite green; `checkSymlink` could
+  be replaced with `return nil` for the same reason. Keep the privileged test and add an
+  unprivileged witness: the process's own primary gid is a stranger to an empty trust
+  set whenever it is not 0, and a predicate taking its identities as parameters
+  (`allowsOwner`, `checkSymlink`) is testable directly at any privilege.
+- **Mutation-check a new security predicate as that user.** Break it, confirm something
+  fails. A mutant that survives unprivileged is a guard CI is not holding, whatever the
+  local run says.
 
 ## Commits and PRs
 
