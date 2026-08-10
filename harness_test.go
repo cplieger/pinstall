@@ -88,6 +88,9 @@ type fakeEnv struct {
 	// installerFails makes the installer report a failure AND write nothing, the
 	// shape that fails the staged gates.
 	installerFails bool
+	// wideArtifacts names the artifacts the fake installer leaves group- and
+	// other-writable, the shape a real installer choosing its own modes can produce.
+	wideArtifacts []string
 	// probeAnswerFor renders the version a fake artifact encodes into the shape
 	// that package's probe prints.
 	probeAnswerFor func(version string) string
@@ -348,8 +351,14 @@ func (e *fakeEnv) runInstaller(c *command) ([]byte, error) {
 		return nil, err
 	}
 	for name, version := range e.produces {
-		if err := writeFakeBinary(filepath.Join(binDir, name), version); err != nil {
+		path := filepath.Join(binDir, name)
+		if err := writeFakeBinary(path, version); err != nil {
 			return nil, err
+		}
+		if slices.Contains(e.wideArtifacts, name) {
+			if err := os.Chmod(path, 0o777); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return []byte("installed\n"), nil

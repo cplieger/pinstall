@@ -218,6 +218,8 @@ func (m *Manager) install(ctx context.Context) error {
 	if dlErr != nil {
 		return dlErr
 	}
+	// Closed as soon as the extraction is done; the defer only covers the failure
+	// paths between here and there. Closing twice is harmless.
 	defer func() { _ = archive.close() }()
 
 	stage, stageErr := m.newStage()
@@ -226,13 +228,15 @@ func (m *Manager) install(ctx context.Context) error {
 	}
 	defer os.RemoveAll(stage.root)
 
-	extract, extractErr := os.OpenRoot(stage.extract)
-	if extractErr != nil {
-		return fmt.Errorf("opening the extraction directory: %w", extractErr)
+	if err := m.extract(ctx, archive, stage); err != nil {
+		return err
 	}
-	defer func() { _ = extract.Close() }()
-	if err := m.unpack(ctx, archive.reader(), extract); err != nil {
-		return fmt.Errorf("unpacking the archive: %w", err)
+	// The archive's blocks are the caller's disk, and nothing after the extraction
+	// reads them. Release them before the installer, the gates and the publish run,
+	// rather than holding a copy of the download alongside the extracted tree and
+	// the version directory for the rest of the install.
+	if err := archive.close(); err != nil {
+		return fmt.Errorf("closing the archive: %w", err)
 	}
 	src, srcErr := m.runInstaller(ctx, stage)
 	if srcErr != nil {
@@ -252,6 +256,20 @@ func (m *Manager) install(ctx context.Context) error {
 	m.mu.Unlock()
 	slog.Info("installed", "package", m.cfg.Release.Name, "version", m.cfg.Version,
 		"dir", m.versionDir(m.cfg.Version))
+	return nil
+}
+
+// extract unpacks the verified archive into the staging tree through an [os.Root],
+// so no archive entry can name its way out of the extraction directory.
+func (m *Manager) extract(ctx context.Context, archive *verifiedArchive, stage *stageTree) error {
+	dst, err := os.OpenRoot(stage.extract)
+	if err != nil {
+		return fmt.Errorf("opening the extraction directory: %w", err)
+	}
+	defer func() { _ = dst.Close() }()
+	if err := m.unpack(ctx, archive.reader(), dst); err != nil {
+		return fmt.Errorf("unpacking the archive: %w", err)
+	}
 	return nil
 }
 
@@ -501,6 +519,16 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 	from := filepath.Join(src, name)
 	if !selfContained(from) {
 		return "", errors.New("absent, not executable, or a symlink into the staging tree")
+	}
+	// An in-archive installer chooses its own modes, and this rename is the last
+	// point at which what it chose can be refused: publish moves this inode into
+	// place and a rename cannot change a mode. A group- or other-writable artifact
+	// in a published version directory is a binary this package executes and
+	// another principal can rewrite, which is the integrity gate the pin exists to
+	// provide. It is refused rather than repaired, for the same reason nothing else
+	// here is repaired.
+	if !artifactPrivate(from) {
+		return "", errors.New("writable by another principal, and this package will not publish an artifact it executes that somebody else can rewrite")
 	}
 	to := filepath.Join(dst, name)
 	if err := m.rename(from, to); err != nil {

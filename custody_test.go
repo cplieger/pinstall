@@ -136,8 +136,15 @@ func TestVerifyCustodyIgnoresAPOSIXACL(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := setPOSIXACL(root, posixACLNamedUserUnderMask); err != nil {
-		t.Skipf("this filesystem does not accept a POSIX ACL (%v), so the exemption is untested here", err)
+	switch err := setPOSIXACL(root, posixACLNamedUserUnderMask); {
+	case err == nil:
+	case errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EOPNOTSUPP):
+		t.Skipf("this filesystem does not support POSIX ACLs (%v), so the exemption is untested here", err)
+	default:
+		// EINVAL and friends mean the kernel rejected THIS blob, which is a bug in
+		// the fixture's encoding rather than a missing filesystem feature. Skipping
+		// on it would quietly retire the one test that pins the exemption.
+		t.Fatalf("the kernel rejected the fixture ACL (%v); the encoding in setPOSIXACL is wrong", err)
 	}
 	names, err := syscall.Listxattr(root, make([]byte, 1024))
 	if err != nil || names == 0 {
@@ -359,4 +366,215 @@ func setPOSIXACL(path string, entries []posixACLEntry) error {
 		blob = binary.LittleEndian.AppendUint32(blob, e.id)
 	}
 	return syscall.Setxattr(path, "system.posix_acl_access", blob, 0)
+}
+
+// TestVerifyCustodyRefusesAStickyInstallationRoot pins the difference between the
+// leaf and its ancestors, which the first version of this check got wrong.
+//
+// Sticky restricts removal and renaming, never CREATE. On an ancestor that is
+// enough, because what needs protecting there is our own directory entry. On the
+// installation root it is not: anyone able to create entries inside it can plant a
+// complete-looking version directory, and selection would accept it as installed.
+// The end-to-end half is what makes the severity concrete — before the fix, Ensure
+// activated a planted version with ZERO fetches.
+func TestVerifyCustodyRefusesAStickyInstallationRoot(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	if err := os.Chmod(env.versionsRoot(), 0o777|os.ModeSticky); err != nil {
+		t.Fatalf("chmod the installation root sticky and world-writable: %v", err)
+	}
+
+	err := verifyCustody(env.versionsRoot())
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody for a sticky world-writable root", err)
+	}
+	if !strings.Contains(err.Error(), "sticky") {
+		t.Errorf("error %q does not explain why the sticky bit is not enough here", err)
+	}
+
+	m := env.manager()
+	_ = m.Ensure(context.Background())
+	if ready, _ := m.Ready(); ready && env.fetchCount() == 0 {
+		t.Error("Ensure activated a planted version through a sticky world-writable root without downloading anything")
+	}
+}
+
+// TestVerifyCustodyRefusesAWritableDirectoryHoldingASymlinkOnThePath pins the
+// second half of the chain rule. verifyCustody resolves symlinks, but every later
+// operation in this package reaches the tree through the NAME (MkdirTemp,
+// CreateTemp, OpenRoot, Rename, RemoveAll), so a component another principal can
+// replace is a component that can be repointed after the verdict. Judging only the
+// resolved chain let a 0777 directory holding the symlink go unexamined.
+func TestVerifyCustodyRefusesAWritableDirectoryHoldingASymlinkOnThePath(t *testing.T) {
+	base := t.TempDir()
+	pub := filepath.Join(base, "pub")
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "pkg-versions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.MkdirAll(pub, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink(real, filepath.Join(pub, "tools")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	viaLink := filepath.Join(pub, "tools", "pkg-versions")
+
+	if err := verifyCustody(viaLink); err != nil {
+		t.Fatalf("verifyCustody refused a private chain reached through a symlink: %v", err)
+	}
+
+	// The resolved target is untouched and still private; only the directory
+	// HOLDING the link becomes writable, which is what repoints the name.
+	if err := os.Chmod(pub, 0o777); err != nil {
+		t.Fatalf("chmod the directory holding the symlink: %v", err)
+	}
+	err := verifyCustody(viaLink)
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the symlink's own directory is writable by everyone, so the name can be repointed", err)
+	}
+	if !strings.Contains(err.Error(), pub) {
+		t.Errorf("error %q does not name %s, the directory that can repoint the path", err, pub)
+	}
+}
+
+// TestVerifyCustodyRefusesAnUnreadableAttributeList pins the fail-closed direction.
+// Reading the attribute list is part of establishing the precondition, so a list
+// this process cannot read leaves it in the same position as finding an ACL it
+// cannot evaluate. Only the "this filesystem has no extended attributes" answers
+// are benign.
+func TestVerifyCustodyRefusesAnUnreadableAttributeList(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	tests := map[string]struct {
+		err     error
+		wantErr bool
+	}{
+		"an I/O error":                {err: syscall.EIO, wantErr: true},
+		"permission denied":           {err: syscall.EACCES, wantErr: true},
+		"a list too big to read":      {err: syscall.E2BIG, wantErr: true},
+		"no extended attributes":      {err: syscall.ENOTSUP},
+		"no such attribute":           {err: syscall.ENODATA},
+		"the call is not implemented": {err: syscall.ENOSYS},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			old := listxattrNames
+			listxattrNames = func(string, []byte) (int, error) { return 0, tc.err }
+			defer func() { listxattrNames = old }()
+
+			err := verifyCustody(root)
+			if tc.wantErr && !errors.Is(err, ErrNoCustody) {
+				t.Fatalf("verifyCustody error = %v, want ErrNoCustody when listxattr answers %v", err, tc.err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("verifyCustody error = %v, want nil when listxattr answers %v (there is no ACL to hide anything)", err, tc.err)
+			}
+		})
+	}
+}
+
+// TestVerifyCustodyRetriesAGrownAttributeList pins the ERANGE path: the second read
+// must use the size the kernel reported, so a directory carrying many attributes
+// cannot push an ACL name out of a fixed window, and a still-failing retry refuses.
+func TestVerifyCustodyRetriesAGrownAttributeList(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	padding := make([]byte, 4096)
+	for i := range padding {
+		padding[i] = 'a'
+	}
+	names := append(append([]byte("user."), padding...), 0)
+	names = append(names, []byte("system.nfs4_acl_xdr")...)
+	names = append(names, 0)
+
+	old := listxattrNames
+	listxattrNames = func(_ string, dest []byte) (int, error) {
+		switch {
+		case dest == nil:
+			return len(names), nil
+		case len(dest) < len(names):
+			return 0, syscall.ERANGE
+		}
+		return copy(dest, names), nil
+	}
+	defer func() { listxattrNames = old }()
+
+	err := verifyCustody(root)
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the ACL name sits past the first buffer", err)
+	}
+	if !strings.Contains(err.Error(), "system.nfs4_acl_xdr") {
+		t.Errorf("error %q does not name the access-control list found on the retry", err)
+	}
+}
+
+// TestEnsureDeletesNothingInATreeItRefuses pins that the read-only precondition is
+// actually read-only in the whole operation, not only in its own function. The
+// legacy purge and the partial sweep are both DELETES, and running them inside a
+// tree the library then refuses would assert exactly the authority the refusal
+// exists to disclaim.
+func TestEnsureDeletesNothingInATreeItRefuses(t *testing.T) {
+	env := newFakeEnv(t)
+	partial := env.placePartial("1.0.0")
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
+	m := env.manager()
+
+	if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
+	}
+	if !exists(partial) {
+		t.Errorf("Ensure deleted %s inside a tree it refused to install into", partial)
+	}
+}
+
+// TestSelectActiveExcludesAVersionWithAWritableArtifact pins the check custody of
+// the TREE cannot make. Directory write permission governs creating, removing and
+// renaming entries — not writing to the contents of an entry that already exists —
+// so a group- or other-writable artifact inside a directory nobody else can add to
+// is still a binary this package executes and another principal can rewrite.
+//
+// The version probe does not cover this: a rewritten binary can print whatever
+// version its directory name claims.
+func TestSelectActiveExcludesAVersionWithAWritableArtifact(t *testing.T) {
+	env := newFakeEnv(t)
+	dir := env.placeVersion(pinnedVersion)
+	if err := os.Chmod(filepath.Join(dir, toolName), 0o777); err != nil {
+		t.Fatalf("chmod the artifact: %v", err)
+	}
+	m := env.manager()
+	m.checkCustody()
+
+	if _, ok := m.selectActive(context.Background()); ok {
+		t.Fatal("selectActive accepted a version whose primary artifact is writable by another principal")
+	}
+}
+
+// TestMoveArtifactRefusesToPublishAWritableArtifact pins the same rule at the other
+// end. An in-archive installer chooses its own modes, and the rename into the
+// version directory is the last point at which what it chose can be refused:
+// publish moves this inode into place and a rename cannot change a mode.
+func TestMoveArtifactRefusesToPublishAWritableArtifact(t *testing.T) {
+	env := newFakeEnv(t)
+	env.produces = map[string]string{toolName: pinnedVersion, toolSidecar: pinnedVersion, toolExtra: pinnedVersion}
+	env.wideArtifacts = []string{toolName}
+	m := env.manager()
+
+	err := m.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure published an artifact the installer left writable by another principal")
+	}
+	if !strings.Contains(err.Error(), "writable by another principal") {
+		t.Errorf("Ensure error = %v, want one naming the writable artifact", err)
+	}
+	if dirs := env.versionDirs(); len(dirs) != 0 {
+		t.Errorf("installation root holds %v, want nothing published", dirs)
+	}
 }

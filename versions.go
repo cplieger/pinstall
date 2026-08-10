@@ -110,22 +110,58 @@ func (m *Manager) completeVersions() []string {
 	return out
 }
 
-// trusted reports whether a version directory may be activated. Without custody
-// of the tree a sentinel proves nothing — it is a plain file, trivially forgeable,
-// unlike a digest — so only a version THIS process installed from a verified
-// archive qualifies.
+// trusted reports whether a version directory may be activated. A sentinel proves
+// nothing on its own — it is a plain file, trivially forgeable, unlike a digest — so
+// when the tree cannot be trusted only a version THIS process installed from a
+// verified archive qualifies.
 //
-// The verdict is MEASURED (see [verifyCustody]) rather than declared by the
-// caller. [Config.Untrusted] waives the refusal to install into such a tree; it is
-// not what decides whether the tree is trustworthy, because a caller cannot be
-// expected to know that its volume carries an inherited ACL.
+// TWO independent triggers, and both are needed:
+//
+//   - The measured custody verdict ([verifyCustody]). A caller cannot be expected to
+//     know that its volume carries an inherited ACL, so the library finds out.
+//   - [Config.Untrusted], unconditionally. It keeps the meaning it had before the
+//     measurement existed, because measurement has blind spots a caller may know
+//     about: a volume mounted into two containers whose processes both map to uid 0
+//     passes every check here, and the flag is the only way to say so.
 func (m *Manager) trusted(version string) bool {
+	if m.cfg.Untrusted {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.installed[version]
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.custodyErr == nil {
 		return true
 	}
 	return m.installed[version]
+}
+
+// artifactPrivate reports whether path is a file only its owner may write.
+//
+// Custody of the TREE does not answer this: directory write permission governs
+// creating, removing and renaming entries, not writing to the contents of an entry
+// that already exists. A group- or other-writable artifact inside a directory nobody
+// else can add to is still a binary this package executes and another principal can
+// rewrite, so the mode of the artifact itself has to be read — and, like everything
+// else here, read rather than repaired.
+func artifactPrivate(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode().Perm()&0o022 == 0
+}
+
+// wideArtifact returns the name of the first artifact in dir that another principal
+// could rewrite, or "" when every required artifact is private to its owner.
+func (m *Manager) wideArtifact(dir string) string {
+	for _, name := range m.cfg.Require {
+		if !artifactPrivate(filepath.Join(dir, name)) {
+			return name
+		}
+	}
+	return ""
 }
 
 // selectActive picks the version to run: the pin when it is activatable, else the
@@ -140,11 +176,16 @@ func (m *Manager) trusted(version string) bool {
 func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 	for _, version := range preferPin(m.completeVersions(), m.cfg.Version) {
 		if !m.trusted(version) {
-			slog.Warn("ignoring an existing version directory because the installation root was writable by others; only a freshly verified install may be activated",
-				"package", m.cfg.Release.Name, "version", version)
+			slog.Warn("ignoring an existing version directory because this process does not exclusively control the installation tree; only a freshly verified install may be activated",
+				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict(), "untrusted", m.cfg.Untrusted)
 			continue
 		}
 		dir := m.versionDir(version)
+		if wide := m.wideArtifact(dir); wide != "" {
+			slog.Error("excluding a version directory: one of its artifacts is writable by another principal, so it is a binary this process would execute and somebody else could rewrite",
+				"package", m.cfg.Release.Name, "version", version, "artifact", wide)
+			continue
+		}
 		bin := filepath.Join(dir, m.primary)
 		got, err := m.probeVersion(ctx, bin)
 		if err != nil {

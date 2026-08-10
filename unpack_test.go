@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,21 +35,54 @@ func TestUnpackZipRefusesEscapingEntries(t *testing.T) {
 	}
 	for name, entry := range tests {
 		t.Run(name, func(t *testing.T) {
-			base := t.TempDir()
-			out := filepath.Join(base, "out")
-			if err := os.Mkdir(out, 0o755); err != nil {
-				t.Fatalf("mkdir the extraction dir: %v", err)
-			}
+			base, out := nestedExtractionDir(t)
 			archive := zipReader(t, map[string]zipEntry{entry: {body: "pwned", mode: 0o644}})
 			if err := UnpackZip(context.Background(), archive, openRoot(t, out)); err == nil {
 				t.Errorf("UnpackZip accepted an archive holding %q", entry)
 			}
-			// The escape target for every case above resolves to the parent of
-			// the extraction directory, or to a fixed absolute path.
-			if exists(filepath.Join(base, "pwn")) || exists("/etc/cron.d/pwn") {
-				t.Fatalf("extraction of %q escaped the extraction directory", entry)
+			// The extraction directory is nested deep enough that every relative
+			// escape in the table lands inside base, so scanning base is a real
+			// oracle rather than a check of one guessed path. An absolute entry is
+			// the one shape that cannot land there, hence the fixed path too.
+			assertNothingOutsideExtraction(t, base, out)
+			if exists("/etc/cron.d/pwn") {
+				t.Fatalf("extraction of %q wrote to an absolute path", entry)
 			}
 		})
+	}
+}
+
+// nestedExtractionDir returns a scratch base and an extraction directory nested
+// several levels inside it, so a relative escape has somewhere observable to land.
+// A test that puts the extraction directory directly under its scratch root cannot
+// see "../../x" at all, which is how an escape oracle passes while missing escapes.
+func nestedExtractionDir(t *testing.T) (base, out string) {
+	t.Helper()
+	base = t.TempDir()
+	out = filepath.Join(base, "l1", "l2", "l3", "l4", "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("MkdirAll the extraction dir: %v", err)
+	}
+	return base, out
+}
+
+// assertNothingOutsideExtraction fails when base holds any regular file outside the
+// extraction directory, which is what a contained extraction guarantees.
+func assertNothingOutsideExtraction(t *testing.T, base, out string) {
+	t.Helper()
+	prefix := out + string(filepath.Separator)
+	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || path == out || strings.HasPrefix(path, prefix) {
+			return nil
+		}
+		t.Errorf("extraction wrote %s, which is outside the extraction directory %s", path, out)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", base, err)
 	}
 }
 
@@ -266,11 +300,7 @@ func FuzzUnpackZipEntryNames(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, name string) {
-		base := t.TempDir()
-		out := filepath.Join(base, "out")
-		if err := os.Mkdir(out, 0o755); err != nil {
-			t.Fatalf("mkdir the extraction dir: %v", err)
-		}
+		base, out := nestedExtractionDir(t)
 		raw, err := zipWithRawName(name)
 		if err != nil {
 			// Not every string is a name archive/zip can encode; that is the
@@ -284,15 +314,7 @@ func FuzzUnpackZipEntryNames(f *testing.F) {
 		defer root.Close()
 		_ = UnpackZip(context.Background(), bytesReader(raw), root)
 
-		siblings, readErr := os.ReadDir(base)
-		if readErr != nil {
-			t.Fatalf("ReadDir the parent of the extraction dir: %v", readErr)
-		}
-		for _, e := range siblings {
-			if e.Name() != "out" {
-				t.Fatalf("entry %q created %q beside the extraction directory", name, e.Name())
-			}
-		}
+		assertNothingOutsideExtraction(t, base, out)
 	})
 }
 

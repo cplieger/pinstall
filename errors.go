@@ -4,8 +4,11 @@ import "errors"
 
 // Errors callers can classify. Everything else is wrapped with context.
 var (
-	// ErrDigestMismatch reports that the downloaded archive is not the artifact
-	// the pinned digest names. Nothing is placed under Root when it is returned.
+	// ErrDigestMismatch reports that the downloaded archive is not the artifact the
+	// pinned digest names. No version directory and no staging tree are created when
+	// it is returned, so nothing becomes a selection candidate. The installation root
+	// itself may exist — custody has to be judged on the real directory — and the
+	// archive's own blocks are freed with its descriptor, having never had a name.
 	ErrDigestMismatch = errors.New("archive SHA-256 mismatch")
 	// ErrUnsupportedArch reports an architecture the release publishes no
 	// archive for, or one with no pinned digest.

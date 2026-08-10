@@ -35,9 +35,19 @@ import (
 // A filesystem with no ACL support answers listxattr with nothing, or ENOTSUP,
 // which reads as "the mode is authoritative" — the right default and the common
 // case.
+//
+// What this cannot see, stated plainly rather than papered over: a filesystem that
+// does not make the mode its access decision AT ALL. A cifs mount with noperm, or a
+// FUSE filesystem without default_permissions, will answer every permission question
+// itself and the numbers this check reads are then decoration. No mode-and-xattr
+// inspection can detect that from inside the process, so it is out of scope for
+// [verifyCustody] and belongs in the operator's decision, which is what
+// [Config.Untrusted] is for.
 var aclXattrs = []string{
 	"system.nfs4_acl",     // NFSv4 ACLs as exposed by the nfs client
 	"system.nfs4_acl_xdr", // NFSv4 ACLs as exposed by OpenZFS on Linux
+	"system.cifs_acl",     // SMB/CIFS security descriptors (cifs cifsacl)
+	"system.richacl",      // richacl, where it is present
 }
 
 // listxattrNames is syscall.Listxattr, replaced in tests. The one seam in this
@@ -109,13 +119,32 @@ var listxattrNames = syscall.Listxattr
 // verdict and its use — and changing the chain would need write access to a
 // component this walk just proved nobody else has.
 func verifyCustody(dir string) error {
+	euid := os.Geteuid()
+	// The NAME's own chain first. Every later operation in this package reaches the
+	// tree through this string (MkdirTemp, CreateTemp, OpenRoot, Rename, RemoveAll),
+	// so a component another principal can replace is a component that can be
+	// repointed after this verdict. A symlink here is allowed only if nobody else
+	// could swap it.
+	if err := walkChain(dir, euid); err != nil {
+		return err
+	}
+	// Then the chain it resolves to, which is where the tree actually lives.
 	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return fmt.Errorf("%w: resolving %s: %w", ErrNoCustody, dir, err)
 	}
-	euid := os.Geteuid()
-	for _, component := range ancestors(resolved) {
-		if err := checkComponent(component, euid); err != nil {
+	if resolved != dir {
+		return walkChain(resolved, euid)
+	}
+	return nil
+}
+
+// walkChain judges every component of an absolute path from the filesystem root
+// down to the path itself.
+func walkChain(path string, euid int) error {
+	components := ancestors(path)
+	for i, component := range components {
+		if err := checkComponent(component, euid, i == len(components)-1); err != nil {
 			return err
 		}
 	}
@@ -138,14 +167,14 @@ func ancestors(path string) []string {
 	return out
 }
 
-// checkComponent judges one directory in the chain.
-func checkComponent(path string, euid int) error {
+// checkComponent judges one component of a path chain.
+//
+// leaf marks the last component, which is the installation root itself, and it is
+// held to a stricter rule than its ancestors: see the sticky discussion below.
+func checkComponent(path string, euid int, leaf bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("%w: examining %s: %w", ErrNoCustody, path, err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
@@ -156,15 +185,57 @@ func checkComponent(path string, euid int) error {
 			ErrNoCustody, path, owner, euid)
 	}
 	mode := fi.Mode()
-	if writable := mode.Perm() & 0o022; writable != 0 && mode&os.ModeSticky == 0 {
-		return fmt.Errorf("%w: %s is mode %#o, writable by %s",
-			ErrNoCustody, path, mode.Perm(), writableBy(writable))
+	if mode&os.ModeSymlink != 0 {
+		// A symlink's own mode grants nothing on Linux, so ownership is the whole
+		// question: only its owner (or root) can replace it, and the ownership check
+		// above has just settled that. The directory it lands in is judged by the
+		// resolved walk.
+		return nil
 	}
-	if name, found := aclXattrPresent(path); found {
-		return fmt.Errorf("%w: %s carries an NFSv4 access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
+	if !mode.IsDir() {
+		return fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
+	}
+	if writeErr := checkWritable(path, mode, leaf); writeErr != nil {
+		return writeErr
+	}
+	name, aclErr := aclXattrPresent(path)
+	if aclErr != nil {
+		return fmt.Errorf("%w: %s: cannot read the attribute list that would reveal an access-control list, so custody cannot be established: %w",
+			ErrNoCustody, path, aclErr)
+	}
+	if name != "" {
+		return fmt.Errorf("%w: %s carries an NFSv4-family access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
 			ErrNoCustody, path, name, mode.Perm())
 	}
 	return nil
+}
+
+// checkWritable applies the write rule, whose one subtlety is the sticky bit.
+//
+// On an ANCESTOR, world-writable plus sticky is safe: sticky restricts removal and
+// renaming to the owner of each entry, so a principal who can create entries beside
+// ours cannot rename ours away or replace it. That exemption is what makes /tmp
+// (1777 on every Linux system) a usable place to root an installation.
+//
+// On the installation root ITSELF it is not safe, and this is the difference the
+// first version of this check got wrong. Sticky says nothing about CREATE, and the
+// root's contents are the thing being protected: anyone able to create entries there
+// can plant a complete-looking version directory, which selection would then accept
+// as an installed version. So the leaf must be private outright.
+func checkWritable(path string, mode os.FileMode, leaf bool) error {
+	writable := mode.Perm() & 0o022
+	if writable == 0 {
+		return nil
+	}
+	if !leaf && mode&os.ModeSticky != 0 {
+		return nil
+	}
+	if leaf && mode&os.ModeSticky != 0 {
+		return fmt.Errorf("%w: %s is mode %#o, writable by %s: the sticky bit stops another principal renaming this directory away but not creating a version directory inside it",
+			ErrNoCustody, path, mode.Perm(), writableBy(writable))
+	}
+	return fmt.Errorf("%w: %s is mode %#o, writable by %s",
+		ErrNoCustody, path, mode.Perm(), writableBy(writable))
 }
 
 // writableBy names the principals a set of write bits grants, for the error text.
@@ -179,36 +250,42 @@ func writableBy(bits os.FileMode) string {
 	return strings.Join(who, " and ")
 }
 
-// aclXattrPresent reports whether path carries one of [aclXattrs], and which.
+// aclXattrPresent reports which of [aclXattrs] path carries, "" for none, and an
+// error when the attribute list could not be read at all.
 //
-// A filesystem without extended-attribute support answers ENOTSUP, which is not a
-// failure: it means there is no ACL to hide anything, so the mode is
-// authoritative. Any other error is read the same way, because a listxattr this
-// process cannot perform on a directory it has just proved it owns is a
-// filesystem quirk rather than evidence of a permission this gate should invent.
-func aclXattrPresent(path string) (string, bool) {
+// Reading it is part of establishing the precondition, so an unreadable list is a
+// refusal rather than a pass: EIO, EACCES, a second ERANGE or E2BIG all mean this
+// check does not know what the filesystem will enforce, which is the same position
+// as finding an ACL it cannot evaluate. The one benign case is a filesystem with no
+// extended-attribute support, which answers ENOTSUP or ENODATA and genuinely has no
+// ACL to hide anything, so the mode is authoritative there.
+func aclXattrPresent(path string) (string, error) {
 	buf := make([]byte, 1024)
 	n, err := listxattrNames(path, buf)
 	if errors.Is(err, syscall.ERANGE) {
-		// The name list is longer than the buffer. Ask for the real size rather
-		// than guessing, so a directory carrying many attributes cannot push an
-		// ACL name out of a fixed window and past this check.
+		// The name list outgrew the buffer. Ask for the real size rather than
+		// guessing, so a directory carrying many attributes cannot push an ACL name
+		// out of a fixed window and past this check.
 		size, sizeErr := listxattrNames(path, nil)
-		if sizeErr != nil || size <= 0 {
-			return "", false
+		if sizeErr != nil {
+			return "", sizeErr
 		}
 		buf = make([]byte, size)
 		n, err = listxattrNames(path, buf)
 	}
-	if err != nil || n <= 0 {
-		return "", false
+	switch {
+	case errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EOPNOTSUPP),
+		errors.Is(err, syscall.ENODATA), errors.Is(err, syscall.ENOSYS):
+		return "", nil
+	case err != nil:
+		return "", err
 	}
 	for name := range strings.SplitSeq(string(buf[:n]), "\x00") {
 		if slices.Contains(aclXattrs, name) {
-			return name, true
+			return name, nil
 		}
 	}
-	return "", false
+	return "", nil
 }
 
 // checkCustody re-evaluates custody of the installation tree and records the
@@ -238,6 +315,13 @@ func (m *Manager) setCustody(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.custodyErr = err
+}
+
+// custodyVerdict returns the last recorded verdict.
+func (m *Manager) custodyVerdict() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.custodyErr
 }
 
 // requireCustody re-proves custody of the installation root now that it exists,

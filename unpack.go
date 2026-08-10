@@ -33,14 +33,20 @@ const (
 // implementation determined to find a path can still reach the file through
 // [io.SectionReader.Outer]; the signature removes the accident, not the intent.)
 //
-// dst is an [os.Root] on the extraction directory, and writing THROUGH it is what
-// makes an archive entry unable to escape: os.Root refuses an absolute name, a
-// traversing name, and a symlink leaving the tree, in the kernel, on every
-// operation. That is strictly stronger than the lexical check this library used to
-// perform and require of custom unpackers — a lexical check cannot see an entry
-// that writes through a symlink an earlier entry in the same archive planted,
-// which is the classic tar escape. An implementation must not join dst's name onto
-// an entry name and open the result directly; use the [os.Root] methods.
+// dst is an [os.Root] on the extraction directory. Write THROUGH it and an archive
+// entry cannot escape: os.Root refuses an absolute name, a traversing name, and a
+// symlink leaving the tree, in the kernel, on every operation. That is strictly
+// stronger than the lexical check this library used to perform and used to require
+// of custom unpackers by documentation — a lexical check cannot see an entry that
+// writes through a symlink an earlier entry in the same archive planted, which is
+// the classic tar escape.
+//
+// It is a better tool, not a cage. An Unpacker is ordinary in-process Go code: it
+// can read dst.Name() and call os.OpenFile itself, so nothing here can stop an
+// implementation that goes around the root. What the parameter does is remove the
+// need to re-derive containment correctly, and make the contained path the shortest
+// one. Do not join dst's name onto an entry name and open the result; use the
+// [os.Root] methods.
 //
 // An implementation MUST still bound the entry count and the total bytes written:
 // containment is not a size limit, and a hostile archive that cannot escape can

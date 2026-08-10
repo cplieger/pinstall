@@ -536,9 +536,11 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	})
 
 	t.Run("cannot write outside the destination it is handed", func(t *testing.T) {
-		// The containment is the destination's, not the unpacker's discipline: a
-		// custom implementation that tries to escape is refused by os.Root rather
-		// than trusted to have validated the name itself.
+		// A custom implementation that names its way out through the root it was
+		// handed is refused by os.Root rather than trusted to have validated the
+		// name itself. It could still call os.OpenFile directly and escape — a
+		// callback is ordinary Go code — so what this pins is that the SUPPLIED
+		// path is contained, not that the seam is a sandbox.
 		env := newFakeEnv(t)
 		var escapeErr error
 		env.release.Unpack = func(_ context.Context, _ *io.SectionReader, dst *os.Root) error {

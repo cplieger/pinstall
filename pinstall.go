@@ -388,9 +388,17 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	}
 	defer m.releaseOp()
 
-	m.purgeOnce()
+	// Custody first, and NOTHING mutates the tree before it. The purge and the
+	// partial sweep are deletes, and deleting inside a tree this library is about to
+	// refuse would assert exactly the authority the refusal exists to disclaim.
 	m.checkCustody()
-	m.prunePartials()
+	if m.custodyVerdict() == nil {
+		m.purgeOnce()
+		m.prunePartials()
+	} else {
+		slog.Warn("skipping the legacy purge and the partial sweep: both are deletes, and this process does not exclusively control the installation tree",
+			"package", m.cfg.Release.Name, "root", m.versionsDir)
+	}
 
 	sel, ok := m.selectActive(ctx)
 	var installErr error
