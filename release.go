@@ -34,6 +34,12 @@ type Release struct {
 	// ProbeArgs is the argv that makes the primary artifact print its version
 	// (e.g. {"--version"}). Required: every start probes the artifact it is
 	// about to activate, so a release with no probe cannot be verified.
+	//
+	// It must be safe to run against a version this deployment will NOT activate, and
+	// against one it is about to delete. Retention asks the same question of a retained
+	// candidate before counting it as a usable fallback, so the argv has to be a pure
+	// query: no migration, no cache warm, no write to shared state. A bare version flag
+	// is; a subcommand that touches the package's own configuration is not.
 	ProbeArgs []string
 	// Name is the package identity. It fixes the versions root
 	// (<Root>/<Name>-versions), the state file (<Root>/<Name>-state.json) and

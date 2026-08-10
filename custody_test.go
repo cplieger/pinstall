@@ -899,3 +899,98 @@ func TestSelectActiveRefusesEvenItsOwnInstallWithoutCustodyOrAWaiver(t *testing.
 		t.Errorf("Ready() = (%v, %v), want (false, %v)", ready, why, ReasonUnavailable)
 	}
 }
+
+// TestWideArtifactCoversUndeclaredEntries pins that the check is about the DIRECTORY's
+// contents, not about the names this deployment happens to declare. PathEntry leads PATH
+// with the whole version directory and a multi-binary release resolves its sidecars from
+// there by bare name, so an undeclared executable in a restored tree is reachable too.
+func TestWideArtifactCoversUndeclaredEntries(t *testing.T) {
+	env := newFakeEnv(t)
+	dir := env.placeVersion(pinnedVersion)
+	m := env.manager()
+	if wide := m.wideArtifact(dir); wide != "" {
+		t.Fatalf("wideArtifact = %q on a clean directory, want \"\"", wide)
+	}
+
+	stray := filepath.Join(dir, "not-declared-anywhere")
+	if err := writeFakeBinary(stray, pinnedVersion); err != nil {
+		t.Fatalf("writeFakeBinary: %v", err)
+	}
+	if err := os.Chmod(stray, 0o777); err != nil {
+		t.Fatalf("chmod the undeclared entry: %v", err)
+	}
+	if wide := m.wideArtifact(dir); wide != "not-declared-anywhere" {
+		t.Errorf("wideArtifact = %q, want the undeclared entry: it sits on PATH like every other file there", wide)
+	}
+}
+
+// TestWorldWritableStickyFailsClosed pins the direction of the one fact that decides
+// whether a symlink must be owned by us. An unreadable answer must count as sticky: the
+// unknown can then only ADD the ownership demand, where the opposite default let a
+// transient stat failure on the parent retire it silently.
+func TestWorldWritableStickyFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	if got := worldWritableSticky(dir); got {
+		t.Errorf("worldWritableSticky(%s) = true on a private directory", dir)
+	}
+	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if got := worldWritableSticky(dir); !got {
+		t.Errorf("worldWritableSticky(%s) = false on a world-writable sticky directory", dir)
+	}
+	if got := worldWritableSticky(filepath.Join(dir, "does-not-exist")); !got {
+		t.Error("worldWritableSticky = false for a path it could not stat, which retires the ownership demand instead of adding it")
+	}
+	file := filepath.Join(dir, "a-file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := worldWritableSticky(file); got {
+		t.Error("worldWritableSticky = true for a regular file, which is not a directory anything can be created in")
+	}
+}
+
+// TestRetentionNeverExecutesAVersionSelectionRefuses pins the ordering inside
+// usableAsFallback. probeVersion EXECUTES the artifact, so asking it about a directory
+// selection has refused would run a binary this manager declined to activate, as its own
+// uid, on the shared volume Config.Untrusted describes. Retention is a disk-hygiene
+// decision and must not become an execution path selection would not take.
+func TestRetentionNeverExecutesAVersionSelectionRefuses(t *testing.T) {
+	env := newFakeEnv(t)
+	planted := env.placeVersion("9.9.9")
+	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m.checkCustody()
+
+	if m.trusted("9.9.9") {
+		t.Fatal("the fixture is wrong: the planted version must be untrusted for this test to mean anything")
+	}
+	if m.usableAsFallback(context.Background(), "9.9.9") {
+		t.Error("usableAsFallback accepted a version selection refuses")
+	}
+	if got := env.countCalls("probe " + filepath.Join(planted, toolName)); got != 0 {
+		t.Errorf("the planted artifact was executed %d times by retention, after selection had refused it", got)
+	}
+}
+
+// TestUnavailableReportsTheWaiverCauseNotTheWaivedVerdict pins that a failed verdict is
+// only reported as the cause when it is what BLOCKED activation. Under the waiver it is
+// the accepted state, and reporting it would send an operator to fix permissions they
+// deliberately chose while hiding the real reason.
+func TestUnavailableReportsTheWaiverCauseNotTheWaivedVerdict(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
+	env.onFetch = func(io.Writer) error { return errors.New("network is down") }
+	m := env.manager(func(c *Config) { c.Untrusted = true })
+
+	err := m.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure succeeded although the planted version is untrusted and the fetch fails")
+	}
+	if errors.Is(err, ErrNoCustody) {
+		t.Errorf("Ensure error = %v, want the install failure: the caller waived custody, so the verdict is not what blocked this", err)
+	}
+}

@@ -329,16 +329,32 @@ func TestRetainedAndPrunedVersions(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			keep := slices.Sorted(slices.Values(retainedVersions(tc.complete, tc.active, tc.retain)))
+			// The two halves of retention, composed the way pruneSuperseded
+			// composes them: the pure lexical candidate list, then the spare set,
+			// then the victims. The usability half needs a filesystem and a
+			// subprocess, so it is covered by the Ensure-level tests instead; here
+			// every candidate is treated as usable, which is the healthy tree.
+			var keep []string
+			if tc.active != "" {
+				candidates := predecessorCandidates(tc.complete, tc.active)
+				retain := max(tc.retain, 0)
+				keep = append([]string{tc.active}, candidates[:min(retain, len(candidates))]...)
+			}
+			got := slices.Sorted(slices.Values(keep))
 			want := slices.Sorted(slices.Values(tc.wantKeep))
-			if !slices.Equal(keep, want) {
-				t.Errorf("retainedVersions = %v, want %v", keep, want)
+			if !slices.Equal(got, want) {
+				t.Errorf("retained = %v, want %v", got, want)
 			}
-			pruned := slices.Sorted(slices.Values(versionsToPrune(tc.complete, tc.active, tc.retain)))
+			var pruned []string
+			if tc.active != "" {
+				pruned = victimsOf(tc.complete, keep, nil)
+			}
+			prunedSorted := slices.Sorted(slices.Values(pruned))
 			wantPruned := slices.Sorted(slices.Values(tc.wantPruned))
-			if !slices.Equal(pruned, wantPruned) {
-				t.Errorf("versionsToPrune = %v, want %v", pruned, wantPruned)
+			if !slices.Equal(prunedSorted, wantPruned) {
+				t.Errorf("victimsOf = %v, want %v", prunedSorted, wantPruned)
 			}
+			keep, pruned = got, prunedSorted
 			for _, v := range pruned {
 				if slices.Contains(keep, v) {
 					t.Errorf("%q is both retained and pruned", v)

@@ -99,38 +99,52 @@ func (m *Manager) versionDirComplete(version string) bool {
 // directory that selection would refuse makes that promise false in exactly the
 // situation it exists for.
 //
-// The walk stops as soon as it has want of them, so the cost is normally one bounded
-// probe per prune — and pruning runs after a successful install, not on every start.
-func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) []string {
-	if want <= 0 {
-		return nil
-	}
-	older := make([]string, 0, len(complete))
-	for _, v := range complete {
-		if compareVersions(v, active) < 0 {
-			older = append(older, v)
-		}
-	}
-	sortVersionsDesc(older)
-	out := make([]string, 0, want)
-	for _, version := range older {
-		if len(out) == want {
+// The walk stops as soon as it has want of them, and it returns the ones it judged
+// UNUSABLE alongside, so the caller can spare those without asking again: the earlier
+// shape asked each question twice, once to fill the retained set and again to decide
+// each victim, which doubled the subprocesses and emitted every diagnosis twice.
+//
+// The cost, stated plainly because it is a subprocess: up to one bounded version probe
+// per complete directory older than the active one, capped by want plus however many
+// unusable directories are met before the cap. This runs wherever pruning does, which is
+// every Ensure and every Rescan that ends with a version active and no install error —
+// not only after an install. With the default want of 1 and a healthy tree it is one.
+func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) (keep, unusable []string) {
+	keep = make([]string, 0, max(want, 0))
+	for _, version := range predecessorCandidates(complete, active) {
+		if len(keep) >= want {
+			// Enough keepers. Anything further is a victim either way, and asking
+			// would cost a subprocess to reach the same outcome.
 			break
 		}
-		if m.usableAsFallback(ctx, version) {
-			out = append(out, version)
+		if !m.usableAsFallback(ctx, version) {
+			unusable = append(unusable, version)
+			continue
 		}
+		keep = append(keep, version)
 	}
-	return out
+	return keep, unusable
 }
 
 // usableAsFallback reports whether a complete version directory would survive
 // selection, and says why in the log when it would not.
+//
+// trusted() comes first, and that ordering is not an optimisation. probeVersion
+// EXECUTES the artifact, so asking it about a directory selection has refused would run
+// a binary this manager declined to activate, as the manager's own uid, on a volume it
+// shares with another principal — which is exactly the deployment [Config.Untrusted]
+// describes. Retention is a disk-hygiene decision and must not become an execution path
+// selection would not take.
 func (m *Manager) usableAsFallback(ctx context.Context, version string) bool {
+	if !m.trusted(version) {
+		slog.Warn("not counting a version directory towards retention: this process may not activate it, so it is not a fallback and must not be executed to find out",
+			"package", m.cfg.Release.Name, "version", version)
+		return false
+	}
 	dir := m.versionDir(version)
 	if wide := m.wideArtifact(dir); wide != "" {
-		slog.Warn("not counting a version directory towards retention: an entry in it is writable by another principal",
-			"package", m.cfg.Release.Name, "version", version, "entry", wide)
+		slog.Warn("not counting a version directory towards retention: it is writable by another principal",
+			"package", m.cfg.Release.Name, "version", version, "offender", wide)
 		return false
 	}
 	got, err := m.probeVersion(ctx, filepath.Join(dir, m.primary))
@@ -405,21 +419,10 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-// retainedVersions names the version directories pruning must KEEP: the active
-// version plus the `retain` newest complete versions below it, and nothing else.
-// This is why no rollback journal is needed — a predecessor survives every
-// switch, so a bad activation is recoverable by selecting it.
-//
-// Why per-version process leases are NOT taken: a retained set is only safe to
-// prune from when no live process still holds a reference into a dropped
-// directory. That holds when a new pin arrives only by restarting the consumer,
-// which ends every process started against the old version. A consumer that
-// enables LIVE in-place upgrades — a new pin reaching a running process without a
-// restart — breaks that argument, because work started on version A could still
-// reach into A's directory, and pruning would then have to take a per-version
-// lease and remove a directory only at zero leases. Revisit this function first
-// if that changes.
-func retainedVersions(complete []string, active string, retain int) []string {
+// predecessorCandidates returns the complete versions older than active, newest first.
+// It is the lexical half of retention, kept separate from the usability half because it
+// is pure: no filesystem, no subprocess, and therefore cheap to pin exhaustively.
+func predecessorCandidates(complete []string, active string) []string {
 	if active == "" {
 		return nil
 	}
@@ -430,26 +433,23 @@ func retainedVersions(complete []string, active string, retain int) []string {
 		}
 	}
 	sortVersionsDesc(older)
-	if retain < 0 {
-		retain = 0
-	}
-	return append([]string{active}, older[:min(retain, len(older))]...)
+	return older
 }
 
-// versionsToPrune returns the complete version directories that are neither
-// active nor among its retained predecessors. Anything NEWER than the active
-// version is also pruned: reaching that state means the pin moved down, and a
-// stale higher version is not a fallback the pin wants kept.
-func versionsToPrune(complete []string, active string, retain int) []string {
-	if active == "" {
-		return nil
-	}
-	keep := retainedVersions(complete, active, retain)
+// victimsOf returns the complete versions that pruning removes: everything that is
+// neither spared (the active version and its retained predecessors) nor unusable.
+//
+// Anything NEWER than the active version is a victim: reaching that state means the pin
+// moved down, and a stale higher version is not a fallback the pin wants kept. An
+// unusable one is not, and that asymmetry is deliberate — this library did not put a
+// directory into a state selection refuses, so deleting the evidence is not its call.
+func victimsOf(complete, spare, unusable []string) []string {
 	out := make([]string, 0, len(complete))
-	for _, v := range complete {
-		if !slices.Contains(keep, v) {
-			out = append(out, v)
+	for _, version := range complete {
+		if slices.Contains(spare, version) || slices.Contains(unusable, version) {
+			continue
 		}
+		out = append(out, version)
 	}
 	return out
 }
@@ -469,17 +469,8 @@ func versionsToPrune(complete []string, active string, retain int) []string {
 // is not its call.
 func (m *Manager) pruneSuperseded(ctx context.Context, active string) {
 	complete := m.completeVersions()
-	keep := append([]string{active}, m.usablePredecessors(ctx, complete, active, m.cfg.Retain)...)
-	victims := make([]string, 0, len(complete))
-	for _, version := range complete {
-		if slices.Contains(keep, version) {
-			continue
-		}
-		if !m.usableAsFallback(ctx, version) {
-			continue
-		}
-		victims = append(victims, version)
-	}
+	keep, unusable := m.usablePredecessors(ctx, complete, active, m.cfg.Retain)
+	victims := victimsOf(complete, append([]string{active}, keep...), unusable)
 	if len(victims) == 0 {
 		return
 	}
