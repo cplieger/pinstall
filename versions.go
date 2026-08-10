@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // LastFieldOfFirstLine is the default [Release.ParseVersion]: the last
@@ -88,6 +89,73 @@ func (m *Manager) versionDirComplete(version string) bool {
 	return true
 }
 
+// usablePredecessors returns up to want complete versions older than active that could
+// actually serve as a fallback, newest first.
+//
+// "Could serve" is the same question selection asks, and asking it here is what makes
+// the retained predecessor a real fallback rather than a directory nothing will
+// activate: private, and answering the version probe with the version its own directory
+// claims. The README promises N predecessors as the recovery mechanism, so counting a
+// directory that selection would refuse makes that promise false in exactly the
+// situation it exists for.
+//
+// The walk stops as soon as it has want of them, and it returns the ones it judged
+// UNUSABLE alongside, so the caller can spare those without asking again: the earlier
+// shape asked each question twice, once to fill the retained set and again to decide
+// each victim, which doubled the subprocesses and emitted every diagnosis twice.
+//
+// The cost, stated plainly because it is a subprocess: up to one bounded version probe
+// per complete directory older than the active one, capped by want plus however many
+// unusable directories are met before the cap. This runs wherever pruning does, which is
+// every Ensure and every Rescan that ends with a version active and no install error —
+// not only after an install. With the default want of 1 and a healthy tree it is one.
+func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) (keep, unusable []string) {
+	keep = make([]string, 0, max(want, 0))
+	for _, version := range predecessorCandidates(complete, active) {
+		if len(keep) >= want {
+			// Enough keepers. Anything further is a victim either way, and asking
+			// would cost a subprocess to reach the same outcome.
+			break
+		}
+		if !m.usableAsFallback(ctx, version) {
+			unusable = append(unusable, version)
+			continue
+		}
+		keep = append(keep, version)
+	}
+	return keep, unusable
+}
+
+// usableAsFallback reports whether a complete version directory would survive
+// selection, and says why in the log when it would not.
+//
+// trusted() comes first, and that ordering is not an optimisation. probeVersion
+// EXECUTES the artifact, so asking it about a directory selection has refused would run
+// a binary this manager declined to activate, as the manager's own uid, on a volume it
+// shares with another principal — which is exactly the deployment [Config.Untrusted]
+// describes. Retention is a disk-hygiene decision and must not become an execution path
+// selection would not take.
+func (m *Manager) usableAsFallback(ctx context.Context, version string) bool {
+	if !m.trusted(version) {
+		slog.Warn("not counting a version directory towards retention: this process may not activate it, so it is not a fallback and must not be executed to find out",
+			"package", m.cfg.Release.Name, "version", version)
+		return false
+	}
+	dir := m.versionDir(version)
+	if wide := m.wideArtifact(dir); wide != "" {
+		slog.Warn("not counting a version directory towards retention: it is writable by another principal",
+			"package", m.cfg.Release.Name, "version", version, "offender", wide)
+		return false
+	}
+	got, err := m.probeVersion(ctx, filepath.Join(dir, m.primary))
+	if err != nil || got != version {
+		slog.Warn("not counting a version directory towards retention: it would not survive selection's version probe",
+			"package", m.cfg.Release.Name, "version", version, "reported", got, "error", err)
+		return false
+	}
+	return true
+}
+
 // completeVersions lists the completed version directories, newest first.
 func (m *Manager) completeVersions() []string {
 	entries, err := os.ReadDir(m.versionsDir)
@@ -110,17 +178,122 @@ func (m *Manager) completeVersions() []string {
 	return out
 }
 
-// trusted reports whether a version directory may be activated. When Root was
-// writable by others, a sentinel proves nothing (it is trivially forgeable,
-// unlike a digest), so only a version THIS process installed from a verified
-// archive qualifies.
+// trusted reports whether a version directory may be activated. A sentinel proves
+// nothing on its own — it is a plain file, trivially forgeable, unlike a digest — so
+// without custody of the tree the answer is no: not for any directory found there, and
+// not even for one this process installed, unless the caller has explicitly waived the
+// precondition and accepted that weaker claim.
+//
+// TWO independent triggers, and both are needed:
+//
+//   - The measured custody verdict ([verifyCustody]). A caller cannot be expected to
+//     know that its volume carries an inherited ACL, so the library finds out.
+//   - [Config.Untrusted], unconditionally. It keeps the meaning it had before the
+//     measurement existed, because measurement has blind spots a caller may know
+//     about: a volume mounted into two containers whose processes both map to uid 0
+//     passes every check here, and the flag is the only way to say so.
+//
+// What `installed` proves is worth stating exactly, because it is less than it looks:
+// THIS process published that version from an archive whose digest matched, at some
+// earlier point in its own life. It is not evidence that the bytes are unchanged
+// since. In a tree without custody nothing can be, short of re-hashing every artifact
+// on every start against a record kept in the same untrusted tree — which is why the
+// README lists that as a deliberate non-goal rather than a missing feature. This is
+// the strongest available claim in a situation the caller has been told about, not a
+// guarantee equivalent to custody.
 func (m *Manager) trusted(version string) bool {
-	if !m.cfg.Untrusted {
-		return true
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.installed[version]
+	switch {
+	case m.custodyErr != nil && !m.cfg.InstallWithoutCustody:
+		// The verdict says this process does not control the tree and the caller has
+		// not accepted that. Nothing here is evidence, INCLUDING what this process
+		// installed earlier: that fact proves a publish at some past instant, not the
+		// bytes at this one, and in a writable tree the directory or the artifact can
+		// be renamed between the checks and the exec. Readiness is withheld rather
+		// than granted on a claim the library cannot make.
+		return false
+	case m.custodyErr != nil, m.cfg.Untrusted:
+		// Either the caller accepted a tree it shares, or it declared the tree
+		// untrustworthy on its own knowledge. Same mitigation: only a version this
+		// process published from a verified archive.
+		return m.installed[version]
+	}
+	return true
+}
+
+// entryPrivate reports whether a file or directory inside a version tree can be modified
+// by any identity the caller has not accounted for.
+//
+// Custody of the tree does not answer this. Directory write permission governs creating,
+// removing and renaming entries, not writing to the contents of an entry that already
+// exists, so a group-writable artifact inside a directory nobody else can add to is still
+// a binary this package executes and another principal can rewrite. And a version
+// directory is not always one this process created: an operator is encouraged to reshape
+// the volume, and a tree restored from a backup can hold entries with another owner.
+//
+// It asks the same questions [verifyCustody] asks of a path component, for the same
+// reasons and against the same declared writer set: the owner, the mode, and the
+// access-control list. Like everything else here it reads and reports; it never repairs.
+func (m *Manager) entryPrivate(path string, wantDir bool) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if fi.Mode().IsDir() != wantDir {
+		return false
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	euid := os.Geteuid()
+	if !m.trust.allowsOwner(int(stat.Uid), euid) {
+		return false
+	}
+	writers, err := writersOf(path, fi, stat)
+	if err != nil {
+		// An unreadable access-control list is not proof there is nothing to find.
+		return false
+	}
+	_, stranger := m.trust.firstStranger(writers, euid)
+	return !stranger
+}
+
+// wideArtifact returns the name of the first entry in dir that another principal could
+// rewrite, or "" when the directory and everything in it is private. The directory
+// itself answers as "." — one another principal can write makes the modes of the
+// entries inside it irrelevant, since the entries can simply be replaced.
+//
+// EVERY top-level entry, not only the declared artifacts. [Manager.PathEntry] hands the
+// whole version directory to the front of PATH, and a multi-binary release's primary
+// artifact resolves its sidecars from there by bare name, so an undeclared executable
+// sitting in that directory is reachable too. A version directory is not always one
+// this process created: an operator is encouraged to reshape the volume, and a tree
+// restored from a backup can hold entries with another owner. Directory permissions
+// govern adding, removing and renaming names; they do not stop the owner of an entry
+// that is already there from rewriting it, which is why judging the directory alone is not enough.
+//
+// Top level only, because that is what PATH exposes: an executable in a subdirectory
+// is not reachable by bare name. A directory this library assembled holds exactly the
+// declared artifacts and the sentinel, so this is a handful of stats.
+func (m *Manager) wideArtifact(dir string) string {
+	if !m.entryPrivate(dir, true) {
+		return "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "."
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if !m.entryPrivate(filepath.Join(dir, e.Name()), false) {
+			return e.Name()
+		}
+	}
+	return ""
 }
 
 // selectActive picks the version to run: the pin when it is activatable, else the
@@ -135,11 +308,25 @@ func (m *Manager) trusted(version string) bool {
 func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 	for _, version := range preferPin(m.completeVersions(), m.cfg.Version) {
 		if !m.trusted(version) {
-			slog.Warn("ignoring an existing version directory because the installation root was writable by others; only a freshly verified install may be activated",
-				"package", m.cfg.Release.Name, "version", version)
+			slog.Warn("ignoring an existing version directory because this process does not exclusively control the installation tree; only a freshly verified install may be activated",
+				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict(), "untrusted", m.cfg.Untrusted)
 			continue
 		}
+		if m.cfg.Untrusted {
+			slog.Error("activating a version on degraded evidence: Config.Untrusted waives custody of the tree, so all that is known is that this process published this version from a verified archive earlier, not that its artifacts are unchanged since",
+				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict())
+		}
 		dir := m.versionDir(version)
+		if wide := m.wideArtifact(dir); wide != "" {
+			if wide == "." {
+				slog.Error("excluding a version directory: the directory itself is writable by another principal, who can therefore replace any artifact in it whatever the artifacts' own modes say",
+					"package", m.cfg.Release.Name, "version", version, "dir", dir)
+			} else {
+				slog.Error("excluding a version directory: an entry in it is writable by another principal, so it is a file this process may execute and somebody else could rewrite",
+					"package", m.cfg.Release.Name, "version", version, "entry", wide)
+			}
+			continue
+		}
 		bin := filepath.Join(dir, m.primary)
 		got, err := m.probeVersion(ctx, bin)
 		if err != nil {
@@ -211,21 +398,10 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-// retainedVersions names the version directories pruning must KEEP: the active
-// version plus the `retain` newest complete versions below it, and nothing else.
-// This is why no rollback journal is needed — a predecessor survives every
-// switch, so a bad activation is recoverable by selecting it.
-//
-// Why per-version process leases are NOT taken: a retained set is only safe to
-// prune from when no live process still holds a reference into a dropped
-// directory. That holds when a new pin arrives only by restarting the consumer,
-// which ends every process started against the old version. A consumer that
-// enables LIVE in-place upgrades — a new pin reaching a running process without a
-// restart — breaks that argument, because work started on version A could still
-// reach into A's directory, and pruning would then have to take a per-version
-// lease and remove a directory only at zero leases. Revisit this function first
-// if that changes.
-func retainedVersions(complete []string, active string, retain int) []string {
+// predecessorCandidates returns the complete versions older than active, newest first.
+// It is the lexical half of retention, kept separate from the usability half because it
+// is pure: no filesystem, no subprocess, and therefore cheap to pin exhaustively.
+func predecessorCandidates(complete []string, active string) []string {
 	if active == "" {
 		return nil
 	}
@@ -236,35 +412,44 @@ func retainedVersions(complete []string, active string, retain int) []string {
 		}
 	}
 	sortVersionsDesc(older)
-	if retain < 0 {
-		retain = 0
-	}
-	return append([]string{active}, older[:min(retain, len(older))]...)
+	return older
 }
 
-// versionsToPrune returns the complete version directories that are neither
-// active nor among its retained predecessors. Anything NEWER than the active
-// version is also pruned: reaching that state means the pin moved down, and a
-// stale higher version is not a fallback the pin wants kept.
-func versionsToPrune(complete []string, active string, retain int) []string {
-	if active == "" {
-		return nil
-	}
-	keep := retainedVersions(complete, active, retain)
+// victimsOf returns the complete versions that pruning removes: everything that is
+// neither spared (the active version and its retained predecessors) nor unusable.
+//
+// Anything NEWER than the active version is a victim: reaching that state means the pin
+// moved down, and a stale higher version is not a fallback the pin wants kept. An
+// unusable one is not, and that asymmetry is deliberate — this library did not put a
+// directory into a state selection refuses, so deleting the evidence is not its call.
+func victimsOf(complete, spare, unusable []string) []string {
 	out := make([]string, 0, len(complete))
-	for _, v := range complete {
-		if !slices.Contains(keep, v) {
-			out = append(out, v)
+	for _, version := range complete {
+		if slices.Contains(spare, version) || slices.Contains(unusable, version) {
+			continue
 		}
+		out = append(out, version)
 	}
 	return out
 }
 
-// pruneSuperseded removes every complete version directory outside the retained
-// set, then syncs the installation root again so the removals are durable.
-// Failures warn: disk hygiene must not brick a start.
-func (m *Manager) pruneSuperseded(active string) {
-	victims := versionsToPrune(m.completeVersions(), active, m.cfg.Retain)
+// pruneSuperseded removes the version directories outside the retained set, then syncs
+// the installation root again so the removals are durable. Failures warn: disk hygiene
+// must not brick a start.
+//
+// The retained set is the active version plus up to Retain predecessors that could
+// ACTUALLY serve (see usablePredecessors). A directory that selection would refuse —
+// one holding a rewritable entry, or whose binary disagrees with its own name — must
+// not spend the slot the usable predecessor needs, because that deletes the fallback
+// and leaves the recovery guarantee resting on something nothing will activate.
+//
+// Such a directory is also never a victim. It is left exactly as found, for the
+// operator to look at: this library did not put it in that state and deleting evidence
+// is not its call.
+func (m *Manager) pruneSuperseded(ctx context.Context, active string) {
+	complete := m.completeVersions()
+	keep, unusable := m.usablePredecessors(ctx, complete, active, m.cfg.Retain)
+	victims := victimsOf(complete, append([]string{active}, keep...), unusable)
 	if len(victims) == 0 {
 		return
 	}
@@ -285,9 +470,12 @@ func (m *Manager) pruneSuperseded(active string) {
 // runs while no staging tree of this manager exists — Ensure holds opMu and
 // creates its stage later.
 //
-// Untrusted is deliberately NOT a delete trigger here: a foreign-writable root
-// invalidates a directory for ACTIVATION (see trusted), and turning that flag
-// into a mass delete would throw away the fallback set.
+// Untrusted does not change WHAT is swept, only whether sweeping happens at all: its
+// caller runs this and the purge only when Manager.mayMutateTree allows, and the flag
+// is one of the two ways that returns true. A foreign-writable tree invalidates a
+// directory for ACTIVATION (see trusted); it has never been a reason to delete more
+// than the incomplete directories this sweep already targets, because that would throw
+// away the fallback set.
 func (m *Manager) prunePartials() {
 	entries, err := os.ReadDir(m.versionsDir)
 	if err != nil {

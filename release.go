@@ -17,7 +17,9 @@ import (
 // data, not policy — durability, version selection, retry, retention and the
 // readiness verdict belong to the library and are not configurable.
 type Release struct {
-	// Unpack extracts the verified archive. A nil Unpack uses [UnpackZip].
+	// Unpack extracts the verified archive from an open reader, into an
+	// [os.Root] on the extraction directory. A nil Unpack uses [UnpackZip].
+	// Neither parameter is a path, deliberately — see [Unpacker].
 	Unpack Unpacker
 	// Installer describes an installer script shipped INSIDE the archive. A nil
 	// Installer means the archive already holds the artifacts.
@@ -32,6 +34,12 @@ type Release struct {
 	// ProbeArgs is the argv that makes the primary artifact print its version
 	// (e.g. {"--version"}). Required: every start probes the artifact it is
 	// about to activate, so a release with no probe cannot be verified.
+	//
+	// It must be safe to run against a version this deployment will NOT activate, and
+	// against one it is about to delete. Retention asks the same question of a retained
+	// candidate before counting it as a usable fallback, so the argv has to be a pure
+	// query: no migration, no cache warm, no write to shared state. A bare version flag
+	// is; a subcommand that touches the package's own configuration is not.
 	ProbeArgs []string
 	// Name is the package identity. It fixes the versions root
 	// (<Root>/<Name>-versions), the state file (<Root>/<Name>-state.json) and
@@ -130,6 +138,13 @@ type Purge struct {
 
 // Config is one deployment of one [Release]: the pin, the digests, the root and
 // the local policy. The zero value is not usable — call [New].
+//
+// profile, then the pin, then the root, then policy, then the two custody escapes last
+// because they are the fields a reader should meet only after the rest. Packing it for the
+// 24 bytes fieldalignment can reclaim scatters that order, and a Config is allocated once
+// per manager.
+//
+//nolint:govet // fieldalignment: the field order IS this struct's documentation — the
 type Config struct {
 	// Digests maps a GOARCH to the lowercase hex SHA-256 of that
 	// architecture's archive. The resolved architecture must have an entry.
@@ -177,10 +192,55 @@ type Config struct {
 	// are bounded deliberately: an endless loop re-downloading a large archive
 	// is worse than a visible failure an operator can repair.
 	MaxAttempts int
-	// Untrusted records that Root was writable by others. A sentinel is
-	// trivially forgeable, unlike a digest, so when it is set no pre-existing
-	// version directory may be activated: only a version THIS process
-	// installed from a verified archive counts.
+	// TrustedUIDs and TrustedGIDs name identities whose write access to the installation
+	// tree does NOT invalidate custody, beyond root and this process's own uid, which are
+	// always trusted.
+	//
+	// This is the knob for the situation the library can see but cannot judge. It reads
+	// the mode, the ownership and the access-control list of every directory on the way
+	// to Root and can tell you that uid 3000 may write there; it can never tell that uid
+	// 3000 is the administrator who already holds root through sudo, so writing those
+	// files gains that account nothing. You know that, so you say it, and the library
+	// goes back to enforcing the rule everywhere else.
+	//
+	// Each entry is a claim you are making: this identity is already at least as
+	// privileged as the process running the install. An identity that is not — the
+	// unprivileged account an application runs as, say — genuinely can escalate through a
+	// binary this library installs and a consumer executes, and listing it there defeats
+	// the point. Listing "everyone" is not possible, because a grant to everyone names no
+	// identity to trust; see InstallWithoutCustody.
+	TrustedUIDs []int
+	// TrustedGIDs is the group half of TrustedUIDs. A group grant is a grant to every
+	// current and future member, so it is the weaker claim of the two.
+	TrustedGIDs []int
+	// InstallWithoutCustody proceeds even though custody of Root could not be established:
+	// the refusal becomes a warning and the install runs anyway.
+	//
+	// It is the blunt instrument, for a volume whose permissions cannot be described by
+	// naming identities — one whose filesystem does not make the mode its access decision
+	// at all (a cifs mount with noperm, a FUSE filesystem without default_permissions), or
+	// one you simply accept as shared. Prefer TrustedUIDs and TrustedGIDs, which keep the
+	// check working; reach for this when there is nothing precise to say.
+	//
+	// It also re-authorises what the library otherwise declines to do in a tree it does
+	// not control: the one-shot Purge, the sweep of partial directories and orphan staging
+	// trees, the retention prune, the convenience symlink, and the state record. That
+	// follows from what it means — the library is installing there, so refusing to tidy up
+	// after itself would leave Purge silently dead and let partial directories accumulate
+	// without bound.
+	//
+	// Setting it implies Untrusted's restriction on activation: in a tree this process does
+	// not control, a completion sentinel is forgeable, so only a version THIS process
+	// installed from a verified archive is activated.
+	InstallWithoutCustody bool
+	// Untrusted activates only versions THIS process installed from a verified archive,
+	// never one already on the volume, regardless of what the custody check concluded.
+	//
+	// The check has blind spots a caller may know about — a volume mounted into two
+	// containers whose processes both map to uid 0 passes every question it asks — and this
+	// is how to say so without also declaring the tree unmanageable. It costs a
+	// digest-verified reinstall on every start, which is the price of not believing a
+	// sentinel.
 	Untrusted bool
 }
 

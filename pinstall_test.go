@@ -608,6 +608,147 @@ func TestProbeAndAssertionsLeadPATHWithTheBinaryDir(t *testing.T) {
 	}
 }
 
+// TestPathEnvNeverAdmitsTheWorkingDirectory pins the degenerate half of the
+// lead-PATH rule, which is where its guarantee inverts rather than weakens. A
+// PATH element that is empty means the current working directory, so appending
+// an empty inherited PATH leaves a trailing separator that hands the child a
+// search directory nobody chose — the calling server's cwd — and a release whose
+// primary executable resolves sidecars by bare name then runs whatever is
+// standing there. Narrowing the lookup to one verified directory is the entire
+// point of leading with it, so an empty inherited PATH must produce that
+// directory ALONE.
+func TestPathEnvNeverAdmitsTheWorkingDirectory(t *testing.T) {
+	const entry = "/opt/toolkit-versions/2.14.2"
+
+	tests := map[string]struct {
+		inherited string
+		entry     string
+		want      []string
+	}{
+		"empty inherited PATH yields the entry alone": {
+			inherited: "",
+			entry:     entry,
+			want:      []string{"PATH=" + entry},
+		},
+		"inherited PATH follows the entry": {
+			inherited: "/usr/local/bin:/usr/bin",
+			entry:     entry,
+			want:      []string{"PATH=" + entry + string(os.PathListSeparator) + "/usr/local/bin:/usr/bin"},
+		},
+		"a single inherited element still follows": {
+			inherited: "/usr/bin",
+			entry:     entry,
+			want:      []string{"PATH=" + entry + string(os.PathListSeparator) + "/usr/bin"},
+		},
+		"no entry yields no overlay at all": {
+			inherited: "/usr/bin",
+			entry:     "",
+			want:      nil,
+		},
+		"no entry and no inherited PATH yields no overlay either": {
+			inherited: "",
+			entry:     "",
+			want:      nil,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("PATH", tc.inherited)
+
+			got := pathEnv(tc.entry)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("pathEnv(%q) with PATH=%q = %#v, want %#v", tc.entry, tc.inherited, got, tc.want)
+			}
+			assertNoWorkingDirectoryOnPATH(t, got)
+		})
+	}
+}
+
+// TestPathEnvAndTheProbeOverlayCannotDrift is the reason the rule is one
+// unexported composer instead of a sentence in the docs. The library STATED that
+// a consumer must lead PATH with PathEntry and then applied that rule three
+// times without exporting it once — twice in the consumers, once here for its
+// own version probe and settings assertions — and the copy that drifted was this
+// package's, which appended an empty inherited PATH. The exported overlay and
+// the internal one must therefore be the same value for the active version, in
+// both the ordinary and the degenerate case.
+func TestPathEnvAndTheProbeOverlayCannotDrift(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	tests := map[string]string{
+		"an ordinary inherited PATH": "/usr/local/bin:/usr/bin",
+		"no inherited PATH at all":   "",
+	}
+
+	for name, inherited := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("PATH", inherited)
+
+			exported := m.PathEnv()
+			internal := binPathEnv(m.Path())
+			if !slices.Equal(exported, internal) {
+				t.Errorf("PathEnv() = %#v but the probe overlay for %s = %#v; the two copies of one rule have drifted",
+					exported, m.Path(), internal)
+			}
+			if want := []string{"PATH=" + m.PathEntry() + pathSuffix(inherited)}; !slices.Equal(exported, want) {
+				t.Errorf("PathEnv() = %#v, want %#v", exported, want)
+			}
+			assertNoWorkingDirectoryOnPATH(t, exported)
+			assertNoWorkingDirectoryOnPATH(t, internal)
+		})
+	}
+}
+
+// TestPathEnvIsNilWithoutAnActiveVersion pins the no-overlay case: with nothing
+// active there is no directory to lead with, and an overlay reading "PATH=" is
+// not a narrower search path but a cwd-only one.
+func TestPathEnvIsNilWithoutAnActiveVersion(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+
+	t.Setenv("PATH", "")
+	if got := m.PathEnv(); got != nil {
+		t.Errorf("PathEnv() = %#v before any version is active, want nil", got)
+	}
+}
+
+// pathSuffix is what the inherited PATH contributes to the overlay: nothing when
+// it is empty, otherwise the separator and its own value.
+func pathSuffix(inherited string) string {
+	if inherited == "" {
+		return ""
+	}
+	return string(os.PathListSeparator) + inherited
+}
+
+// assertNoWorkingDirectoryOnPATH fails when any produced assignment carries an
+// empty PATH element. That is the whole bug expressed as a property: an empty
+// element is the current working directory, whether it arrives as a trailing
+// separator, a leading one, or a doubled one in the middle.
+func assertNoWorkingDirectoryOnPATH(t *testing.T, overlay []string) {
+	t.Helper()
+	for _, kv := range overlay {
+		value, ok := strings.CutPrefix(kv, "PATH=")
+		if !ok {
+			continue
+		}
+		if strings.HasSuffix(value, string(os.PathListSeparator)) {
+			t.Errorf("PATH=%q ends in a separator, so its last element is empty and resolves to the working directory", value)
+		}
+		for i, element := range filepath.SplitList(value) {
+			if element == "" {
+				t.Errorf("PATH=%q has an empty element at index %d, which resolves to the working directory", value, i)
+			}
+		}
+	}
+}
+
 // The operation slot has two halves and neither is sufficient alone: WAITING for
 // it honours the caller's context, and the work that has been ADMITTED does not.
 // Consumers were compensating for the absence of both with their own admission

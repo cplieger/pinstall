@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/pinstall"
-	"github.com/cplieger/pinstall/kirocli"
+	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pinstall/v2/kirocli"
 )
 
 const (

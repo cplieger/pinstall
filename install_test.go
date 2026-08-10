@@ -1,6 +1,7 @@
 package pinstall
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -508,16 +509,16 @@ func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T
 // TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts pins the Unpacker
 // seam's CONTRACT rather than a second archive format: the library ships and tests
 // exactly one unpacker, and what a custom one can rely on is that it receives the
-// digest-verified archive and that its error aborts the install with nothing
-// published.
+// digest-verified archive, a destination whose own methods refuse to write outside
+// it, and that its error aborts the install with nothing published.
 func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
-	t.Run("receives the verified archive and the staging extraction dir", func(t *testing.T) {
+	t.Run("receives the verified archive and a root on the staging extraction dir", func(t *testing.T) {
 		env := newFakeEnv(t)
 		var gotArchive []byte
 		var gotDir string
-		env.release.Unpack = func(_ context.Context, archive, dir string) error {
-			gotDir = dir
-			raw, err := os.ReadFile(archive)
+		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, dst *os.Root) error {
+			gotDir = dst.Name()
+			raw, err := io.ReadAll(archive)
 			gotArchive = raw
 			return err
 		}
@@ -530,14 +531,37 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 			t.Errorf("unpacker got %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
 		}
 		if !strings.HasPrefix(gotDir, env.versionsRoot()) || !strings.Contains(gotDir, stagePrefix) {
-			t.Errorf("unpacker got dir %q, want one inside a staging tree under %q", gotDir, env.versionsRoot())
+			t.Errorf("unpacker got a root on %q, want one inside a staging tree under %q", gotDir, env.versionsRoot())
+		}
+	})
+
+	t.Run("cannot write outside the destination it is handed", func(t *testing.T) {
+		// A custom implementation that names its way out through the root it was
+		// handed is refused by os.Root rather than trusted to have validated the
+		// name itself. It could still call os.OpenFile directly and escape — a
+		// callback is ordinary Go code — so what this pins is that the SUPPLIED
+		// path is contained, not that the seam is a sandbox.
+		env := newFakeEnv(t)
+		var escapeErr error
+		env.release.Unpack = func(_ context.Context, _ *io.SectionReader, dst *os.Root) error {
+			_, escapeErr = dst.OpenFile("../../pwn", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			return escapeErr
+		}
+		m := env.manager()
+
+		_ = m.Ensure(context.Background())
+		if escapeErr == nil {
+			t.Fatal("the destination root accepted a traversing name")
+		}
+		if exists(filepath.Join(env.versionsRoot(), "pwn")) || exists(filepath.Join(env.root, "pwn")) {
+			t.Error("an unpacker wrote outside the destination it was handed")
 		}
 	})
 
 	t.Run("is never called on a digest mismatch", func(t *testing.T) {
 		env := newFakeEnv(t)
 		called := false
-		env.release.Unpack = func(context.Context, string, string) error {
+		env.release.Unpack = func(context.Context, *io.SectionReader, *os.Root) error {
 			called = true
 			return nil
 		}
@@ -558,7 +582,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	t.Run("its error aborts the install and publishes nothing", func(t *testing.T) {
 		env := newFakeEnv(t)
 		injected := errors.New("unsupported archive format")
-		env.release.Unpack = func(context.Context, string, string) error { return injected }
+		env.release.Unpack = func(context.Context, *io.SectionReader, *os.Root) error { return injected }
 		m := env.manager()
 
 		if err := m.Ensure(context.Background()); !errors.Is(err, injected) {
@@ -568,6 +592,55 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 			t.Errorf("installation root holds %v, want nothing", dirs)
 		}
 	})
+}
+
+// TestDownloadedArchiveHasNoNameWhileItIsBeingUsed pins the strongest form of the
+// TOCTOU fix. The archive is unlinked the instant it exists, so there is no name to
+// substitute rather than a name that must not be re-resolved: while the unpacker
+// holds its reader, NOTHING in the installation tree refers to those bytes, and the
+// reader still yields exactly what the digest proved.
+//
+// The predecessor of this design digested a file and let the unpacker re-open its
+// PATH, which a second process could repoint between the two steps. Both halves are
+// asserted here because either alone would be satisfiable by the broken shape: a
+// nameless file whose reader returned other bytes, or the right bytes reached
+// through a name that still exists.
+func TestDownloadedArchiveHasNoNameWhileItIsBeingUsed(t *testing.T) {
+	env := newFakeEnv(t)
+	var gotArchive []byte
+	var namesDuringUnpack []string
+	env.release.Unpack = func(_ context.Context, archive *io.SectionReader, _ *os.Root) error {
+		namesDuringUnpack = archiveCandidateNames(t, env.versionsRoot())
+		raw, err := io.ReadAll(archive)
+		gotArchive = raw
+		return err
+	}
+	m := env.manager()
+
+	_ = m.Ensure(context.Background())
+	if !bytes.Equal(gotArchive, env.archive) {
+		t.Errorf("unpacker read %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
+	}
+	if len(namesDuringUnpack) != 0 {
+		t.Errorf("the installation tree still names the archive as %v while it is being extracted; a name is something another principal can repoint", namesDuringUnpack)
+	}
+}
+
+// archiveCandidateNames lists every entry directly under the installation root
+// that could name a downloaded archive.
+func archiveCandidateNames(t *testing.T, versionsRoot string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(versionsRoot)
+	if err != nil {
+		t.Fatalf("ReadDir the installation root: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".download") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }
 
 // TestHTTPFetchRefusesEmptyAndNonOK pins the fetch boundary's two cheap refusals.

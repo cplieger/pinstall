@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -44,6 +45,15 @@ const (
 // TestMain silences the manager's slog output for the whole package: every
 // install path logs, and the volume drowns real failures in test output.
 func TestMain(m *testing.M) {
+	// The umask is pinned for the whole test binary, and it is not cosmetic. t.TempDir
+	// creates its numbered subdirectory with a plain mkdir(0777), so a developer whose
+	// umask is 002 — the default for a regular user on Debian, Ubuntu and Fedora — gets
+	// a GROUP-WRITABLE fixture root, and this package's custody check then correctly
+	// refuses to install into it. Measured: 48 tests fail under umask 002 and pass under
+	// 022, with the production behaviour right in both cases. CI runs at 022 and so does
+	// the container this suite was written in, which is how three review rounds missed
+	// it. Fixing the harness is the answer; softening the check would not be.
+	syscall.Umask(0o022)
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
 }
@@ -88,6 +98,9 @@ type fakeEnv struct {
 	// installerFails makes the installer report a failure AND write nothing, the
 	// shape that fails the staged gates.
 	installerFails bool
+	// wideArtifacts names the artifacts the fake installer leaves group- and
+	// other-writable, the shape a real installer choosing its own modes can produce.
+	wideArtifacts []string
 	// probeAnswerFor renders the version a fake artifact encodes into the shape
 	// that package's probe prints.
 	probeAnswerFor func(version string) string
@@ -133,34 +146,75 @@ func newFakeEnv(t *testing.T) *fakeEnv {
 	return env
 }
 
-// zipEntry is one file in a test archive.
+// zipEntry is one entry in a test archive: a file by default, or a directory when
+// dir is set (which is how a real archiver emits an explicit "./" or "pkg/" entry).
 type zipEntry struct {
 	body string
 	mode os.FileMode
+	dir  bool
+}
+
+// namedEntry is a zipEntry with its name attached, for the archives whose ORDER or
+// duplicate names matter and a map therefore cannot express.
+type namedEntry struct {
+	name string
+	zipEntry
 }
 
 // buildZip builds a real zip in memory, so extraction is exercised for real
 // while the runner seam stands in for executing what comes out of it.
 func buildZip(t *testing.T, entries map[string]zipEntry) []byte {
 	t.Helper()
+	ordered := make([]namedEntry, 0, len(entries))
+	for _, name := range slices.Sorted(maps.Keys(entries)) {
+		ordered = append(ordered, namedEntry{name: name, zipEntry: entries[name]})
+	}
+	return buildZipOrdered(t, ordered)
+}
+
+// buildZipOrdered writes entries in the given order, so a test can express a
+// duplicate name or a specific sequence.
+func buildZipOrdered(t *testing.T, entries []namedEntry) []byte {
+	t.Helper()
+	raw, err := encodeZip(entries)
+	if err != nil {
+		t.Fatalf("building the test archive: %v", err)
+	}
+	return raw
+}
+
+// encodeZip is the writer both builders share, returning an error instead of
+// failing a test so a fuzz target can use it on names archive/zip may reject.
+func encodeZip(entries []namedEntry) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
-	for _, name := range slices.Sorted(maps.Keys(entries)) {
-		e := entries[name]
-		h := &zip.FileHeader{Name: name, Method: zip.Deflate}
-		h.SetMode(e.mode)
+	for _, e := range entries {
+		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		mode := e.mode
+		if e.dir {
+			mode |= os.ModeDir
+		}
+		h.SetMode(mode)
 		w, err := zw.CreateHeader(h)
 		if err != nil {
-			t.Fatalf("zip CreateHeader(%s): %v", name, err)
+			return nil, fmt.Errorf("CreateHeader(%q): %w", e.name, err)
 		}
 		if _, err := w.Write([]byte(e.body)); err != nil {
-			t.Fatalf("zip Write(%s): %v", name, err)
+			return nil, fmt.Errorf("Write(%q): %w", e.name, err)
 		}
 	}
 	if err := zw.Close(); err != nil {
-		t.Fatalf("zip Close: %v", err)
+		return nil, fmt.Errorf("closing the archive: %w", err)
 	}
-	return buf.Bytes()
+	return buf.Bytes(), nil
+}
+
+// zipWithRawName builds a one-entry archive carrying name verbatim, for the fuzz
+// target. archive/zip rejects some byte sequences outright, which is the writer's
+// business rather than the extractor's, so the error is returned for the caller to
+// skip on.
+func zipWithRawName(name string) ([]byte, error) {
+	return encodeZip([]namedEntry{{name: name, zipEntry: zipEntry{body: "x", mode: 0o644}}})
 }
 
 // installerArchive is an archive whose only useful content is the installer the
@@ -307,8 +361,14 @@ func (e *fakeEnv) runInstaller(c *command) ([]byte, error) {
 		return nil, err
 	}
 	for name, version := range e.produces {
-		if err := writeFakeBinary(filepath.Join(binDir, name), version); err != nil {
+		path := filepath.Join(binDir, name)
+		if err := writeFakeBinary(path, version); err != nil {
 			return nil, err
+		}
+		if slices.Contains(e.wideArtifacts, name) {
+			if err := os.Chmod(path, 0o777); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return []byte("installed\n"), nil

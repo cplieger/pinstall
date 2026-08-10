@@ -193,25 +193,34 @@ type stageTree struct {
 // nothing outside the staging tree is left behind and the versions already on the
 // volume keep serving.
 //
-// The archive is downloaded and verified into a process-local temp dir BEFORE any
-// staging tree exists, so on a digest mismatch nothing has been created under the
-// installation root at all — not even an empty directory.
+// Custody of the installation root is proved FIRST, before a byte is fetched: the
+// digest gate downstream is only worth running on a tree nobody else can write to
+// (see [verifyCustody]). Then the archive is downloaded into a file that is
+// unlinked the instant it exists, so from that point on it has no name at all —
+// nothing to swap, nothing to rewrite by path, and nothing left on the volume if
+// this process dies mid-install. The same descriptor carries the bytes through the
+// digest check and into the extraction, so the proof and the use are about the
+// same bytes by construction.
 func (m *Manager) install(ctx context.Context) error {
 	slog.Info("installing", "package", m.cfg.Release.Name, "version", m.cfg.Version, "arch", m.cfg.GOARCH)
 	if m.cfg.Release.Notice != "" {
 		slog.Info(m.cfg.Release.Notice, "package", m.cfg.Release.Name, "version", m.cfg.Version)
 	}
 
-	work, mkErr := os.MkdirTemp("", "pinstall-*")
-	if mkErr != nil {
-		return fmt.Errorf("creating the download temp dir: %w", mkErr)
-	}
-	defer os.RemoveAll(work)
-
-	archive := filepath.Join(work, "archive")
-	if err := m.downloadArchive(ctx, archive); err != nil {
+	if err := m.ensureVersionsDir(); err != nil {
 		return err
 	}
+	if err := m.requireCustody(); err != nil {
+		return err
+	}
+
+	archive, dlErr := m.downloadArchive(ctx)
+	if dlErr != nil {
+		return dlErr
+	}
+	// Closed as soon as the extraction is done; the defer only covers the failure
+	// paths between here and there. Closing twice is harmless.
+	defer func() { _ = archive.close() }()
 
 	stage, stageErr := m.newStage()
 	if stageErr != nil {
@@ -219,8 +228,15 @@ func (m *Manager) install(ctx context.Context) error {
 	}
 	defer os.RemoveAll(stage.root)
 
-	if err := m.unpack(ctx, archive, stage.extract); err != nil {
-		return fmt.Errorf("unpacking the archive: %w", err)
+	if err := m.extract(ctx, archive, stage); err != nil {
+		return err
+	}
+	// The archive's blocks are the caller's disk, and nothing after the extraction
+	// reads them. Release them before the installer, the gates and the publish run,
+	// rather than holding a copy of the download alongside the extracted tree and
+	// the version directory for the rest of the install.
+	if err := archive.close(); err != nil {
+		return fmt.Errorf("closing the archive: %w", err)
 	}
 	src, srcErr := m.runInstaller(ctx, stage)
 	if srcErr != nil {
@@ -243,39 +259,121 @@ func (m *Manager) install(ctx context.Context) error {
 	return nil
 }
 
+// extract unpacks the verified archive into the staging tree through an [os.Root],
+// so no archive entry can name its way out of the extraction directory.
+func (m *Manager) extract(ctx context.Context, archive *verifiedArchive, stage *stageTree) error {
+	dst, err := os.OpenRoot(stage.extract)
+	if err != nil {
+		return fmt.Errorf("opening the extraction directory: %w", err)
+	}
+	defer func() { _ = dst.Close() }()
+	if err := m.unpack(ctx, archive.reader(), dst); err != nil {
+		return fmt.Errorf("unpacking the archive: %w", err)
+	}
+	return nil
+}
+
 // downloadArchive fetches the pinned archive and proves it is the artifact the
 // pin names. Verification is the whole point: nothing downstream re-checks the
 // digest, and nothing is placed on the persistent volume until it passes.
-func (m *Manager) downloadArchive(ctx context.Context, dst string) error {
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
+//
+// The archive is created inside the installation root and UNLINKED immediately, so
+// for the entire time it holds bytes it has no name. That is a deletion rather than
+// a defence added: with no name there is nothing for another principal to point
+// elsewhere, nothing to rewrite by path, no temp directory whose permissions need
+// checking, no TMPDIR the caller controls in the threat surface, and no cleanup to
+// get right — the kernel reclaims the space when the last descriptor closes,
+// including when this process dies mid-download. The installation root is the right
+// home for it because custody there has just been proved, and it is the same
+// filesystem the extracted tree lands on.
+//
+// It returns the archive still OPEN, because the proof and the extraction have to
+// be about the same bytes. Digesting a file and then handing its PATH to the
+// unpacker proves nothing even while a name exists: a name can be pointed at
+// another inode in between. The descriptor these bytes were written and hashed
+// through is the one the unpacker reads. The caller closes it.
+func (m *Manager) downloadArchive(ctx context.Context) (*verifiedArchive, error) {
+	f, err := m.anonymousFile()
 	if err != nil {
-		return fmt.Errorf("creating the archive file: %w", err)
+		return nil, err
 	}
 	sum := sha256.New()
 	// Digest the bytes as they land, so a large archive is read once.
-	fetchErr := m.fetch(ctx, m.archiveURL(), io.MultiWriter(f, sum))
-	closeErr := f.Close()
-	switch {
-	case fetchErr != nil:
-		return fetchErr
-	case closeErr != nil:
-		return fmt.Errorf("closing the archive file: %w", closeErr)
+	if fetchErr := m.fetch(ctx, m.archiveURL(), io.MultiWriter(f, sum)); fetchErr != nil {
+		_ = f.Close()
+		return nil, fetchErr
+	}
+	// The verified length is the descriptor's own write offset, not a stat of the
+	// path: it counts the bytes that went through the hash, so the reader handed
+	// out below cannot reach past what was proved.
+	size, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("measuring the archive that was written: %w", err)
 	}
 	got := hex.EncodeToString(sum.Sum(nil))
 	if got != m.digest {
-		return fmt.Errorf("%w: arch=%s expected=%s actual=%s (bump the version and every digest literal together)",
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: arch=%s expected=%s actual=%s (bump the version and every digest literal together)",
 			ErrDigestMismatch, m.cfg.GOARCH, m.digest, got)
 	}
 	slog.Info("archive SHA-256 verified against the pinned digest",
 		"package", m.cfg.Release.Name, "arch", m.cfg.GOARCH, "sha256", got)
-	return nil
+	return &verifiedArchive{file: f, size: size}, nil
 }
 
-// newStage creates the staging tree under the installation root.
-func (m *Manager) newStage() (*stageTree, error) {
-	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
-		return nil, fmt.Errorf("creating the installation root: %w", err)
+// anonymousFile returns an open, writable file under the installation root that
+// has already been removed from the directory, so it is reachable only through the
+// returned descriptor.
+//
+// Create-then-unlink rather than O_TMPFILE: that flag's value is
+// architecture-dependent and reaching it means a dependency outside the standard
+// library, while the only thing it buys here is closing the instant between the
+// create and the unlink — an instant inside a directory whose custody was just
+// proved, where no other principal can act at all. The dot prefix keeps the name
+// out of the version scan and out of prunePartials for that instant.
+func (m *Manager) anonymousFile() (*os.File, error) {
+	f, err := os.CreateTemp(m.versionsDir, ".download-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating the archive file: %w", err)
 	}
+	if err := os.Remove(f.Name()); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("unlinking the archive file: %w", err)
+	}
+	return f, nil
+}
+
+// verifiedArchive is a downloaded archive whose digest matched, held open on the
+// descriptor its bytes were written and hashed through, with the exact length
+// that hash covers.
+//
+// It has no path field because it has no path: the file was unlinked before the
+// first byte arrived. Nothing downstream re-checks the digest, so the only thing
+// making the extraction trustworthy is that it reads these bytes.
+type verifiedArchive struct {
+	file *os.File
+	size int64
+}
+
+// reader returns a reader over exactly the verified bytes. Each call builds a
+// fresh one: an [io.SectionReader] carries its own offset, so sequential reading
+// by an unpacker moves nothing on the shared descriptor.
+func (a *verifiedArchive) reader() *io.SectionReader {
+	return io.NewSectionReader(a.file, 0, a.size)
+}
+
+// close releases the descriptor, which is also what frees the archive's disk
+// space: the file is already unlinked, so this is its last reference.
+func (a *verifiedArchive) close() error { return a.file.Close() }
+
+// newStage creates the staging tree under the installation root.
+//
+// No mode is verified here and none is repaired. The staging tree sits inside a
+// root whose custody install() proved before anything was created, so the modes of
+// the directories under it are not a boundary anybody can be on the wrong side of.
+// That is the point of proving custody once instead of per-directory.
+func (m *Manager) newStage() (*stageTree, error) {
 	root, err := os.MkdirTemp(m.versionsDir, stagePrefix+"*")
 	if err != nil {
 		return nil, fmt.Errorf("creating the staging tree: %w", err)
@@ -292,6 +390,18 @@ func (m *Manager) newStage() (*stageTree, error) {
 		}
 	}
 	return stage, nil
+}
+
+// ensureVersionsDir creates the installation root, so custody can be judged on the
+// directory that will actually hold the tree rather than on the deepest ancestor
+// that happened to exist. It requests dirMode and does not read the result back:
+// what the filesystem stored is [verifyCustody]'s question, and its answer is a
+// verdict rather than a repair.
+func (m *Manager) ensureVersionsDir() error {
+	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
+		return fmt.Errorf("creating the installation root: %w", err)
+	}
+	return nil
 }
 
 // runInstaller runs the archive's own installer against the PRIVATE staging home,
@@ -410,6 +520,16 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 	if !selfContained(from) {
 		return "", errors.New("absent, not executable, or a symlink into the staging tree")
 	}
+	// An in-archive installer chooses its own modes, and this rename is the last
+	// point at which what it chose can be refused: publish moves this inode into
+	// place and a rename cannot change a mode. A group- or other-writable artifact
+	// in a published version directory is a binary this package executes and
+	// another principal can rewrite, which is the integrity gate the pin exists to
+	// provide. It is refused rather than repaired, for the same reason nothing else
+	// here is repaired.
+	if !m.entryPrivate(from, false) {
+		return "", errors.New("writable by another principal, and this package will not publish an artifact it executes that somebody else can rewrite")
+	}
 	to := filepath.Join(dst, name)
 	if err := m.rename(from, to); err != nil {
 		return "", err
@@ -420,6 +540,10 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 // writeSentinel writes the ".complete" marker LAST, holding the version whose
 // full artifact set the directory contains. It lives inside the directory it
 // describes, so it cannot drift from those artifacts.
+//
+// It is a plain file and therefore forgeable by anyone who can write into the
+// tree, which is exactly what custody excludes; see [verifyCustody] for why that
+// is the defence rather than the sentinel's own mode.
 func (m *Manager) writeSentinel(dir string) error {
 	path := filepath.Join(dir, sentinelName)
 	if err := os.WriteFile(path, []byte(m.cfg.Version+"\n"), fileMode); err != nil {

@@ -1,4 +1,4 @@
-module github.com/cplieger/pinstall
+module github.com/cplieger/pinstall/v2
 
 go 1.26.5
 

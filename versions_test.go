@@ -204,23 +204,33 @@ func TestSelectActiveExcludesAReplacedArtifactUnderAnIntactSentinel(t *testing.T
 	})
 }
 
-// TestSelectActiveIgnoresExistingDirectoriesOnAnUntrustedRoot pins the Untrusted
-// contract: a sentinel is trivially forgeable, unlike a digest, so when the root was
-// writable by others a pre-existing version directory may not be activated -- only
-// one this process installed from a verified archive.
-func TestSelectActiveIgnoresExistingDirectoriesOnAnUntrustedRoot(t *testing.T) {
+// TestSelectActiveIgnoresExistingDirectoriesWithoutCustody pins the contract a
+// tree without custody gets: a sentinel is a plain file and therefore trivially
+// forgeable, unlike a digest, so a pre-existing version directory may not be
+// activated -- only one this process installed from a verified archive.
+//
+// The trigger is the MEASURED verdict rather than the Untrusted flag. Untrusted
+// waives the refusal to install into such a tree; it is not a declaration that the
+// tree is bad, because a caller cannot be expected to know its volume carries an
+// inherited ACL. So the fixture makes the root genuinely writable by others and
+// then waives the install refusal, which is the real deployment this covers.
+func TestSelectActiveIgnoresExistingDirectoriesWithoutCustody(t *testing.T) {
 	env := newFakeEnv(t)
 	env.placeVersion(pinnedVersion)
-	m := env.manager(func(c *Config) { c.Untrusted = true })
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
+	m.checkCustody()
 
 	if _, ok := m.selectActive(context.Background()); ok {
-		t.Fatal("selectActive accepted a pre-existing directory on an untrusted root")
+		t.Fatal("selectActive accepted a pre-existing directory in a tree without custody")
 	}
 	if err := m.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
-		t.Errorf("fetches = %d, want 1 -- an untrusted root must force a digest-verified reinstall", env.fetchCount())
+		t.Errorf("fetches = %d, want 1 -- a tree without custody must force a digest-verified reinstall", env.fetchCount())
 	}
 	if ready, why := m.Ready(); !ready {
 		t.Errorf("Ready() = false (%s), want true after the verified reinstall", why)
@@ -319,16 +329,32 @@ func TestRetainedAndPrunedVersions(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			keep := slices.Sorted(slices.Values(retainedVersions(tc.complete, tc.active, tc.retain)))
+			// The two halves of retention, composed the way pruneSuperseded
+			// composes them: the pure lexical candidate list, then the spare set,
+			// then the victims. The usability half needs a filesystem and a
+			// subprocess, so it is covered by the Ensure-level tests instead; here
+			// every candidate is treated as usable, which is the healthy tree.
+			var keep []string
+			if tc.active != "" {
+				candidates := predecessorCandidates(tc.complete, tc.active)
+				retain := max(tc.retain, 0)
+				keep = append([]string{tc.active}, candidates[:min(retain, len(candidates))]...)
+			}
+			got := slices.Sorted(slices.Values(keep))
 			want := slices.Sorted(slices.Values(tc.wantKeep))
-			if !slices.Equal(keep, want) {
-				t.Errorf("retainedVersions = %v, want %v", keep, want)
+			if !slices.Equal(got, want) {
+				t.Errorf("retained = %v, want %v", got, want)
 			}
-			pruned := slices.Sorted(slices.Values(versionsToPrune(tc.complete, tc.active, tc.retain)))
+			var pruned []string
+			if tc.active != "" {
+				pruned = victimsOf(tc.complete, keep, nil)
+			}
+			prunedSorted := slices.Sorted(slices.Values(pruned))
 			wantPruned := slices.Sorted(slices.Values(tc.wantPruned))
-			if !slices.Equal(pruned, wantPruned) {
-				t.Errorf("versionsToPrune = %v, want %v", pruned, wantPruned)
+			if !slices.Equal(prunedSorted, wantPruned) {
+				t.Errorf("victimsOf = %v, want %v", prunedSorted, wantPruned)
 			}
+			keep, pruned = got, prunedSorted
 			for _, v := range pruned {
 				if slices.Contains(keep, v) {
 					t.Errorf("%q is both retained and pruned", v)

@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cplieger/pinstall"
+	"github.com/cplieger/pinstall/v2"
 )
 
 // Name is the package identity and the name of its primary artifact.
