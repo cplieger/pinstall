@@ -220,7 +220,7 @@ func TestSelectActiveIgnoresExistingDirectoriesWithoutCustody(t *testing.T) {
 	if err := os.Chmod(env.root, 0o777); err != nil {
 		t.Fatalf("chmod the install root: %v", err)
 	}
-	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 	m.checkCustody()
 
 	if _, ok := m.selectActive(context.Background()); ok {

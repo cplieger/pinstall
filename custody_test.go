@@ -2,7 +2,7 @@ package pinstall
 
 import (
 	"context"
-	"encoding/binary"
+	"encoding/base64"
 	"errors"
 	"io"
 	"os"
@@ -26,7 +26,7 @@ func TestVerifyCustodyAcceptsATreeOnlyThisProcessCanWrite(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := verifyCustody(dir); err != nil {
+	if err := verifyCustody(dir, trustedWriters{}); err != nil {
 		t.Fatalf("verifyCustody refused a private tree: %v", err)
 	}
 
@@ -53,14 +53,16 @@ func TestVerifyCustodyAcceptsATreeOnlyThisProcessCanWrite(t *testing.T) {
 // version tree away and puts its own at that name, and nothing downstream re-digests
 // the substitute.
 func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
+	const strangerGID = 65500
 	tests := map[string]struct {
-		mode os.FileMode
-		want string
+		mode  os.FileMode
+		chgrp bool
+		want  string
 	}{
-		"group writable":   {mode: 0o775, want: "its group"},
-		"other writable":   {mode: 0o757, want: "everyone"},
-		"both writable":    {mode: 0o777, want: "its group and everyone"},
-		"group write only": {mode: 0o720, want: "its group"},
+		"group writable, by a group that is not root": {mode: 0o775, chgrp: true, want: "gid 65500"},
+		"other writable": {mode: 0o757, want: "everyone"},
+		"both writable":  {mode: 0o777, want: "everyone"},
+		"group write only, by a group that is not root": {mode: 0o720, chgrp: true, want: "gid 65500"},
 	}
 	for name, tc := range tests {
 		for _, depth := range []string{"the root itself", "a parent"} {
@@ -75,11 +77,16 @@ func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
 				if depth == "a parent" {
 					offender = parent
 				}
+				if tc.chgrp {
+					if err := os.Chown(offender, -1, strangerGID); err != nil {
+						t.Skipf("cannot hand %s to gid %d (%v), so a group grant to a stranger is untestable here", offender, strangerGID, err)
+					}
+				}
 				if err := os.Chmod(offender, tc.mode); err != nil {
 					t.Fatalf("chmod %s: %v", offender, err)
 				}
 
-				err := verifyCustody(root)
+				err := verifyCustody(root, trustedWriters{})
 				if !errors.Is(err, ErrNoCustody) {
 					t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
 				}
@@ -87,51 +94,195 @@ func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
 					t.Errorf("error %q does not name the offending path %s", err, offender)
 				}
 				if !strings.Contains(err.Error(), tc.want) {
-					t.Errorf("error %q does not say it is writable by %s", err, tc.want)
+					t.Errorf("error %q does not name the writer (%s)", err, tc.want)
 				}
 			})
 		}
 	}
 }
 
-// TestVerifyCustodyRefusesAnNFSv4ACL pins the check that a mode cannot make: an
-// NFSv4 ACL can grant a named non-root user write access that the mode does not
-// show, so its presence means this gate cannot see who may write and must decline.
+// TestVerifyCustodyAcceptsAGroupOnlyRootCanUse pins the precision the parsed writer set
+// buys, and it is a case the earlier mode-only rule refused for no reason: a directory at
+// 0775 owned by root:root is writable by the root group, whose only member is root, which
+// this check already trusts. Refusing it made the gate look arbitrary and taught operators
+// to reach for the waiver.
+func TestVerifyCustodyAcceptsAGroupOnlyRootCanUse(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs to run as root for the root group to be the fixture's group")
+	}
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Chmod(root, 0o775); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if err := verifyCustody(root, trustedWriters{}); err != nil {
+		t.Fatalf("verifyCustody refused a directory writable only by the root group: %v", err)
+	}
+}
+
+// TestVerifyCustodyAcceptsADeclaredGroup pins the group half of the declaration, which is
+// the weaker of the two claims because a group grant reaches every current and future
+// member.
+func TestVerifyCustodyAcceptsADeclaredGroup(t *testing.T) {
+	const strangerGID = 65500
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Chown(root, -1, strangerGID); err != nil {
+		t.Skipf("cannot hand the fixture to gid %d (%v)", strangerGID, err)
+	}
+	if err := os.Chmod(root, 0o775); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if err := verifyCustody(root, trustedWriters{}); !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody before the group is declared", err)
+	}
+	if err := verifyCustody(root, trustedWriters{gids: []int{strangerGID}}); err != nil {
+		t.Fatalf("verifyCustody refused a group the caller declared: %v", err)
+	}
+}
+
+// TestVerifyCustodyNeverTrustsEveryone pins the one identity that cannot be declared. A
+// grant to everyone names no identity, so accepting it would be turning the check off
+// while pretending to narrow it — which is what InstallWithoutCustody is for, honestly.
+func TestVerifyCustodyNeverTrustsEveryone(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o777); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Chmod(root, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	trust := trustedWriters{uids: []int{0, 1, 2, 3000, os.Geteuid()}, gids: []int{0, 1, 2, 568}}
+	err := verifyCustody(root, trust)
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: no list of identities can cover everyone", err)
+	}
+	if !strings.Contains(err.Error(), "everyone") {
+		t.Errorf("error %q does not name everyone as the writer", err)
+	}
+}
+
+// TestVerifyCustodyEvaluatesAnNFSv4ACL pins the check a mode cannot make. An NFSv4 ACL
+// can grant a named non-root user write access the mode does not show, so the list is
+// PARSED and its grants are judged like any other writer — refused when the identity is a
+// stranger, accepted when the caller has declared it.
 //
-// The xattr lister is substituted because no ordinary test process can mount a
-// filesystem that exposes one. That is the branch's only seam, and the alternative
-// is leaving the most consequential refusal in the file untested.
-func TestVerifyCustodyRefusesAnNFSv4ACL(t *testing.T) {
-	for _, attr := range aclXattrs {
-		t.Run(attr, func(t *testing.T) {
+// The attribute is served through a substituted reader because no ordinary test process
+// can mount a filesystem that produces one. The blob itself is a real list, captured from
+// a ZFS nfsv4 dataset (see acl_golden_test.go), so what is faked is the delivery and not
+// the content.
+func TestVerifyCustodyEvaluatesAnNFSv4ACL(t *testing.T) {
+	sample := nfs4Samples["root-owned tools directory, mode 0750"]
+	blob, err := base64.StdEncoding.DecodeString(sample.b64)
+	if err != nil {
+		t.Fatalf("decoding the fixture: %v", err)
+	}
+
+	tests := map[string]struct {
+		trust   trustedWriters
+		wantErr bool
+		wantIn  string
+	}{
+		"nothing declared": {
+			trust: trustedWriters{}, wantErr: true, wantIn: "uid 3000",
+		},
+		"the wrong uid declared": {
+			trust: trustedWriters{uids: []int{4242}}, wantErr: true, wantIn: "uid 3000",
+		},
+		"the writer declared": {
+			trust: trustedWriters{uids: []int{3000}},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "pkg-versions")
 			if err := os.MkdirAll(root, 0o755); err != nil {
 				t.Fatalf("MkdirAll: %v", err)
 			}
-			// A mode that passes every other check, which is the point: the ACL
-			// is the only thing wrong, and a mode-only gate would wave it through.
-			restore := stubListxattr(t, root, attr)
-			defer restore()
+			defer serveACL(t, root, xattrNFS4XDR, blob)()
 
-			err := verifyCustody(root)
-			if !errors.Is(err, ErrNoCustody) {
-				t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
+			err := verifyCustody(root, tc.trust)
+			if tc.wantErr {
+				if !errors.Is(err, ErrNoCustody) {
+					t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
+				}
+				if !strings.Contains(err.Error(), tc.wantIn) {
+					t.Errorf("error %q does not name the writer (%s)", err, tc.wantIn)
+				}
+				return
 			}
-			if !strings.Contains(err.Error(), attr) {
-				t.Errorf("error %q does not name the access-control list %s", err, attr)
+			if err != nil {
+				t.Fatalf("verifyCustody refused a tree whose only extra writer the caller declared: %v", err)
 			}
 		})
 	}
 }
 
-// TestVerifyCustodyIgnoresAPOSIXACL pins the deliberate exemption, so a future
-// tightening cannot quietly refuse the ordinary Linux volume. Under POSIX.1e the
-// mode's group bits ARE the ACL mask, which caps every named entry, so the mode
-// check already covers non-owner write and the ACL carries no hidden grant.
-//
-// The fixture is a real ACL rather than a stub: a named user with rwx under an r-x
-// mask, which leaves the mode at 0755 and the user without write.
-func TestVerifyCustodyIgnoresAPOSIXACL(t *testing.T) {
+// TestVerifyCustodyRefusesAnUnreadableACL pins the fail-closed direction. Reading the list
+// is part of establishing the precondition, so an attribute this process cannot read leaves
+// it in the same position as finding a grant it cannot accept. Only the answers that
+// genuinely mean "this filesystem has no extended attributes" are benign.
+func TestVerifyCustodyRefusesAnUnreadableACL(t *testing.T) {
+	tests := map[string]struct {
+		err     error
+		wantErr bool
+	}{
+		"an I/O error":                {err: syscall.EIO, wantErr: true},
+		"permission denied":           {err: syscall.EACCES, wantErr: true},
+		"a value too big to read":     {err: syscall.E2BIG, wantErr: true},
+		"no such attribute":           {err: syscall.ENODATA},
+		"no extended attributes":      {err: syscall.ENOTSUP},
+		"the call is not implemented": {err: syscall.ENOSYS},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "pkg-versions")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			old := getxattrFn
+			getxattrFn = func(string, string, []byte) (int, error) { return 0, tc.err }
+			defer func() { getxattrFn = old }()
+
+			err := verifyCustody(root, trustedWriters{})
+			switch {
+			case tc.wantErr && !errors.Is(err, ErrNoCustody):
+				t.Fatalf("verifyCustody error = %v, want ErrNoCustody when getxattr answers %v", err, tc.err)
+			case tc.wantErr && !errors.Is(err, ErrACLUnreadable):
+				t.Errorf("verifyCustody error = %v, want it to wrap ErrACLUnreadable", err)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("verifyCustody error = %v, want nil when getxattr answers %v", err, tc.err)
+			}
+		})
+	}
+}
+
+// TestVerifyCustodyRefusesAMalformedACL pins that bytes which are not a well-formed list
+// refuse rather than parse to an empty writer set. Under-reporting writers is precisely how
+// this check would wave through the tree it exists to refuse.
+func TestVerifyCustodyRefusesAMalformedACL(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	defer serveACL(t, root, xattrNFS4XDR, []byte("not an acl"))()
+
+	err := verifyCustody(root, trustedWriters{})
+	if !errors.Is(err, ErrNoCustody) || !errors.Is(err, ErrACLUnreadable) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody wrapping ErrACLUnreadable", err)
+	}
+}
+
+// TestVerifyCustodyAcceptsAPOSIXACLThatGrantsNothing pins the dialect that needs no
+// declaration: under POSIX.1e the mask caps every named entry, so a list granting a user
+// rwx under an r-x mask grants no write and the tree stays private. The fixture is a real
+// ACL the kernel enforces, not a parsed blob.
+func TestVerifyCustodyAcceptsAPOSIXACLThatGrantsNothing(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pkg-versions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -139,25 +290,18 @@ func TestVerifyCustodyIgnoresAPOSIXACL(t *testing.T) {
 	switch err := setPOSIXACL(root, posixACLNamedUserUnderMask); {
 	case err == nil:
 	case errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EOPNOTSUPP):
-		t.Skipf("this filesystem does not support POSIX ACLs (%v), so the exemption is untested here", err)
+		t.Skipf("this filesystem does not support POSIX ACLs (%v)", err)
 	default:
-		// EINVAL and friends mean the kernel rejected THIS blob, which is a bug in
-		// the fixture's encoding rather than a missing filesystem feature. Skipping
-		// on it would quietly retire the one test that pins the exemption.
-		t.Fatalf("the kernel rejected the fixture ACL (%v); the encoding in setPOSIXACL is wrong", err)
+		t.Fatalf("the kernel rejected the fixture ACL (%v); the encoding in encodePOSIXACL is wrong", err)
 	}
-	names, err := syscall.Listxattr(root, make([]byte, 1024))
-	if err != nil || names == 0 {
-		t.Skip("the POSIX ACL left no extended attribute, so there is nothing for the check to ignore")
-	}
-	if fi, statErr := os.Lstat(root); statErr != nil {
-		t.Fatalf("lstat: %v", statErr)
+	if fi, err := os.Lstat(root); err != nil {
+		t.Fatalf("lstat: %v", err)
 	} else if fi.Mode().Perm()&0o022 != 0 {
-		t.Fatalf("the fixture ACL widened the mode to %#o; it is meant to leave it at 0755, so this test would be asserting the wrong thing", fi.Mode().Perm())
+		t.Fatalf("the fixture widened the mode to %#o; it is meant to leave it at 0755", fi.Mode().Perm())
 	}
 
-	if err := verifyCustody(root); err != nil {
-		t.Fatalf("verifyCustody refused a directory whose POSIX ACL grants nothing its mode does not: %v", err)
+	if err := verifyCustody(root, trustedWriters{}); err != nil {
+		t.Fatalf("verifyCustody refused a directory whose POSIX ACL grants no write: %v", err)
 	}
 }
 
@@ -172,17 +316,17 @@ func TestVerifyCustodyRefusesANonDirectoryAndAMissingPath(t *testing.T) {
 	}
 
 	t.Run("a file in the chain", func(t *testing.T) {
-		if err := verifyCustody(filepath.Join(file, "versions")); !errors.Is(err, ErrNoCustody) {
+		if err := verifyCustody(filepath.Join(file, "versions"), trustedWriters{}); !errors.Is(err, ErrNoCustody) {
 			t.Errorf("verifyCustody error = %v, want ErrNoCustody", err)
 		}
 	})
 	t.Run("the root itself is a file", func(t *testing.T) {
-		if err := verifyCustody(file); !errors.Is(err, ErrNoCustody) {
+		if err := verifyCustody(file, trustedWriters{}); !errors.Is(err, ErrNoCustody) {
 			t.Errorf("verifyCustody error = %v, want ErrNoCustody", err)
 		}
 	})
 	t.Run("a path that does not exist", func(t *testing.T) {
-		if err := verifyCustody(filepath.Join(base, "absent", "versions")); !errors.Is(err, ErrNoCustody) {
+		if err := verifyCustody(filepath.Join(base, "absent", "versions"), trustedWriters{}); !errors.Is(err, ErrNoCustody) {
 			t.Errorf("verifyCustody error = %v, want ErrNoCustody", err)
 		}
 	})
@@ -204,14 +348,14 @@ func TestVerifyCustodyJudgesTheResolvedChain(t *testing.T) {
 	}
 	viaLink := filepath.Join(link, "pkg-versions")
 
-	if err := verifyCustody(viaLink); err != nil {
+	if err := verifyCustody(viaLink, trustedWriters{}); err != nil {
 		t.Fatalf("verifyCustody refused a private tree reached through a symlink: %v", err)
 	}
 
 	if err := os.Chmod(real, 0o777); err != nil {
 		t.Fatalf("chmod the link target: %v", err)
 	}
-	err := verifyCustody(viaLink)
+	err := verifyCustody(viaLink, trustedWriters{})
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("verifyCustody error = %v, want ErrNoCustody once the link's TARGET is world-writable", err)
 	}
@@ -253,7 +397,7 @@ func TestEnsureInstallsWithoutCustodyWhenTheCallerWaivesIt(t *testing.T) {
 	if err := os.Chmod(env.root, 0o777); err != nil {
 		t.Fatalf("chmod the install root: %v", err)
 	}
-	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 
 	if err := m.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure with Untrusted set: %v", err)
@@ -276,7 +420,7 @@ func TestEnsureWithoutCustodyIgnoresAVersionItDidNotInstall(t *testing.T) {
 	if err := os.Chmod(env.root, 0o777); err != nil {
 		t.Fatalf("chmod the install root: %v", err)
 	}
-	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 	env.onFetch = func(dst io.Writer) error { return errors.New("network is down") }
 
 	err := m.Ensure(context.Background())
@@ -298,74 +442,26 @@ func mustEval(t *testing.T, path string) string {
 	return resolved
 }
 
-// stubListxattr makes the xattr lister report attr for target and nothing for any
-// other path, and returns the restore. It is the seam for the NFSv4 branch, which
-// no ordinary test filesystem can produce.
-func stubListxattr(t *testing.T, target, attr string) func() {
+// serveACL makes the attribute reader return blob as target's attr, and nothing for any
+// other path or name. It is the seam for the NFSv4 dialect, which no ordinary test
+// filesystem can produce.
+func serveACL(t *testing.T, target, attr string, blob []byte) func() {
 	t.Helper()
 	resolved := mustEval(t, target)
-	old := listxattrNames
-	listxattrNames = func(path string, dest []byte) (int, error) {
-		if path != resolved {
-			return 0, nil
+	old := getxattrFn
+	getxattrFn = func(path, name string, dest []byte) (int, error) {
+		if path != resolved || name != attr {
+			return 0, syscall.ENODATA
 		}
-		names := append([]byte(attr), 0)
 		if dest == nil {
-			return len(names), nil
+			return len(blob), nil
 		}
-		if len(dest) < len(names) {
+		if len(dest) < len(blob) {
 			return 0, syscall.ERANGE
 		}
-		return copy(dest, names), nil
+		return copy(dest, blob), nil
 	}
-	return func() { listxattrNames = old }
-}
-
-// POSIX ACL fixtures. The on-disk format is a version word followed by fixed-size
-// entries, which is stable kernel ABI (uapi/linux/posix_acl_xattr.h), so building
-// one by hand keeps this test free of a setfacl binary that many minimal images
-// (including the container this suite runs in) do not ship.
-const (
-	posixACLVersion uint32 = 2
-	aclTagUserObj   uint16 = 0x01
-	aclTagUser      uint16 = 0x02
-	aclTagGroupObj  uint16 = 0x04
-	aclTagMask      uint16 = 0x10
-	aclTagOther     uint16 = 0x20
-	aclUndefinedID  uint32 = 0xFFFFFFFF
-	aclPermRead     uint16 = 4
-	aclPermWrite    uint16 = 2
-	aclPermExecute  uint16 = 1
-)
-
-// posixACLNamedUserUnderMask grants a named user rwx while the mask allows only
-// r-x. Under POSIX.1e semantics the mask is the ceiling, so the user ends up
-// without write and the directory's mode stays 0755 — exactly the case that proves
-// the mode is an upper bound for this dialect.
-var posixACLNamedUserUnderMask = []posixACLEntry{
-	{tag: aclTagUserObj, perm: aclPermRead | aclPermWrite | aclPermExecute, id: aclUndefinedID},
-	{tag: aclTagUser, perm: aclPermRead | aclPermWrite | aclPermExecute, id: 1234},
-	{tag: aclTagGroupObj, perm: aclPermRead | aclPermExecute, id: aclUndefinedID},
-	{tag: aclTagMask, perm: aclPermRead | aclPermExecute, id: aclUndefinedID},
-	{tag: aclTagOther, perm: aclPermRead | aclPermExecute, id: aclUndefinedID},
-}
-
-// posixACLEntry is one access-control entry in the xattr encoding.
-type posixACLEntry struct {
-	id   uint32
-	tag  uint16
-	perm uint16
-}
-
-// setPOSIXACL writes entries as path's POSIX access ACL.
-func setPOSIXACL(path string, entries []posixACLEntry) error {
-	blob := binary.LittleEndian.AppendUint32(nil, posixACLVersion)
-	for _, e := range entries {
-		blob = binary.LittleEndian.AppendUint16(blob, e.tag)
-		blob = binary.LittleEndian.AppendUint16(blob, e.perm)
-		blob = binary.LittleEndian.AppendUint32(blob, e.id)
-	}
-	return syscall.Setxattr(path, "system.posix_acl_access", blob, 0)
+	return func() { getxattrFn = old }
 }
 
 // TestVerifyCustodyRefusesAStickyInstallationRoot pins the difference between the
@@ -384,7 +480,7 @@ func TestVerifyCustodyRefusesAStickyInstallationRoot(t *testing.T) {
 		t.Fatalf("chmod the installation root sticky and world-writable: %v", err)
 	}
 
-	err := verifyCustody(env.versionsRoot())
+	err := verifyCustody(env.versionsRoot(), trustedWriters{})
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("verifyCustody error = %v, want ErrNoCustody for a sticky world-writable root", err)
 	}
@@ -420,7 +516,7 @@ func TestVerifyCustodyRefusesAWritableDirectoryHoldingASymlinkOnThePath(t *testi
 	}
 	viaLink := filepath.Join(pub, "tools", "pkg-versions")
 
-	if err := verifyCustody(viaLink); err != nil {
+	if err := verifyCustody(viaLink, trustedWriters{}); err != nil {
 		t.Fatalf("verifyCustody refused a private chain reached through a symlink: %v", err)
 	}
 
@@ -429,142 +525,12 @@ func TestVerifyCustodyRefusesAWritableDirectoryHoldingASymlinkOnThePath(t *testi
 	if err := os.Chmod(pub, 0o777); err != nil {
 		t.Fatalf("chmod the directory holding the symlink: %v", err)
 	}
-	err := verifyCustody(viaLink)
+	err := verifyCustody(viaLink, trustedWriters{})
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the symlink's own directory is writable by everyone, so the name can be repointed", err)
 	}
 	if !strings.Contains(err.Error(), pub) {
 		t.Errorf("error %q does not name %s, the directory that can repoint the path", err, pub)
-	}
-}
-
-// TestVerifyCustodyRefusesAnUnreadableAttributeList pins the fail-closed direction.
-// Reading the attribute list is part of establishing the precondition, so a list
-// this process cannot read leaves it in the same position as finding an ACL it
-// cannot evaluate. Only the "this filesystem has no extended attributes" answers
-// are benign.
-func TestVerifyCustodyRefusesAnUnreadableAttributeList(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "pkg-versions")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-
-	tests := map[string]struct {
-		err     error
-		wantErr bool
-	}{
-		"an I/O error":                {err: syscall.EIO, wantErr: true},
-		"permission denied":           {err: syscall.EACCES, wantErr: true},
-		"a list too big to read":      {err: syscall.E2BIG, wantErr: true},
-		"no extended attributes":      {err: syscall.ENOTSUP},
-		"no such attribute":           {err: syscall.ENODATA},
-		"the call is not implemented": {err: syscall.ENOSYS},
-	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			old := listxattrNames
-			listxattrNames = func(string, []byte) (int, error) { return 0, tc.err }
-			defer func() { listxattrNames = old }()
-
-			err := verifyCustody(root)
-			if tc.wantErr && !errors.Is(err, ErrNoCustody) {
-				t.Fatalf("verifyCustody error = %v, want ErrNoCustody when listxattr answers %v", err, tc.err)
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("verifyCustody error = %v, want nil when listxattr answers %v (there is no ACL to hide anything)", err, tc.err)
-			}
-		})
-	}
-}
-
-// TestVerifyCustodyRetriesAGrownAttributeList pins the whole ERANGE path: the retry
-// uses the size the kernel reported, so a directory carrying many attributes cannot
-// push an ACL name out of a fixed window, and a retry that itself fails refuses
-// rather than concluding there is no ACL.
-//
-// The failure-after-ERANGE cases are listed explicitly because they are where the
-// fail-open bug lived and where a mutant would hide: an error on the size query, a
-// second ERANGE, or an error on the second fill.
-func TestVerifyCustodyRetriesAGrownAttributeList(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "pkg-versions")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	padding := make([]byte, 4096)
-	for i := range padding {
-		padding[i] = 'a'
-	}
-	names := append(append([]byte("user."), padding...), 0)
-	names = append(names, []byte("system.nfs4_acl_xdr")...)
-	names = append(names, 0)
-
-	tests := map[string]struct {
-		// after describes what the calls following the first ERANGE do.
-		after   func(call int, dest []byte) (int, error)
-		wantErr string
-	}{
-		"the retry succeeds and finds the ACL": {
-			after: func(_ int, dest []byte) (int, error) {
-				if dest == nil {
-					return len(names), nil
-				}
-				return copy(dest, names), nil
-			},
-			wantErr: "system.nfs4_acl_xdr",
-		},
-		"the size query fails": {
-			after:   func(int, []byte) (int, error) { return 0, syscall.EIO },
-			wantErr: "input/output error",
-		},
-		"the size query reports nothing": {
-			after: func(_ int, dest []byte) (int, error) {
-				if dest == nil {
-					return 0, nil
-				}
-				return 0, nil
-			},
-			wantErr: "after refusing",
-		},
-		"the retry is short again": {
-			after: func(_ int, dest []byte) (int, error) {
-				if dest == nil {
-					return len(names), nil
-				}
-				return 0, syscall.ERANGE
-			},
-			wantErr: "numerical result out of range",
-		},
-		"the retry fails": {
-			after: func(_ int, dest []byte) (int, error) {
-				if dest == nil {
-					return len(names), nil
-				}
-				return 0, syscall.E2BIG
-			},
-			wantErr: "argument list too long",
-		},
-	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			call := 0
-			old := listxattrNames
-			listxattrNames = func(_ string, dest []byte) (int, error) {
-				call++
-				if call == 1 {
-					return 0, syscall.ERANGE
-				}
-				return tc.after(call, dest)
-			}
-			defer func() { listxattrNames = old }()
-
-			err := verifyCustody(root)
-			if !errors.Is(err, ErrNoCustody) {
-				t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("error %q does not mention %q", err, tc.wantErr)
-			}
-		})
 	}
 }
 
@@ -789,7 +755,7 @@ func TestVerifyCustodyRefusesAForeignSymlinkReachedThroughAnotherLink(t *testing
 	}
 
 	t.Run("named directly", func(t *testing.T) {
-		err := verifyCustody(filepath.Join(hop, "pkg-versions"))
+		err := verifyCustody(filepath.Join(hop, "pkg-versions"), trustedWriters{})
 		if !errors.Is(err, ErrNoCustody) {
 			t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
 		}
@@ -803,7 +769,7 @@ func TestVerifyCustodyRefusesAForeignSymlinkReachedThroughAnotherLink(t *testing
 		if err := os.Symlink(shared, via); err != nil {
 			t.Fatalf("Symlink: %v", err)
 		}
-		err := verifyCustody(filepath.Join(via, "hop", "pkg-versions"))
+		err := verifyCustody(filepath.Join(via, "hop", "pkg-versions"), trustedWriters{})
 		if !errors.Is(err, ErrNoCustody) {
 			t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the same foreign link is on the path, one indirection further", err)
 		}
@@ -984,7 +950,7 @@ func TestUnavailableReportsTheWaiverCauseNotTheWaivedVerdict(t *testing.T) {
 		t.Fatalf("chmod the install root: %v", err)
 	}
 	env.onFetch = func(io.Writer) error { return errors.New("network is down") }
-	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 
 	err := m.Ensure(context.Background())
 	if err == nil {
@@ -992,5 +958,114 @@ func TestUnavailableReportsTheWaiverCauseNotTheWaivedVerdict(t *testing.T) {
 	}
 	if errors.Is(err, ErrNoCustody) {
 		t.Errorf("Ensure error = %v, want the install failure: the caller waived custody, so the verdict is not what blocked this", err)
+	}
+}
+
+// TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall is the case the whole
+// TrustedUIDs/TrustedGIDs mechanism exists for, and it is the one an operator will hit.
+//
+// A volume is reached over NFS by an administrator who already holds root on the host.
+// That account can write the installation tree, so custody legitimately fails and the
+// library legitimately refuses — it can see the grant and cannot see that the grantee is
+// already privileged. Declaring the identity restores custody, which is the point:
+// InstallWithoutCustody would also get the install running, but it treats the tree as
+// unmanageable and so re-downloads the archive on EVERY start, because nothing already on
+// disk may be activated. Both halves are asserted here, because the reinstall cost is the
+// thing that makes the blunt instrument unusable in practice.
+func TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall(t *testing.T) {
+	const adminUID = 65501
+
+	// A fixture whose tree is writable by another uid: the closest a test can get to the
+	// NFS-admin shape without a second account to run as.
+	setup := func(t *testing.T) *fakeEnv {
+		t.Helper()
+		env := newFakeEnv(t)
+		if err := os.Chown(env.root, -1, 65500); err != nil {
+			t.Skipf("cannot hand the fixture to another group (%v)", err)
+		}
+		if err := os.Chmod(env.root, 0o770); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		return env
+	}
+
+	t.Run("refused when nothing is declared", func(t *testing.T) {
+		env := setup(t)
+		m := env.manager()
+		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
+		}
+		if !strings.Contains(m.custodyVerdict().Error(), "gid 65500") {
+			t.Errorf("verdict %q does not name the writer", m.custodyVerdict())
+		}
+	})
+
+	t.Run("declared: custody holds and a restart reuses the install", func(t *testing.T) {
+		env := setup(t)
+		trust := func(c *Config) { c.TrustedGIDs = []int{65500}; c.TrustedUIDs = []int{adminUID} }
+
+		m := env.manager(trust)
+		if err := m.Ensure(context.Background()); err != nil {
+			t.Fatalf("Ensure with the writer declared: %v", err)
+		}
+		if m.custodyVerdict() != nil {
+			t.Fatalf("custody still fails (%v); declaring the writer must restore it, not waive it", m.custodyVerdict())
+		}
+		if ready, why := m.Ready(); !ready {
+			t.Fatalf("Ready() = false (%s)", why)
+		}
+		first := env.fetchCount()
+
+		// A fresh Manager over the same on-disk tree: a container restart.
+		m2 := env.manager(trust)
+		if err := m2.Ensure(context.Background()); err != nil {
+			t.Fatalf("Ensure after a restart: %v", err)
+		}
+		if got := env.fetchCount(); got != first {
+			t.Errorf("fetches went from %d to %d across a restart; declaring the writer must not cost a reinstall", first, got)
+		}
+	})
+
+	t.Run("waived instead: every restart re-downloads", func(t *testing.T) {
+		env := setup(t)
+		waive := func(c *Config) { c.InstallWithoutCustody = true }
+
+		m := env.manager(waive)
+		if err := m.Ensure(context.Background()); err != nil {
+			t.Fatalf("Ensure with the waiver: %v", err)
+		}
+		first := env.fetchCount()
+
+		m2 := env.manager(waive)
+		if err := m2.Ensure(context.Background()); err != nil {
+			t.Fatalf("Ensure after a restart: %v", err)
+		}
+		if got := env.fetchCount(); got == first {
+			t.Errorf("fetches stayed at %d across a restart under the waiver; the restriction on activating a pre-existing version is what makes the precise knob worth having", got)
+		}
+	})
+}
+
+// TestInstallWithoutCustodyStillRefusesAPlantedVersion pins that the blunt waiver is not a
+// way to trust the tree. It permits installing there and it re-authorises the library's own
+// housekeeping, but a version directory this process did not publish is still refused,
+// because a completion sentinel in a tree somebody else can write is forgeable.
+func TestInstallWithoutCustodyStillRefusesAPlantedVersion(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
+	m.checkCustody()
+
+	if _, ok := m.selectActive(context.Background()); ok {
+		t.Error("selectActive accepted a planted version under InstallWithoutCustody")
+	}
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if env.fetchCount() != 1 {
+		t.Errorf("fetches = %d, want 1: the planted version must be replaced by a verified install", env.fetchCount())
 	}
 }

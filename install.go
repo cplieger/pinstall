@@ -527,7 +527,7 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 	// another principal can rewrite, which is the integrity gate the pin exists to
 	// provide. It is refused rather than repaired, for the same reason nothing else
 	// here is repaired.
-	if !artifactPrivate(from) {
+	if !m.entryPrivate(from, false) {
 		return "", errors.New("writable by another principal, and this package will not publish an artifact it executes that somebody else can rewrite")
 	}
 	to := filepath.Join(dst, name)

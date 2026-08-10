@@ -138,6 +138,13 @@ type Purge struct {
 
 // Config is one deployment of one [Release]: the pin, the digests, the root and
 // the local policy. The zero value is not usable — call [New].
+//
+// profile, then the pin, then the root, then policy, then the two custody escapes last
+// because they are the fields a reader should meet only after the rest. Packing it for the
+// 24 bytes fieldalignment can reclaim scatters that order, and a Config is allocated once
+// per manager.
+//
+//nolint:govet // fieldalignment: the field order IS this struct's documentation — the
 type Config struct {
 	// Digests maps a GOARCH to the lowercase hex SHA-256 of that
 	// architecture's archive. The resolved architecture must have an entry.
@@ -185,31 +192,55 @@ type Config struct {
 	// are bounded deliberately: an endless loop re-downloading a large archive
 	// is worse than a visible failure an operator can repair.
 	MaxAttempts int
-	// Untrusted waives the custody precondition: install into Root even when this
-	// process does not exclusively control it. It is an informed acceptance of
-	// risk, not a way to silence the check — the library still measures custody
-	// itself (see the ErrNoCustody documentation), still logs what is wrong, and
-	// still refuses to activate any version directory this process did not install
-	// from a verified archive, because a completion sentinel in a tree another
-	// principal can write is forgeable rather than evidence.
+	// TrustedUIDs and TrustedGIDs name identities whose write access to the installation
+	// tree does NOT invalidate custody, beyond root and this process's own uid, which are
+	// always trusted.
 	//
-	// Set it, too, when you know something the check cannot measure. It reads
-	// ownership, the mode and the ACL-dialect attributes of the directory chain: a
-	// volume mounted into two containers whose processes both map to the same uid, a
-	// cifs mount with noperm, or a FUSE filesystem without default_permissions all
-	// return a clean verdict while another principal can write. In those cases this
-	// flag is the only way to get the "activate only what this process installed"
-	// behaviour, which it provides unconditionally.
+	// This is the knob for the situation the library can see but cannot judge. It reads
+	// the mode, the ownership and the access-control list of every directory on the way
+	// to Root and can tell you that uid 3000 may write there; it can never tell that uid
+	// 3000 is the administrator who already holds root through sudo, so writing those
+	// files gains that account nothing. You know that, so you say it, and the library
+	// goes back to enforcing the rule everywhere else.
 	//
-	// It also re-authorises the operations the library otherwise declines to perform
-	// in a tree it does not control: the one-shot [Config.Purge], the sweep of partial
-	// directories and orphan staging trees, the retention prune, the convenience
-	// symlink, and the state record. That follows from what the flag means — the
-	// library is installing there, so refusing to tidy up after itself would leave
-	// Purge silently dead and let partial directories accumulate without bound.
+	// Each entry is a claim you are making: this identity is already at least as
+	// privileged as the process running the install. An identity that is not — the
+	// unprivileged account an application runs as, say — genuinely can escalate through a
+	// binary this library installs and a consumer executes, and listing it there defeats
+	// the point. Listing "everyone" is not possible, because a grant to everyone names no
+	// identity to trust; see InstallWithoutCustody.
+	TrustedUIDs []int
+	// TrustedGIDs is the group half of TrustedUIDs. A group grant is a grant to every
+	// current and future member, so it is the weaker claim of the two.
+	TrustedGIDs []int
+	// InstallWithoutCustody proceeds even though custody of Root could not be established:
+	// the refusal becomes a warning and the install runs anyway.
 	//
-	// Otherwise leave it false. Fixing the volume is the better answer, and the error
-	// names the path.
+	// It is the blunt instrument, for a volume whose permissions cannot be described by
+	// naming identities — one whose filesystem does not make the mode its access decision
+	// at all (a cifs mount with noperm, a FUSE filesystem without default_permissions), or
+	// one you simply accept as shared. Prefer TrustedUIDs and TrustedGIDs, which keep the
+	// check working; reach for this when there is nothing precise to say.
+	//
+	// It also re-authorises what the library otherwise declines to do in a tree it does
+	// not control: the one-shot Purge, the sweep of partial directories and orphan staging
+	// trees, the retention prune, the convenience symlink, and the state record. That
+	// follows from what it means — the library is installing there, so refusing to tidy up
+	// after itself would leave Purge silently dead and let partial directories accumulate
+	// without bound.
+	//
+	// Setting it implies Untrusted's restriction on activation: in a tree this process does
+	// not control, a completion sentinel is forgeable, so only a version THIS process
+	// installed from a verified archive is activated.
+	InstallWithoutCustody bool
+	// Untrusted activates only versions THIS process installed from a verified archive,
+	// never one already on the volume, regardless of what the custody check concluded.
+	//
+	// The check has blind spots a caller may know about — a volume mounted into two
+	// containers whose processes both map to uid 0 passes every question it asks — and this
+	// is how to say so without also declaring the tree unmanageable. It costs a
+	// digest-verified reinstall on every start, which is the price of not believing a
+	// sentinel.
 	Untrusted bool
 }
 

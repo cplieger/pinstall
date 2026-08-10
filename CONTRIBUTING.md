@@ -23,9 +23,14 @@ even if the API is untouched.
   rename it into place, `fsync` the installation root. Any sync failure fails the
   install. Do not reorder these, do not batch them, and do not treat the rename as
   sufficient: atomic visibility is not crash durability.
-- **Custody is verified, never repaired.** `verifyCustody` runs before anything is
-  fetched and returns a verdict; no code path in this library calls `chmod` on a
-  directory it did not like. Adding a repair would take an authority over the
+- **Custody is verified, never repaired, and access-control lists are parsed rather
+  than treated as opaque.** `verifyCustody` runs before anything is fetched and returns a
+  verdict; no code path in this library calls `chmod` on a directory it did not like. When
+  a path carries an ACL it is decoded (`acl.go`) and the identities it grants write to are
+  judged against `Config.TrustedUIDs`/`TrustedGIDs`, so a refusal names a principal an
+  operator can act on. `acl_golden_test.go` pins the NFSv4 wire format against real lists
+  captured from a ZFS dataset; do not "simplify" that parser against the specification
+  alone, because those fixtures already corrected one wrong reading of it. Adding a repair would take an authority over the
   operator's volume that the library does not have, and forcing an exact mode also
   _widens_ a tree a stricter umask had narrowed. If you find yourself wanting to fix
   a permission, the answer is a clearer refusal.
@@ -103,7 +108,8 @@ Flat, one concept per file:
 | `release.go`  | `Release`, `ArchiveInstaller`, `Assertion`, `Purge`, and their validation |
 | `install.go`  | fetch, digest verification, staging, assembly, the publish protocol       |
 | `unpack.go`   | `Unpacker`, `UnpackZip`, entry normalisation                              |
-| `custody.go`  | the custody precondition: `verifyCustody`, the ACL-dialect judgement      |
+| `custody.go`  | the custody precondition: `verifyCustody`, the chain walk                 |
+| `acl.go`      | ACL decoding for both dialects, and the trusted-writer set                |
 | `versions.go` | completeness, the version probe, selection, ordering, retention, pruning  |
 | `purge.go`    | the one-shot sweep and the convenience link                               |
 | `errors.go`   | the sentinel errors                                                       |
@@ -179,10 +185,13 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `unpack_test.go`: containment positively and negatively (asserted on the
   filesystem, not on a lexical helper), mode handling, duplicate entry names, and
   the entry-count and size budgets.
-- `custody_test.go`: the precondition — a private tree accepted including its
-  sticky world-writable ancestor, every shape of non-owner write refused at every
-  depth, the NFSv4-ACL refusal, the POSIX-ACL exemption against a real ACL, the
-  resolved-chain rule, and the two Untrusted halves end to end.
+- `custody_test.go`: the precondition — a private tree accepted including its sticky
+  world-writable ancestor, every shape of non-owner write refused at every depth, an
+  NFSv4 ACL evaluated and then accepted once its writer is declared, a POSIX ACL whose
+  mask withholds write, the resolved-chain and lexical-chain rules, and each of the three
+  custody-related Config fields end to end.
+- `acl_golden_test.go`: the wire formats, against real captured lists, plus every shape of
+  malformed input and every reason an entry grants nothing.
 - `release_test.go`: the profile and sweep validation tables, the package-name
   versus artifact-name separation, and the pin validator.
 - `widget_test.go`: the synthetic second profile, end to end.

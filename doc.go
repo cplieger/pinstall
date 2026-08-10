@@ -11,8 +11,11 @@
 // any byte is fetched and never repaired: Root and every directory above it, on both
 // the path as written and the path it resolves to, must be modifiable only by this
 // process's identity or root, and the artifacts themselves are checked the same way at
-// publish and at activation. What that check can and cannot see, and what to do when
-// your volume is one it cannot judge, is on [ErrNoCustody] and [Config.Untrusted]. The verified archive itself is unlinked before the first byte
+// publish and at activation. An access-control list on any of them is decoded and the
+// identities it grants write to are judged, so the verdict names a principal rather than
+// declining to look. What that check can and cannot see, and how to declare an identity
+// that is already privileged, is on [ErrNoCustody], [Config.TrustedUIDs] and
+// [Config.InstallWithoutCustody]. The verified archive itself is unlinked before the first byte
 // arrives and reaches the unpacker as a reader on that same descriptor, so it has
 // no name to substitute, and the unpacker writes through an [os.Root] on the
 // extraction directory, so no archive entry can escape it.

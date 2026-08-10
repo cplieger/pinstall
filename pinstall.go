@@ -163,6 +163,10 @@ type Manager struct {
 
 	// Facts resolved once at construction, so a caller mutating the Config's
 	// maps or slices afterwards cannot change what this manager installs.
+	// trust is the caller's declared writer set, copied at construction so a later
+	// mutation of the Config's slices cannot change what this manager accepts.
+	trust trustedWriters
+
 	archToken   string
 	digest      string
 	urlTemplate string
@@ -265,6 +269,7 @@ func New(cfg *Config) (*Manager, error) {
 		parseVersion: orDefaultParser(c.Release.ParseVersion),
 		installed:    map[string]bool{},
 		cfg:          c,
+		trust:        trustedWriters{uids: slices.Clone(c.TrustedUIDs), gids: slices.Clone(c.TrustedGIDs)},
 		archToken:    token,
 		digest:       digest,
 		urlTemplate:  template,
@@ -426,7 +431,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 // partial directories and orphan staging trees accumulate without bound. The waiver is
 // the operator saying they accept this library operating there.
 func (m *Manager) mayMutateTree() bool {
-	return m.custodyVerdict() == nil || m.cfg.Untrusted
+	return m.custodyVerdict() == nil || m.cfg.InstallWithoutCustody
 }
 
 // finish activates sel: it re-asserts the assertions against the SELECTED
@@ -597,6 +602,21 @@ func (m *Manager) PathEntry() string {
 	return m.active.dir
 }
 
+// PathEnv returns the environment overlay to append to [os.Environ] before
+// spawning anything that must resolve this release's artifacts, or nil when no
+// version is active — [Manager.PathEntry] already composed into [pathEnv]'s
+// rule, so a consumer satisfying the lead-PATH contract does not restate it.
+//
+// It is exported because stating a contract is not the same as shipping it. Both
+// of this library's consumers were told to lead PATH with [Manager.PathEntry]
+// and each wrote its own composer, which with this package's own [binPathEnv]
+// made three copies of one rule; the library's copy is the one that drifted,
+// appending an empty inherited PATH and so producing the trailing separator
+// [pathEnv] exists to avoid.
+func (m *Manager) PathEnv() []string {
+	return pathEnv(m.PathEntry())
+}
+
 // Path returns the absolute path of the active primary artifact, or "" when no
 // version is active. This — never the convenience link — is what a consumer
 // runs.
@@ -611,17 +631,47 @@ func (m *Manager) versionDir(version string) string {
 	return filepath.Join(m.versionsDir, version)
 }
 
+// pathEnv is the one PATH rule this package owns: entry leads, and the inherited
+// PATH follows only when there is one. The result is the single-assignment
+// overlay a caller appends to [os.Environ].
+//
+// Refusing to append an EMPTY inherited value is the whole reason this is a
+// function rather than a concatenation at each site. A PATH element that is
+// empty names the CURRENT WORKING DIRECTORY, so the trailing separator left by
+// appending nothing makes the child search whatever directory the calling
+// process happened to be standing in — for a server that is its own work tree,
+// and a bare-name sidecar lookup lands on anything a user put there. Leading
+// with a directory that holds only this release's verified artifacts exists to
+// NARROW that lookup, so the degenerate case does not merely fail to help, it
+// inverts the guarantee. An empty entry is the same failure with one element
+// instead of two, so it yields no overlay at all rather than a PATH that is
+// nothing but the cwd.
+//
+// It is a package-level function, not a method, because the rule is needed for
+// a directory the manager cannot name: [binPathEnv] applies it to a STAGED
+// binary, before any version is active and therefore before [Manager.PathEntry]
+// has an answer.
+func pathEnv(entry string) []string {
+	if entry == "" {
+		return nil
+	}
+	if inherited := os.Getenv("PATH"); inherited != "" {
+		return []string{"PATH=" + entry + string(os.PathListSeparator) + inherited}
+	}
+	return []string{"PATH=" + entry}
+}
+
 // binPathEnv returns the environment overlay that leads PATH with bin's own
-// directory. Every command pinstall runs AGAINST an installed or staged
-// binary carries it, because a multi-binary release's primary executable may
-// resolve its sidecars by BARE NAME on PATH rather than beside its own
-// executable — kiro-cli is the live case: `kiro-cli settings` delegates to
-// the kiro-cli-chat sidecar via PATH only, so without this overlay every
-// settings assertion fails with ENOENT even though the sidecar sits right
-// next to the asserted binary. The caller's process environment keeps
-// working because exec.Cmd deduplicates Env taking the LAST entry.
+// directory, under [pathEnv]'s rule. Every command pinstall runs AGAINST an
+// installed or staged binary carries it, because a multi-binary release's
+// primary executable may resolve its sidecars by BARE NAME on PATH rather than
+// beside its own executable — kiro-cli is the live case: `kiro-cli settings`
+// delegates to the kiro-cli-chat sidecar via PATH only, so without this overlay
+// every settings assertion fails with ENOENT even though the sidecar sits right
+// next to the asserted binary. The caller's process environment keeps working
+// because exec.Cmd deduplicates Env taking the LAST entry.
 func binPathEnv(bin string) []string {
-	return []string{"PATH=" + filepath.Dir(bin) + string(os.PathListSeparator) + os.Getenv("PATH")}
+	return pathEnv(filepath.Dir(bin))
 }
 
 // applyAssertions runs every configured assertion against bin. A required
@@ -715,7 +765,7 @@ func (m *Manager) recordUnavailable(installErr error) error {
 	// exclusion cause, and reporting it there would send an operator to fix permissions
 	// they deliberately chose while hiding the real reason — a replaced artifact under
 	// an intact sentinel, say, which is ErrVersionMismatch's story to tell.
-	if err == nil && !m.cfg.Untrusted {
+	if err == nil && !m.cfg.InstallWithoutCustody {
 		err = m.custodyVerdict()
 	}
 	if err == nil {

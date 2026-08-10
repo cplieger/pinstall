@@ -205,80 +205,59 @@ func (m *Manager) trusted(version string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	switch {
-	case m.cfg.Untrusted:
-		// The waiver's degraded mode: the caller accepted a tree it shares, and the
-		// mitigation on offer is that only what this process published from a verified
-		// archive is activated.
-		return m.installed[version]
-	case m.custodyErr != nil:
-		// No custody and no waiver. Nothing here is evidence, INCLUDING what this
-		// process installed earlier: that fact proves a publish at some past instant,
-		// not the bytes at this one, and in a writable tree the directory or the
-		// artifact can be renamed between the checks and the exec. Readiness is
-		// withheld rather than granted on a claim the library cannot make.
+	case m.custodyErr != nil && !m.cfg.InstallWithoutCustody:
+		// The verdict says this process does not control the tree and the caller has
+		// not accepted that. Nothing here is evidence, INCLUDING what this process
+		// installed earlier: that fact proves a publish at some past instant, not the
+		// bytes at this one, and in a writable tree the directory or the artifact can
+		// be renamed between the checks and the exec. Readiness is withheld rather
+		// than granted on a claim the library cannot make.
 		return false
+	case m.custodyErr != nil, m.cfg.Untrusted:
+		// Either the caller accepted a tree it shares, or it declared the tree
+		// untrustworthy on its own knowledge. Same mitigation: only a version this
+		// process published from a verified archive.
+		return m.installed[version]
 	}
 	return true
 }
 
-// artifactPrivate reports whether path is a file that only this process's identity
-// (or root) may write.
+// entryPrivate reports whether a file or directory inside a version tree can be modified
+// by any identity the caller has not accounted for.
 //
-// Custody of the TREE does not answer this: directory write permission governs
-// creating, removing and renaming entries, not writing to the contents of an entry
-// that already exists. A group- or other-writable artifact inside a directory nobody
-// else can add to is still a binary this package executes and another principal can
-// rewrite.
+// Custody of the tree does not answer this. Directory write permission governs creating,
+// removing and renaming entries, not writing to the contents of an entry that already
+// exists, so a group-writable artifact inside a directory nobody else can add to is still
+// a binary this package executes and another principal can rewrite. And a version
+// directory is not always one this process created: an operator is encouraged to reshape
+// the volume, and a tree restored from a backup can hold entries with another owner.
 //
-// It asks the same three questions [verifyCustody] asks of a directory, for the same
-// reasons: the mode's write bits, the owner (another user's file is that user's to
-// chmod), and an ACL of a dialect whose mode is not an upper bound. Like everything
-// else here it reads and reports; it never repairs.
-func artifactPrivate(path string) bool {
+// It asks the same questions [verifyCustody] asks of a path component, for the same
+// reasons and against the same declared writer set: the owner, the mode, and the
+// access-control list. Like everything else here it reads and reports; it never repairs.
+func (m *Manager) entryPrivate(path string, wantDir bool) bool {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return false
 	}
-	if fi.Mode().Perm()&0o022 != 0 {
+	if fi.Mode().IsDir() != wantDir {
 		return false
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return false
 	}
-	if owner := int(stat.Uid); owner != os.Geteuid() && owner != 0 {
+	euid := os.Geteuid()
+	if !m.trust.allowsOwner(int(stat.Uid), euid) {
 		return false
 	}
-	name, err := aclXattrPresent(path)
-	return err == nil && name == ""
-}
-
-// dirPrivate reports whether a version directory is one only this process's identity
-// (or root) may add to, remove from or rename within.
-//
-// The custody walk stops at the installation root, so this is the check for one level
-// below it. It matters because a version directory is not always one this process
-// created: an operator is encouraged to reshape the volume, and a tree restored from a
-// backup can hold a directory with another owner or a wider mode. Without it, a
-// foreign-owned version directory passes on the strength of its artifacts' modes while
-// its owner can replace those entries between the check and the exec.
-func dirPrivate(path string) bool {
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsDir() {
+	writers, err := writersOf(path, fi, stat)
+	if err != nil {
+		// An unreadable access-control list is not proof there is nothing to find.
 		return false
 	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return false
-	}
-	stat, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	if owner := int(stat.Uid); owner != os.Geteuid() && owner != 0 {
-		return false
-	}
-	name, err := aclXattrPresent(path)
-	return err == nil && name == ""
+	_, stranger := m.trust.firstStranger(writers, euid)
+	return !stranger
 }
 
 // wideArtifact returns the name of the first entry in dir that another principal could
@@ -293,13 +272,13 @@ func dirPrivate(path string) bool {
 // this process created: an operator is encouraged to reshape the volume, and a tree
 // restored from a backup can hold entries with another owner. Directory permissions
 // govern adding, removing and renaming names; they do not stop the owner of an entry
-// that is already there from rewriting it, which is why dirPrivate alone is not enough.
+// that is already there from rewriting it, which is why judging the directory alone is not enough.
 //
 // Top level only, because that is what PATH exposes: an executable in a subdirectory
 // is not reachable by bare name. A directory this library assembled holds exactly the
 // declared artifacts and the sentinel, so this is a handful of stats.
 func (m *Manager) wideArtifact(dir string) string {
-	if !dirPrivate(dir) {
+	if !m.entryPrivate(dir, true) {
 		return "."
 	}
 	entries, err := os.ReadDir(dir)
@@ -310,7 +289,7 @@ func (m *Manager) wideArtifact(dir string) string {
 		if e.IsDir() {
 			continue
 		}
-		if !artifactPrivate(filepath.Join(dir, e.Name())) {
+		if !m.entryPrivate(filepath.Join(dir, e.Name()), false) {
 			return e.Name()
 		}
 	}
