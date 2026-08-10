@@ -90,6 +90,13 @@ const (
 	nfs4FlagIdentifierGroup uint32 = 0x0040
 	nfs4FlagInheritOnly     uint32 = 0x0008
 
+	// nfs4WhoIsSpecial is the ONLY discriminator value that makes an ACE's id a
+	// special-principal number rather than a uid or gid. It is named because the
+	// alternative -- treating "not zero" as "special" -- reads a named id as a
+	// special one, and the two answers disagree about who may write. Every ACE in
+	// every captured fixture carries 0 or 1.
+	nfs4WhoIsSpecial uint32 = 1
+
 	nfs4WhoOwner    uint32 = 1
 	nfs4WhoGroup    uint32 = 2
 	nfs4WhoEveryone uint32 = 3
@@ -227,14 +234,21 @@ func parsePOSIXACL(blob []byte) ([]principal, error) {
 	}
 	// The mask has to be known before the maskable entries can be judged, and it may
 	// appear after them in the list, which is why decoding and judging are two passes.
-	mask := uint16(0xFFFF)
-	for _, e := range entries {
-		if e.tag == posixTagMask {
-			mask = e.perm
-		}
+	mask, err := posixMask(entries)
+	if err != nil {
+		return nil, err
 	}
 	var out []principal
 	for _, e := range entries {
+		// OTHER is not subject to the mask, and it is the one tag whose grant would
+		// otherwise be known only from the mode. Reading it from the LIST is what stops
+		// this parser trusting the two to agree -- the assumption it exists to refuse.
+		if e.tag == posixTagOther {
+			if e.perm&posixPermWrite != 0 {
+				out = append(out, principal{kind: principalEveryone})
+			}
+			continue
+		}
 		if e.perm&mask&posixPermWrite == 0 {
 			continue
 		}
@@ -246,6 +260,29 @@ func parsePOSIXACL(blob []byte) ([]principal, error) {
 		}
 	}
 	return out, nil
+}
+
+// posixMask returns the ceiling every named entry is capped by, or all-permissions when
+// the list carries no mask at all.
+//
+// A valid access ACL carries at most ONE mask. Two of them cannot be composed without
+// choosing which is the ceiling, and choosing the later one lets a second entry retire the
+// first and hide every named writer beneath it. posix_acl_valid refuses a duplicate on
+// setxattr, so the local kernel will not produce this; a filesystem or a remote server
+// handing over the raw blob can, which is the case this refuses rather than resolves.
+func posixMask(entries []posixEntry) (uint16, error) {
+	mask := uint16(0xFFFF)
+	seen := false
+	for _, e := range entries {
+		if e.tag != posixTagMask {
+			continue
+		}
+		if seen {
+			return 0, errors.New("the list carries more than one mask entry")
+		}
+		mask, seen = e.perm, true
+	}
+	return mask, nil
 }
 
 // decodePOSIXACL reads the entries out of a POSIX.1e access ACL, refusing any shape that
@@ -333,6 +370,13 @@ func parseNFS4ACL(blob []byte, stat *syscall.Stat_t) ([]principal, error) {
 				kind = principalGroup
 			}
 			out = append(out, principal{kind: kind, id: int(id)})
+		case special != nfs4WhoIsSpecial:
+			// Not a discriminator this parser understands, so the id cannot be read as
+			// either a uid or a special principal. Guessing which costs a write grant
+			// in the silent direction: an ALLOW entry naming uid 1 under an unknown
+			// discriminator would read as OWNER@ and be dropped from the writer set,
+			// and a set missing a writer is a clean verdict nobody can refuse on.
+			return nil, fmt.Errorf("entry %d carries unknown whoIsSpecial %d", i, special)
 		case id == nfs4WhoOwner:
 			// The owner, which the caller checks itself.
 		case id == nfs4WhoGroup:

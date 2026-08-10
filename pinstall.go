@@ -425,7 +425,8 @@ func (m *Manager) Ensure(ctx context.Context) error {
 // mayMutateTree reports whether this process may delete inside the installation tree
 // or write its state record there.
 //
-// A clean custody verdict is one answer. [Config.Untrusted] is the other, and it has
+// A clean custody verdict is one answer. [Config.InstallWithoutCustody] is the other, and it
+// has
 // to be: with the waiver set the library installs into the tree anyway, so refusing to
 // sweep it would leave the documented [Config.Purge] knob silently dead and let
 // partial directories and orphan staging trees accumulate without bound. The waiver is
@@ -761,7 +762,7 @@ func (m *Manager) recordUnavailable(installErr error) error {
 	// the path a mid-process verdict flip takes, where no install was even tried.
 	//
 	// Only when the verdict is what BLOCKED activation, though. Under
-	// [Config.Untrusted] a failed verdict is the accepted state rather than the
+	// [Config.InstallWithoutCustody] a failed verdict is the accepted state rather than the
 	// exclusion cause, and reporting it there would send an operator to fix permissions
 	// they deliberately chose while hiding the real reason — a replaced artifact under
 	// an intact sentinel, say, which is ErrVersionMismatch's story to tell.

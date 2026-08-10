@@ -77,7 +77,7 @@ import (
 // all — a cifs mount with noperm, a FUSE filesystem without default_permissions —
 // where the numbers read here are decoration. No mode-and-xattr inspection can detect
 // that from inside the process; it belongs to the operator, which is what
-// [Config.Untrusted] is for.
+// [Config.InstallWithoutCustody] is for.
 func verifyCustody(dir string, trust trustedWriters) error {
 	euid := os.Geteuid()
 	// The NAME's own chain first. Every later operation in this package reaches the

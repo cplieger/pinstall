@@ -184,6 +184,16 @@ type Config struct {
 	// Retain is how many predecessors to keep besides the active version. Zero
 	// uses 1, which is what makes a bad activation recoverable without a
 	// rollback journal.
+	//
+	// Retention counts only what could actually SERVE. A directory this process
+	// may not activate is not a fallback, so it is not a keeper — and it is not
+	// collected either, because the library did not put it into that state and
+	// deleting an install it cannot vouch for is not its call. The consequence is
+	// worth planning for: when nothing pre-existing is activatable, which is what
+	// Untrusted and InstallWithoutCustody both mean for a directory installed by
+	// an earlier process, this bound does not apply to those directories and the
+	// tree grows by one per upgrade until something outside this library collects
+	// them. Under a clean verdict with neither flag, Retain bounds the tree.
 	Retain int
 	// RetryBackoff is the first [Manager.EnsureWithRetry] backoff; it doubles
 	// per attempt up to a ten minute cap. Zero uses 30s.
@@ -231,7 +241,8 @@ type Config struct {
 	//
 	// Setting it implies Untrusted's restriction on activation: in a tree this process does
 	// not control, a completion sentinel is forgeable, so only a version THIS process
-	// installed from a verified archive is activated.
+	// installed from a verified archive is activated. That carries Untrusted's effect on
+	// [Config.Retain] with it — see there.
 	InstallWithoutCustody bool
 	// Untrusted activates only versions THIS process installed from a verified archive,
 	// never one already on the volume, regardless of what the custody check concluded.
@@ -241,6 +252,11 @@ type Config struct {
 	// is how to say so without also declaring the tree unmanageable. It costs a
 	// digest-verified reinstall on every start, which is the price of not believing a
 	// sentinel.
+	//
+	// It also stops [Config.Retain] bounding the tree, because a directory an earlier
+	// process installed is one this one may not activate, so it is neither a fallback to
+	// keep nor an install this library will delete. Expect accumulation on a long-lived
+	// volume and collect it out of band.
 	Untrusted bool
 }
 

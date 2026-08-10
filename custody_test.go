@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -1084,5 +1086,69 @@ func TestInstallWithoutCustodyStillRefusesAPlantedVersion(t *testing.T) {
 	}
 	if env.fetchCount() != 1 {
 		t.Errorf("fetches = %d, want 1: the planted version must be replaced by a verified install", env.fetchCount())
+	}
+}
+
+// TestVerifyCustodyRefusesThenAcceptsTheProcessOwnGroup is the UNPRIVILEGED witness for
+// the group half of the declaration, and for group-write refusal itself. Both properties
+// are otherwise covered only by tests that chown a fixture to a pinned stranger gid, which
+// no unprivileged process can do -- so on CI, where the gate actually runs, every one of
+// those skips and nothing fails if Config.TrustedGIDs stops reaching the writer set at all.
+//
+// The fixture's group is this process's own primary gid, which needs no chown and which
+// trustedWriters treats as a stranger for the same reason it treats any other ordinary
+// group as one: a group grant reaches every current and future member. The root group is
+// the exception the rule is built around -- its only member is root, which the check
+// already trusts -- so as root there is no stranger here to refuse and the test says so
+// instead of asserting whatever the environment happens to be.
+func TestVerifyCustodyRefusesThenAcceptsTheProcessOwnGroup(t *testing.T) {
+	gid := os.Getgid()
+	if gid == 0 {
+		t.Skip("the root group is always trusted, so it cannot stand in for a stranger here; the pinned-gid tests cover this shape where privilege exists")
+	}
+	root := filepath.Join(t.TempDir(), "pkg-versions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Chmod(root, 0o775); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	err := verifyCustody(root, trustedWriters{})
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody for a group-writable root", err)
+	}
+	if want := fmt.Sprintf("gid %d", gid); !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not name the writing group (%s)", err, want)
+	}
+	if err := verifyCustody(root, trustedWriters{gids: []int{gid}}); err != nil {
+		t.Fatalf("verifyCustody refused a group the caller declared: %v", err)
+	}
+}
+
+// TestNewWiresTheDeclaredIdentities pins that Config.TrustedUIDs and Config.TrustedGIDs
+// actually reach the Manager's writer set. It exists because the end-to-end tests for that
+// wiring all need privilege, so replacing the whole assignment in New with an empty
+// trustedWriters left the unprivileged suite green -- both knobs disconnected, nothing
+// failing. This asserts on the resolved set instead of on a filesystem it would have to
+// chown, so it runs and gates at any privilege.
+func TestNewWiresTheDeclaredIdentities(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager(func(c *Config) {
+		c.TrustedUIDs = []int{3000}
+		c.TrustedGIDs = []int{65500}
+	})
+
+	if !slices.Equal(m.trust.uids, []int{3000}) || !slices.Equal(m.trust.gids, []int{65500}) {
+		t.Fatalf("m.trust = %+v, want the declared identities", m.trust)
+	}
+	if !m.trust.allows(principal{kind: principalGroup, id: 65500}, os.Geteuid()) {
+		t.Error("a declared gid is not allowed, so the declaration did not reach the writer set")
+	}
+	if !m.trust.allows(principal{kind: principalUser, id: 3000}, os.Geteuid()) {
+		t.Error("a declared uid is not allowed, so the declaration did not reach the writer set")
+	}
+	if m.trust.allows(principal{kind: principalEveryone}, os.Geteuid()) {
+		t.Error("everyone was allowed, which no declaration may ever do")
 	}
 }

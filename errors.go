@@ -25,13 +25,13 @@ var (
 	// so nothing installed there can be trusted to stay what was installed. The
 	// wrapped text names the offending path and what is wrong with it: an owner, a
 	// mode, or an access-control list whose entries the mode does not show. Fix the
-	// volume, or set [Config.Untrusted] to proceed anyway.
+	// volume, or set [Config.InstallWithoutCustody] to proceed anyway.
 	//
 	// Its absence is not a proof of safety. The check reads Unix ownership, the mode
 	// and the ACL-dialect attributes; a filesystem that does not make the mode its
 	// access decision at all — a cifs mount with noperm, a FUSE filesystem without
 	// default_permissions — returns a clean verdict from inside the process no matter
 	// who can write. If that is your volume, you know something this library cannot
-	// measure, and [Config.Untrusted] is where you say so.
+	// measure, and [Config.InstallWithoutCustody] is where you say so.
 	ErrNoCustody = errors.New("the installation root is not under this process's exclusive control")
 )

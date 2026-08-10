@@ -297,3 +297,117 @@ var posixACLNamedUserUnderMask = []posixACLEntry{
 	{tag: posixTagMask, perm: 5, id: aclUndefinedID},
 	{tag: posixTagOther, perm: 5, id: aclUndefinedID},
 }
+
+// TestParseNFS4ACLRefusesAnUnknownDiscriminator pins the direction this parser must never
+// fail in. whoIsSpecial says whether an ACE's id is a uid/gid or a special-principal
+// number, and reading "not zero" as "special" makes the two answers trade places: an
+// ALLOW entry naming uid 1 under an unrecognised discriminator reads as OWNER@, which the
+// caller checks separately and this parser therefore DROPS. A writer set missing a writer
+// is a clean custody verdict, and no call site can refuse on a verdict that carries no
+// error -- so a silent drop is strictly worse than any over-report.
+//
+// The values matter because of which xattr this is: system.nfs4_acl carries the NFS
+// SERVER's list as relayed by the client, so the discriminator is chosen by whoever
+// administers the export rather than validated by the local kernel's own setters.
+func TestParseNFS4ACLRefusesAnUnknownDiscriminator(t *testing.T) {
+	const grantedID = 1 // equal to nfs4WhoOwner, which is what makes the drop silent
+	stat := &syscall.Stat_t{Gid: 9}
+
+	tests := map[string]struct {
+		special uint32
+		wantErr bool
+		// wantOwner marks the one case where an empty writer set is the RIGHT answer:
+		// the entry really does name OWNER@, whose ownership the caller checks itself.
+		wantOwner bool
+	}{
+		"named, the discriminator this parser understands": {special: 0},
+		"special, naming OWNER@ which the caller checks":   {special: nfs4WhoIsSpecial, wantOwner: true},
+		"two, which used to read a uid as OWNER@":          {special: 2, wantErr: true},
+		"three":                                  {special: 3, wantErr: true},
+		"a flag bit, not a discriminator at all": {special: 0x40, wantErr: true},
+		"every bit set":                          {special: 0xFFFFFFFF, wantErr: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			blob := buildNFS4ACL(nfs4TypeAllow, 0, tc.special, nfs4WriteData, grantedID)
+
+			writers, err := parseNFS4ACL(blob, stat)
+			switch {
+			case tc.wantErr && err == nil:
+				t.Errorf("parseNFS4ACL(whoIsSpecial=%d) = %v, nil; want an error rather than a writer set that may be missing the granted identity",
+					tc.special, writers)
+			case !tc.wantErr && err != nil:
+				t.Errorf("parseNFS4ACL(whoIsSpecial=%d) = %v on a discriminator it understands", tc.special, err)
+			}
+			// The fail-open shape itself: an empty set with no error, for a list that
+			// grants write to somebody. Only OWNER@ may answer that way, and only
+			// because ownership is checked separately by the caller.
+			if err == nil && !tc.wantOwner && len(writers) == 0 {
+				t.Errorf("parseNFS4ACL(whoIsSpecial=%d) reported no writers and no error for an ALLOW entry granting write to id %d",
+					tc.special, grantedID)
+			}
+		})
+	}
+}
+
+// TestParsePOSIXACLRefusesASecondMask pins that a duplicate mask is refused rather than
+// resolved by taking the last one. The mask is a CEILING on every named entry, so a
+// second one silently retires the first and hides every named writer under it.
+// posix_acl_valid rejects this on setxattr, so the local kernel cannot produce it; a
+// filesystem or a remote server handing over the raw blob can.
+func TestParsePOSIXACLRefusesASecondMask(t *testing.T) {
+	const rwx, rx = 7, 5
+
+	hidden := []posixACLEntry{
+		{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagUser, perm: rwx, id: 1234},
+		{tag: posixTagMask, perm: rx, id: aclUndefinedID},
+		{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+		{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+	}
+
+	writers, err := parsePOSIXACL(encodePOSIXACL(hidden))
+	if err == nil {
+		t.Errorf("parsePOSIXACL(two masks) = %v, nil; want a refusal rather than a set the second mask emptied", writers)
+	}
+}
+
+// TestParsePOSIXACLReadsOtherFromTheList pins the last place this parser could have
+// relied on the mode instead of the list. An OTHER entry granting write names everyone,
+// and it must do so from the ACL itself: posix_acl_update_mode keeps the two in step on
+// Linux, but "these two always match" is the assumption the whole check exists to refuse,
+// and the mode is the half an attacker-facing filesystem controls independently.
+func TestParsePOSIXACLReadsOtherFromTheList(t *testing.T) {
+	const rwx, rx = 7, 5
+
+	tests := map[string]struct {
+		other uint16
+		want  bool
+	}{
+		"other may write":      {other: rwx, want: true},
+		"other may not write":  {other: rx, want: false},
+		"other may do nothing": {other: 0, want: false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			entries := []posixACLEntry{
+				{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+				{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+				{tag: posixTagOther, perm: tc.other, id: aclUndefinedID},
+			}
+
+			writers, err := parsePOSIXACL(encodePOSIXACL(entries))
+			if err != nil {
+				t.Fatalf("parsePOSIXACL: %v", err)
+			}
+			got := slices.Contains(writers, principal{kind: principalEveryone})
+			if got != tc.want {
+				t.Errorf("parsePOSIXACL(other=%#o) named everyone = %v, want %v (writers=%v)",
+					tc.other, got, tc.want, writers)
+			}
+		})
+	}
+}
