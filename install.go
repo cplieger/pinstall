@@ -506,6 +506,21 @@ func (m *Manager) assemble(stage *stageTree, src string) error {
 	if err := m.writeSentinel(stage.versionDir); err != nil {
 		return err
 	}
+	// The last point at which the DIRECTORY ITSELF and the sentinel can be refused, and
+	// against the same predicate selection applies at activation. moveArtifact judged each
+	// artifact as it was renamed in; these two entries are the ones this package CREATED,
+	// and nothing had judged them. A filesystem is free to store a wider mode than MkdirAll
+	// and WriteFile asked for — an inherited NFSv4 ACE on OpenZFS does exactly that, which
+	// is the filesystem family this library parses those lists for.
+	//
+	// Publishing one anyway installs a version selection refuses for the life of the
+	// volume: the install reports SUCCESS, and every later start re-fetches the archive and
+	// reports ErrNoVersion with the complete directory sitting right there. Config.
+	// MaxAttempts exists to prevent exactly that loop, and cannot, because each attempt
+	// succeeds.
+	if wide := m.wideArtifact(stage.versionDir); wide != "" {
+		return fmt.Errorf("refusing to publish a version directory another principal could modify (%s), because selection would never activate it", wide)
+	}
 	if err := m.fsync(stage.versionDir); err != nil {
 		return fmt.Errorf("syncing the staged version directory: %w", err)
 	}

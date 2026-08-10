@@ -176,6 +176,9 @@ func TestParseNFS4ACLSkipsWhatCannotGrantWrite(t *testing.T) {
 // refuse every ordinary Linux volume that happens to carry an ACL.
 func TestParsePOSIXACLAppliesTheMask(t *testing.T) {
 	const rwx, rx = 7, 5
+	// A distinctive owning gid: GROUP_OBJ carries no id of its own, so this is what the
+	// parser must report for it, and nothing else in the table uses the number.
+	owning := &syscall.Stat_t{Gid: 8888}
 	tests := map[string]struct {
 		entries []posixACLEntry
 		want    []principal
@@ -221,7 +224,7 @@ func TestParsePOSIXACLAppliesTheMask(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			got, err := parsePOSIXACL(encodePOSIXACL(tc.entries))
+			got, err := parsePOSIXACL(encodePOSIXACL(tc.entries), owning)
 			if err != nil {
 				t.Fatalf("parsePOSIXACL: %v", err)
 			}
@@ -368,7 +371,7 @@ func TestParsePOSIXACLRefusesASecondMask(t *testing.T) {
 		{tag: posixTagOther, perm: rx, id: aclUndefinedID},
 	}
 
-	writers, err := parsePOSIXACL(encodePOSIXACL(hidden))
+	writers, err := parsePOSIXACL(encodePOSIXACL(hidden), &syscall.Stat_t{Gid: 8888})
 	if err == nil {
 		t.Errorf("parsePOSIXACL(two masks) = %v, nil; want a refusal rather than a set the second mask emptied", writers)
 	}
@@ -399,7 +402,7 @@ func TestParsePOSIXACLReadsOtherFromTheList(t *testing.T) {
 				{tag: posixTagOther, perm: tc.other, id: aclUndefinedID},
 			}
 
-			writers, err := parsePOSIXACL(encodePOSIXACL(entries))
+			writers, err := parsePOSIXACL(encodePOSIXACL(entries), &syscall.Stat_t{Gid: 8888})
 			if err != nil {
 				t.Fatalf("parsePOSIXACL: %v", err)
 			}
@@ -407,6 +410,53 @@ func TestParsePOSIXACLReadsOtherFromTheList(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("parsePOSIXACL(other=%#o) named everyone = %v, want %v (writers=%v)",
 					tc.other, got, tc.want, writers)
+			}
+		})
+	}
+}
+
+// TestParsePOSIXACLNamesTheOwningGroupFromTheList pins the last tag whose grant could have
+// been read off the mode instead of the list. GROUP_OBJ carries no id of its own -- it
+// means the object's own group -- so reporting it needs the stat the caller already holds.
+//
+// Without this, a GROUP_OBJ entry granting write under a permissive mask on a file whose
+// MODE shows no group write produced an empty writer set: the owning group vanished,
+// firstStranger found nobody, and the verdict came back clean. That is the same fail-open
+// direction and the same premise as the duplicate-mask case -- a filesystem or a remote
+// server serving a raw blob the local kernel never validated.
+//
+// It IS subject to the mask, unlike OTHER, so a masked-out grant must stay silent.
+func TestParsePOSIXACLNamesTheOwningGroupFromTheList(t *testing.T) {
+	const rwx, rw, rx = 7, 6, 5
+	const owningGid = 8888
+
+	tests := map[string]struct {
+		groupObj uint16
+		mask     uint16
+		want     bool
+	}{
+		"the owning group may write, unmasked": {groupObj: rw, mask: rwx, want: true},
+		"the same grant, capped by the mask":   {groupObj: rw, mask: rx},
+		"the owning group may not write":       {groupObj: rx, mask: rwx},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			entries := []posixACLEntry{
+				{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+				{tag: posixTagGroupObj, perm: tc.groupObj, id: aclUndefinedID},
+				{tag: posixTagMask, perm: tc.mask, id: aclUndefinedID},
+				{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+			}
+
+			writers, err := parsePOSIXACL(encodePOSIXACL(entries), &syscall.Stat_t{Gid: owningGid})
+			if err != nil {
+				t.Fatalf("parsePOSIXACL: %v", err)
+			}
+			got := slices.Contains(writers, principal{kind: principalGroup, id: owningGid})
+			if got != tc.want {
+				t.Errorf("parsePOSIXACL named the owning group (gid %d) = %v, want %v (writers=%v)",
+					owningGid, got, tc.want, writers)
 			}
 		})
 	}

@@ -199,6 +199,21 @@ func checkComponent(path string, euid int, leaf, parentSticky bool, trust truste
 	// create entries there can plant a complete-looking version directory, which
 	// selection would otherwise accept as an installed version.
 	if !leaf && mode&os.ModeSticky != 0 {
+		// The exemption is conditional on two facts a sufficiently privileged ACE can
+		// change: that the sticky bit is set, and that this directory belongs to somebody
+		// who will not clear it. A principal granted WRITE_OWNER can take the directory
+		// and then chmod the bit away; one granted WRITE_ACL can grant itself the rest.
+		// Either way the protection this branch is relying on stops existing, so those
+		// two grants are read even here -- the kernel enforcing check_sticky() today says
+		// nothing about a mode the attacker can rewrite tomorrow.
+		controllers, ctlErr := controllersOf(path, stat)
+		if ctlErr != nil {
+			return fmt.Errorf("%w: %w", ErrNoCustody, ctlErr)
+		}
+		if stranger, found := trust.firstStranger(controllers, euid); found {
+			return fmt.Errorf("%w: %s (mode %#o) is sticky, but its access-control list lets %s take its ownership or rewrite that list, and either one removes the protection the sticky bit was providing%s",
+				ErrNoCustody, path, mode.Perm(), stranger, trust.hint())
+		}
 		return nil
 	}
 	writers, err := writersOf(path, fi, stat)
