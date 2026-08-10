@@ -7,10 +7,12 @@
 // so an interrupted install is detectable by absence of the sentinel and never
 // becomes a selection candidate.
 //
-// Custody of that tree is the precondition everything else rests on, verified
-// before any byte is fetched and never repaired: Root and every directory above
-// it must be modifiable only by this process's identity or root. See
-// [ErrNoCustody]. The verified archive itself is unlinked before the first byte
+// Custody of that tree is the precondition everything else rests on, verified before
+// any byte is fetched and never repaired: Root and every directory above it, on both
+// the path as written and the path it resolves to, must be modifiable only by this
+// process's identity or root, and the artifacts themselves are checked the same way at
+// publish and at activation. What that check can and cannot see, and what to do when
+// your volume is one it cannot judge, is on [ErrNoCustody] and [Config.Untrusted]. The verified archive itself is unlinked before the first byte
 // arrives and reaches the unpacker as a reader on that same descriptor, so it has
 // no name to substitute, and the unpacker writes through an [os.Root] on the
 // extraction directory, so no archive entry can escape it.

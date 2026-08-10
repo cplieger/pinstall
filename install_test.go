@@ -509,8 +509,8 @@ func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T
 // TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts pins the Unpacker
 // seam's CONTRACT rather than a second archive format: the library ships and tests
 // exactly one unpacker, and what a custom one can rely on is that it receives the
-// digest-verified archive, a destination it cannot write outside of, and that its
-// error aborts the install with nothing published.
+// digest-verified archive, a destination whose own methods refuse to write outside
+// it, and that its error aborts the install with nothing published.
 func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	t.Run("receives the verified archive and a root on the staging extraction dir", func(t *testing.T) {
 		env := newFakeEnv(t)

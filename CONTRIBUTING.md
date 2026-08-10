@@ -11,7 +11,7 @@ directory, activates it, and reports whether the result is usable. Its only
 dependency outside the standard library is `cplieger/pathinside` (the lexical
 path-containment predicate, itself standard-library-only), and it is Linux-only:
 the publish protocol relies on a same-filesystem rename plus `fsync` of a
-directory, every write and delete inside the tree is confined by `os.Root`, and the
+directory, the extraction and every delete inside the tree are confined by `os.Root`, and the
 custody check reads Unix ownership plus the extended attributes a filesystem uses
 to expose an access-control list.
 
@@ -33,7 +33,10 @@ even if the API is untouched.
   before the first byte arrives, the digest and the extraction share its descriptor,
   and the unpacker receives an `os.Root` rather than a directory path. Do not
   reintroduce a path for either: `TestDownloadedArchiveHasNoNameWhileItIsBeingUsed`
-  and the `Unpacker` seam tests are what hold this.
+  and the `Unpacker` seam tests are what hold this. The root is a better tool, not a
+  sandbox — a callback is ordinary Go code and can call `os.OpenFile` itself — so
+  what it buys is that the contained path is the shortest one, and do not describe it
+  as making escape impossible.
 - **Nothing reaches a version directory before the digest matches.** The staging
   tree is created only after the archive is verified.
   `TestEnsureDigestMismatchPlacesNothing` asserts nothing is published.

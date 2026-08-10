@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -66,19 +67,29 @@ func nestedExtractionDir(t *testing.T) (base, out string) {
 	return base, out
 }
 
-// assertNothingOutsideExtraction fails when base holds any regular file outside the
-// extraction directory, which is what a contained extraction guarantees.
+// assertNothingOutsideExtraction fails when base holds any entry outside the
+// extraction directory that the fixture did not create, which is what a contained
+// extraction guarantees.
+//
+// Directories count. MkdirAll of an entry's parent is the FIRST operation a nested
+// escape performs, so an oracle that only looked at regular files would miss the
+// escape and see only its failure to finish.
 func assertNothingOutsideExtraction(t *testing.T, base, out string) {
 	t.Helper()
 	prefix := out + string(filepath.Separator)
-	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+	// The scaffolding nestedExtractionDir built, which is not extraction output.
+	fixture := map[string]bool{base: true, out: true}
+	for dir := filepath.Dir(out); dir != base; dir = filepath.Dir(dir) {
+		fixture[dir] = true
+	}
+	err := filepath.WalkDir(base, func(found string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || path == out || strings.HasPrefix(path, prefix) {
+		if fixture[found] || strings.HasPrefix(found, prefix) {
 			return nil
 		}
-		t.Errorf("extraction wrote %s, which is outside the extraction directory %s", path, out)
+		t.Errorf("extraction created %s, which is outside the extraction directory %s", found, out)
 		return nil
 	})
 	if err != nil {
@@ -312,10 +323,25 @@ func FuzzUnpackZipEntryNames(f *testing.F) {
 			t.Fatalf("OpenRoot: %v", rootErr)
 		}
 		defer root.Close()
-		_ = UnpackZip(context.Background(), bytesReader(raw), root)
+		unpackErr := UnpackZip(context.Background(), bytesReader(raw), root)
 
+		// Two oracles, because neither is sufficient alone. The filesystem one is
+		// exact but bounded by how deep the extraction directory is nested, and a
+		// generated name can carry more parent components than that; the logical one
+		// has no depth limit but only sees the name. Together they cover the input.
 		assertNothingOutsideExtraction(t, base, out)
+		if unpackErr == nil {
+			if target, targetErr := entryTarget(name); targetErr == nil && escapesRoot(target) {
+				t.Fatalf("UnpackZip reported success for entry %q, whose target %q leaves the extraction directory", name, target)
+			}
+		}
 	})
+}
+
+// escapesRoot reports whether a cleaned entry target names something outside the
+// extraction directory. It is the depth-independent half of the fuzz oracle.
+func escapesRoot(target string) bool {
+	return path.IsAbs(target) || target == ".." || strings.HasPrefix(target, "../")
 }
 
 // openRoot opens dir as the confined destination an [Unpacker] is handed.

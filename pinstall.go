@@ -392,12 +392,12 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	// partial sweep are deletes, and deleting inside a tree this library is about to
 	// refuse would assert exactly the authority the refusal exists to disclaim.
 	m.checkCustody()
-	if m.custodyVerdict() == nil {
+	if m.mayMutateTree() {
 		m.purgeOnce()
 		m.prunePartials()
 	} else {
 		slog.Warn("skipping the legacy purge and the partial sweep: both are deletes, and this process does not exclusively control the installation tree",
-			"package", m.cfg.Release.Name, "root", m.versionsDir)
+			"package", m.cfg.Release.Name, "root", m.versionsDir, "reason", m.custodyVerdict())
 	}
 
 	sel, ok := m.selectActive(ctx)
@@ -415,6 +415,18 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return m.recordUnavailable(installErr)
 	}
 	return m.finish(ctx, sel, installErr)
+}
+
+// mayMutateTree reports whether this process may delete inside the installation tree
+// or write its state record there.
+//
+// A clean custody verdict is one answer. [Config.Untrusted] is the other, and it has
+// to be: with the waiver set the library installs into the tree anyway, so refusing to
+// sweep it would leave the documented [Config.Purge] knob silently dead and let
+// partial directories and orphan staging trees accumulate without bound. The waiver is
+// the operator saying they accept this library operating there.
+func (m *Manager) mayMutateTree() bool {
+	return m.custodyVerdict() == nil || m.cfg.Untrusted
 }
 
 // finish activates sel: it re-asserts the assertions against the SELECTED
@@ -737,15 +749,24 @@ func (m *Manager) settlePhase() {
 	m.phase = phaseFailed
 }
 
-// saveState writes the diagnostic record durably. A failure only warns: nothing
-// in the record is an input to readiness, so losing it must not fail an
-// otherwise good install.
+// saveState writes the diagnostic record durably. A failure only warns: nothing in
+// the record is an input to readiness, so losing it must not fail an otherwise good
+// install.
+//
+// It is skipped entirely in a tree this process does not control and was not waived
+// into, because the record is a file written under Root and the refusal has to mean
+// what it says. Nothing is lost: the same facts are already in the returned error and
+// the log line.
 func (m *Manager) saveState(s *State) {
+	if !m.mayMutateTree() {
+		return
+	}
 	blob, err := json.Marshal(s)
 	if err != nil {
 		slog.Warn("failed to encode the state record", "package", m.cfg.Release.Name, "error", err)
 		return
 	}
+
 	if err := m.writeFileDurably(m.statePath, append(blob, '\n'), fileMode); err != nil {
 		slog.Warn("failed to persist the state record; it is diagnostic only, so readiness is unaffected",
 			"package", m.cfg.Release.Name, "path", m.statePath, "error", err)

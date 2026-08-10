@@ -187,8 +187,16 @@ type Config struct {
 	// from a verified archive, because a completion sentinel in a tree another
 	// principal can write is forgeable rather than evidence.
 	//
-	// Leave it false unless you have read the refusal and decided to accept it.
-	// Fixing the volume is the better answer, and the error names the path.
+	// Set it, too, when you know something the check cannot measure. It reads
+	// ownership, the mode and the ACL-dialect attributes of the directory chain: a
+	// volume mounted into two containers whose processes both map to the same uid, a
+	// cifs mount with noperm, or a FUSE filesystem without default_permissions all
+	// return a clean verdict while another principal can write. In those cases this
+	// flag is the only way to get the "activate only what this process installed"
+	// behaviour, which it provides unconditionally.
+	//
+	// Otherwise leave it false. Fixing the volume is the better answer, and the error
+	// names the path.
 	Untrusted bool
 }
 

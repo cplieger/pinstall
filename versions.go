@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // LastFieldOfFirstLine is the default [Release.ParseVersion]: the last
@@ -88,6 +89,20 @@ func (m *Manager) versionDirComplete(version string) bool {
 	return true
 }
 
+// activatableVersions lists the complete version directories selection would
+// consider, newest first: complete, and with no artifact another principal could
+// rewrite. It is what retention counts.
+func (m *Manager) activatableVersions() []string {
+	complete := m.completeVersions()
+	out := make([]string, 0, len(complete))
+	for _, version := range complete {
+		if m.wideArtifact(m.versionDir(version)) == "" {
+			out = append(out, version)
+		}
+	}
+	return out
+}
+
 // completeVersions lists the completed version directories, newest first.
 func (m *Manager) completeVersions() []string {
 	entries, err := os.ReadDir(m.versionsDir)
@@ -123,6 +138,15 @@ func (m *Manager) completeVersions() []string {
 //     measurement existed, because measurement has blind spots a caller may know
 //     about: a volume mounted into two containers whose processes both map to uid 0
 //     passes every check here, and the flag is the only way to say so.
+//
+// What `installed` proves is worth stating exactly, because it is less than it looks:
+// THIS process published that version from an archive whose digest matched, at some
+// earlier point in its own life. It is not evidence that the bytes are unchanged
+// since. In a tree without custody nothing can be, short of re-hashing every artifact
+// on every start against a record kept in the same untrusted tree — which is why the
+// README lists that as a deliberate non-goal rather than a missing feature. This is
+// the strongest available claim in a situation the caller has been told about, not a
+// guarantee equivalent to custody.
 func (m *Manager) trusted(version string) bool {
 	if m.cfg.Untrusted {
 		m.mu.Lock()
@@ -137,27 +161,62 @@ func (m *Manager) trusted(version string) bool {
 	return m.installed[version]
 }
 
-// artifactPrivate reports whether path is a file only its owner may write.
+// artifactPrivate reports whether path is a file that only this process's identity
+// (or root) may write.
 //
 // Custody of the TREE does not answer this: directory write permission governs
 // creating, removing and renaming entries, not writing to the contents of an entry
 // that already exists. A group- or other-writable artifact inside a directory nobody
 // else can add to is still a binary this package executes and another principal can
-// rewrite, so the mode of the artifact itself has to be read — and, like everything
-// else here, read rather than repaired.
+// rewrite.
+//
+// It asks the same three questions [verifyCustody] asks of a directory, for the same
+// reasons: the mode's write bits, the owner (another user's file is that user's to
+// chmod), and an ACL of a dialect whose mode is not an upper bound. Like everything
+// else here it reads and reports; it never repairs.
 func artifactPrivate(path string) bool {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return false
 	}
-	return fi.Mode().Perm()&0o022 == 0
+	if fi.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	if owner := int(stat.Uid); owner != os.Geteuid() && owner != 0 {
+		return false
+	}
+	name, err := aclXattrPresent(path)
+	return err == nil && name == ""
 }
 
 // wideArtifact returns the name of the first artifact in dir that another principal
-// could rewrite, or "" when every required artifact is private to its owner.
+// could rewrite, or "" when every one of them is private.
+//
+// Required AND optional, because both are executed. [Manager.PathEntry] hands the
+// whole version directory to the front of PATH, and a multi-binary release's primary
+// artifact resolves its sidecars from there by bare name, so an optional artifact is
+// as much a root-executed binary as a required one. Only the artifacts this
+// deployment declared are examined: anything else in the directory is not on the
+// execution path.
+//
+// A missing optional artifact reads as private rather than wide — absence is the
+// documented, warned-about case, not a rewritable binary.
 func (m *Manager) wideArtifact(dir string) string {
 	for _, name := range m.cfg.Require {
 		if !artifactPrivate(filepath.Join(dir, name)) {
+			return name
+		}
+	}
+	for _, name := range m.cfg.Optional {
+		path := filepath.Join(dir, name)
+		if _, err := os.Lstat(path); err != nil {
+			continue
+		}
+		if !artifactPrivate(path) {
 			return name
 		}
 	}
@@ -179,6 +238,10 @@ func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 			slog.Warn("ignoring an existing version directory because this process does not exclusively control the installation tree; only a freshly verified install may be activated",
 				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict(), "untrusted", m.cfg.Untrusted)
 			continue
+		}
+		if verdict := m.custodyVerdict(); verdict != nil || m.cfg.Untrusted {
+			slog.Error("activating a version on degraded evidence: this process installed it from a verified archive earlier, but the tree is not under its exclusive control, so nothing here proves the artifacts are unchanged since",
+				"package", m.cfg.Release.Name, "version", version, "reason", verdict, "untrusted", m.cfg.Untrusted)
 		}
 		dir := m.versionDir(version)
 		if wide := m.wideArtifact(dir); wide != "" {
@@ -306,11 +369,17 @@ func versionsToPrune(complete []string, active string, retain int) []string {
 	return out
 }
 
-// pruneSuperseded removes every complete version directory outside the retained
-// set, then syncs the installation root again so the removals are durable.
-// Failures warn: disk hygiene must not brick a start.
+// pruneSuperseded removes every ACTIVATABLE version directory outside the retained
+// set, then syncs the installation root again so the removals are durable. Failures
+// warn: disk hygiene must not brick a start.
+//
+// Retention is computed over the activatable set rather than the complete one so a
+// version excluded for holding a rewritable artifact cannot spend the retain slot
+// that the usable predecessor needs — which would delete the fallback and leave the
+// recovery guarantee resting on a directory selection already refuses. Such a version
+// is also not a victim: it is left exactly as found, for the operator to look at.
 func (m *Manager) pruneSuperseded(active string) {
-	victims := versionsToPrune(m.completeVersions(), active, m.cfg.Retain)
+	victims := versionsToPrune(m.activatableVersions(), active, m.cfg.Retain)
 	if len(victims) == 0 {
 		return
 	}

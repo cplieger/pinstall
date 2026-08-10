@@ -79,45 +79,49 @@ var listxattrNames = syscall.Listxattr
 //
 // # What is checked
 //
-// Every component of the resolved path, from the filesystem root down to dir
-// itself:
+// Two chains, because they are two different questions. First the components of the
+// path AS WRITTEN, since every later operation in this package reaches the tree
+// through that string (MkdirTemp, CreateTemp, OpenRoot, Rename, RemoveAll), so a
+// component another principal can replace is a component that can be repointed after
+// this verdict. Then the components of the path it RESOLVES to, which is where the
+// tree actually lives. For each component:
 //
-//   - It is a directory. A non-directory component cannot hold the tree.
-//   - Its owner is this process's effective uid, or root. Any other owner may
-//     chmod it at will, so its current mode says nothing about its future one.
-//   - It is not group- or other-writable, unless it carries the sticky bit. A
-//     sticky directory only lets a principal remove or rename entries it owns,
-//     so /tmp being 1777 cannot reach a subtree we created inside it.
-//   - It carries no access-control list. See below.
+//   - It is a directory, or a symlink (judged by [checkSymlink]). A non-directory
+//     component cannot hold the tree.
+//   - Its owner is this process's effective uid, or root. A directory's owner may
+//     widen its mode whenever it likes, so another user's directory says nothing
+//     about what its permissions will be a moment from now.
+//   - It is not group- or other-writable. An ANCESTOR is exempted when it carries
+//     the sticky bit, because sticky restricts removal and renaming to the owner of
+//     each entry, and that is what makes /tmp (1777 everywhere) usable. The
+//     installation root itself is NOT exempted: sticky says nothing about CREATE,
+//     and anyone who can create entries there can plant a version directory.
+//   - It carries no access-control list of a dialect whose mode is not an upper
+//     bound on write access. See below.
 //
-// # Why an ACL is a refusal rather than an evaluation
+// The artifacts inside a version directory are checked separately, at publish and at
+// activation, because a file's mode is independent of its parent's: directory write
+// permission governs creating, removing and renaming entries, not writing to the
+// contents of one that already exists.
 //
-// A POSIX mode is a lossy projection of an ACL, and the loss runs in the unsafe
-// direction: a directory reading 0755 root:root can carry an inherited entry
-// granting a named non-root user full write. Measured on a ZFS nfsv4 dataset,
-// which is the class of volume a NAS hands a container. A mode-only check would
-// therefore pass exactly the tree this package must refuse, and pass it silently.
+// dir must already exist — the caller creates the installation root before the check
+// rather than after, so the verdict covers the directory that will hold the tree
+// instead of the deepest ancestor that happened to exist first.
 //
-// Reading the mode is not enough, and parsing every ACL dialect is not this
-// library's job, so the gate asks a third question instead: is the mode an upper
-// bound on write access here? On Linux an ACL that says more than the mode does is
-// exposed as an extended attribute, and a trivial ACL — one the mode fully
-// describes — has no such attribute at all. [aclXattrs] lists the dialects where
-// the answer is no, with the measurements behind that judgement; POSIX.1e ACLs are
-// deliberately not among them, so the ordinary Linux volume is unaffected.
+// # What it does not establish
 //
-// The cost is deliberate and bounded: a deployment whose install root sits on an
-// NFSv4-ACL volume with a non-trivial ACL is refused until someone decides about
-// it. The alternative on offer is a guarantee that quietly does not hold.
+// A verdict is a statement about one instant, and the operations it authorises happen
+// afterwards. What makes that gap safe is not the timing but the content of the
+// verdict: repointing any component of either chain needs write access to a directory
+// this walk has just proved nobody else has, so the only principal who can invalidate
+// the answer is one who could already do anything. Root is outside the model
+// entirely, as it is for every check of this kind.
 //
-// dir must already exist — the caller creates the installation root before the
-// check rather than after, so the verdict covers the directory that will hold the
-// tree instead of the deepest ancestor that happened to exist first. Symlinks are
-// resolved before the walk and the resolved chain is what gets judged: a
-// symlinked component is not itself interesting, the directory it lands in is.
-// Nothing re-resolves a name afterwards, so there is no window between the
-// verdict and its use — and changing the chain would need write access to a
-// component this walk just proved nobody else has.
+// It also cannot see a filesystem that does not make the mode its access decision at
+// all — a cifs mount with noperm, a FUSE filesystem without default_permissions —
+// where the numbers read here are decoration. No mode-and-xattr inspection can detect
+// that from inside the process; it belongs to the operator, which is what
+// [Config.Untrusted] is for.
 func verifyCustody(dir string) error {
 	euid := os.Geteuid()
 	// The NAME's own chain first. Every later operation in this package reaches the
@@ -141,12 +145,19 @@ func verifyCustody(dir string) error {
 
 // walkChain judges every component of an absolute path from the filesystem root
 // down to the path itself.
+//
+// It carries one fact forward between components: whether the PARENT was a
+// world-writable sticky directory. That is the only situation in which a symlink's
+// ownership matters — see [checkComponent].
 func walkChain(path string, euid int) error {
 	components := ancestors(path)
+	parentSticky := false
 	for i, component := range components {
-		if err := checkComponent(component, euid, i == len(components)-1); err != nil {
+		mode, err := checkComponent(component, euid, i == len(components)-1, parentSticky)
+		if err != nil {
 			return err
 		}
+		parentSticky = mode.Perm()&0o022 != 0 && mode&os.ModeSticky != 0
 	}
 	return nil
 }
@@ -167,45 +178,71 @@ func ancestors(path string) []string {
 	return out
 }
 
-// checkComponent judges one component of a path chain.
+// checkComponent judges one component of a path chain and returns its mode.
 //
-// leaf marks the last component, which is the installation root itself, and it is
-// held to a stricter rule than its ancestors: see the sticky discussion below.
-func checkComponent(path string, euid int, leaf bool) error {
+// leaf marks the last component, which is the installation root itself and is held
+// to a stricter rule than its ancestors (see [checkWritable]). parentSticky says the
+// containing directory was world-writable with the sticky bit, which is the only
+// case where a symlink's ownership is load-bearing.
+func checkComponent(path string, euid int, leaf, parentSticky bool) (os.FileMode, error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("%w: examining %s: %w", ErrNoCustody, path, err)
+		return 0, fmt.Errorf("%w: examining %s: %w", ErrNoCustody, path, err)
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return fmt.Errorf("%w: %s: the filesystem reported no ownership information", ErrNoCustody, path)
-	}
-	if owner := int(stat.Uid); owner != euid && owner != 0 {
-		return fmt.Errorf("%w: %s is owned by uid %d rather than uid %d or root, so its permissions are that user's to change",
-			ErrNoCustody, path, owner, euid)
+		return 0, fmt.Errorf("%w: %s: the filesystem reported no ownership information", ErrNoCustody, path)
 	}
 	mode := fi.Mode()
+	owner := int(stat.Uid)
 	if mode&os.ModeSymlink != 0 {
-		// A symlink's own mode grants nothing on Linux, so ownership is the whole
-		// question: only its owner (or root) can replace it, and the ownership check
-		// above has just settled that. The directory it lands in is judged by the
-		// resolved walk.
-		return nil
+		return mode, checkSymlink(path, owner, euid, parentSticky)
+	}
+	// For a directory, ownership is load-bearing on its own: the owner can widen the
+	// mode whenever it likes, so a directory belonging to another user tells us
+	// nothing about what its permissions will be a moment from now.
+	if owner != euid && owner != 0 {
+		return mode, fmt.Errorf("%w: %s is owned by uid %d rather than uid %d or root, so its permissions are that user's to change",
+			ErrNoCustody, path, owner, euid)
 	}
 	if !mode.IsDir() {
-		return fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
+		return mode, fmt.Errorf("%w: %s is not a directory", ErrNoCustody, path)
 	}
 	if writeErr := checkWritable(path, mode, leaf); writeErr != nil {
-		return writeErr
+		return mode, writeErr
 	}
 	name, aclErr := aclXattrPresent(path)
 	if aclErr != nil {
-		return fmt.Errorf("%w: %s: cannot read the attribute list that would reveal an access-control list, so custody cannot be established: %w",
+		return mode, fmt.Errorf("%w: %s: cannot read the attribute list that would reveal an access-control list, so custody cannot be established: %w",
 			ErrNoCustody, path, aclErr)
 	}
 	if name != "" {
-		return fmt.Errorf("%w: %s carries an NFSv4-family access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
+		return mode, fmt.Errorf("%w: %s carries an NFSv4-family access-control list (%s), whose entries can grant write access that its mode %#o does not show, so this check cannot see who else may write there",
 			ErrNoCustody, path, name, mode.Perm())
+	}
+	return mode, nil
+}
+
+// checkSymlink judges a symlink on the path.
+//
+// A symlink's own mode grants nothing on Linux, and its OWNERSHIP grants nothing
+// either in the usual case: replacing it requires write permission on the directory
+// holding it, which the walk has already refused to grant anyone else. Requiring the
+// link to be ours as well would refuse a perfectly private chain that happens to
+// contain another user's link inside a directory nobody can write — a real
+// deployment shape, refused for no gain.
+//
+// The exception is a world-writable sticky parent, where sticky's rule is precisely
+// "only the entry's owner (or the directory's, or root) may remove or rename it". A
+// foreign-owned link there CAN be replaced by its owner, so who owns it is exactly
+// the question, and the answer has to be us or root.
+func checkSymlink(path string, owner, euid int, parentSticky bool) error {
+	if !parentSticky {
+		return nil
+	}
+	if owner != euid && owner != 0 {
+		return fmt.Errorf("%w: %s is a symlink owned by uid %d inside a world-writable sticky directory, so that user can repoint it at a tree of their choosing",
+			ErrNoCustody, path, owner)
 	}
 	return nil
 }
@@ -270,6 +307,11 @@ func aclXattrPresent(path string) (string, error) {
 		if sizeErr != nil {
 			return "", sizeErr
 		}
+		if size <= 0 {
+			// A zero-length list after ERANGE is contradictory. Refusing beats
+			// allocating an empty buffer and reading past it.
+			return "", fmt.Errorf("the attribute list reported %d bytes after refusing a 1024 byte buffer", size)
+		}
 		buf = make([]byte, size)
 		n, err = listxattrNames(path, buf)
 	}
@@ -294,20 +336,34 @@ func aclXattrPresent(path string) (string, error) {
 // under a running process, and the verdict is what decides whether an existing
 // version directory may be believed.
 //
-// An installation root that does not exist yet is not a failure and not a pass:
-// there is nothing to select from it either way, and install() creates it and asks
-// again before it places anything.
+// When the installation root does not exist yet the nearest ancestor that DOES is
+// judged instead. Recording a clean verdict for an absent directory would be the
+// wrong kind of convenient: the legacy purge and the state record both write under
+// Root before the versions directory is ever created, and they would then run on the
+// strength of a verdict about nothing. The ancestor chain is what will hold the tree,
+// so it is a real answer to the same question.
 func (m *Manager) checkCustody() {
-	if _, err := os.Lstat(m.versionsDir); errors.Is(err, os.ErrNotExist) {
-		m.setCustody(nil)
-		return
-	}
-	err := verifyCustody(m.versionsDir)
+	err := verifyCustody(nearestExisting(m.versionsDir))
 	if err != nil {
 		slog.Warn("this process does not exclusively control the installation tree, so a completion sentinel there is not evidence; only versions installed by this process will be activated",
 			"package", m.cfg.Release.Name, "root", m.versionsDir, "error", err)
 	}
 	m.setCustody(err)
+}
+
+// nearestExisting returns dir, or its closest ancestor that exists. The filesystem
+// root always does, so this terminates.
+func nearestExisting(dir string) string {
+	for {
+		if _, err := os.Lstat(dir); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
 }
 
 // setCustody records the verdict under the state lock.

@@ -477,9 +477,14 @@ func TestVerifyCustodyRefusesAnUnreadableAttributeList(t *testing.T) {
 	}
 }
 
-// TestVerifyCustodyRetriesAGrownAttributeList pins the ERANGE path: the second read
-// must use the size the kernel reported, so a directory carrying many attributes
-// cannot push an ACL name out of a fixed window, and a still-failing retry refuses.
+// TestVerifyCustodyRetriesAGrownAttributeList pins the whole ERANGE path: the retry
+// uses the size the kernel reported, so a directory carrying many attributes cannot
+// push an ACL name out of a fixed window, and a retry that itself fails refuses
+// rather than concluding there is no ACL.
+//
+// The failure-after-ERANGE cases are listed explicitly because they are where the
+// fail-open bug lived and where a mutant would hide: an error on the size query, a
+// second ERANGE, or an error on the second fill.
 func TestVerifyCustodyRetriesAGrownAttributeList(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pkg-versions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -493,24 +498,73 @@ func TestVerifyCustodyRetriesAGrownAttributeList(t *testing.T) {
 	names = append(names, []byte("system.nfs4_acl_xdr")...)
 	names = append(names, 0)
 
-	old := listxattrNames
-	listxattrNames = func(_ string, dest []byte) (int, error) {
-		switch {
-		case dest == nil:
-			return len(names), nil
-		case len(dest) < len(names):
-			return 0, syscall.ERANGE
-		}
-		return copy(dest, names), nil
+	tests := map[string]struct {
+		// after describes what the calls following the first ERANGE do.
+		after   func(call int, dest []byte) (int, error)
+		wantErr string
+	}{
+		"the retry succeeds and finds the ACL": {
+			after: func(_ int, dest []byte) (int, error) {
+				if dest == nil {
+					return len(names), nil
+				}
+				return copy(dest, names), nil
+			},
+			wantErr: "system.nfs4_acl_xdr",
+		},
+		"the size query fails": {
+			after:   func(int, []byte) (int, error) { return 0, syscall.EIO },
+			wantErr: "input/output error",
+		},
+		"the size query reports nothing": {
+			after: func(_ int, dest []byte) (int, error) {
+				if dest == nil {
+					return 0, nil
+				}
+				return 0, nil
+			},
+			wantErr: "after refusing",
+		},
+		"the retry is short again": {
+			after: func(_ int, dest []byte) (int, error) {
+				if dest == nil {
+					return len(names), nil
+				}
+				return 0, syscall.ERANGE
+			},
+			wantErr: "numerical result out of range",
+		},
+		"the retry fails": {
+			after: func(_ int, dest []byte) (int, error) {
+				if dest == nil {
+					return len(names), nil
+				}
+				return 0, syscall.E2BIG
+			},
+			wantErr: "argument list too long",
+		},
 	}
-	defer func() { listxattrNames = old }()
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			call := 0
+			old := listxattrNames
+			listxattrNames = func(_ string, dest []byte) (int, error) {
+				call++
+				if call == 1 {
+					return 0, syscall.ERANGE
+				}
+				return tc.after(call, dest)
+			}
+			defer func() { listxattrNames = old }()
 
-	err := verifyCustody(root)
-	if !errors.Is(err, ErrNoCustody) {
-		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the ACL name sits past the first buffer", err)
-	}
-	if !strings.Contains(err.Error(), "system.nfs4_acl_xdr") {
-		t.Errorf("error %q does not name the access-control list found on the retry", err)
+			err := verifyCustody(root)
+			if !errors.Is(err, ErrNoCustody) {
+				t.Fatalf("verifyCustody error = %v, want ErrNoCustody", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not mention %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -576,5 +630,86 @@ func TestMoveArtifactRefusesToPublishAWritableArtifact(t *testing.T) {
 	}
 	if dirs := env.versionDirs(); len(dirs) != 0 {
 		t.Errorf("installation root holds %v, want nothing published", dirs)
+	}
+}
+
+// TestUntrustedAloneForcesDistrustOnACleanTree isolates the flag from the
+// measurement, which is the one thing the other Untrusted tests cannot do: they make
+// the root world-writable first, so the measured verdict would produce the same
+// outcome and removing the flag's branch would leave them green.
+//
+// Here custody is intact and the flag is the only reason the planted directory is
+// refused. That contract predates the measurement and has now silently regressed
+// once, which is why it gets a test of its own.
+func TestUntrustedAloneForcesDistrustOnACleanTree(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m.checkCustody()
+
+	if verdict := m.custodyVerdict(); verdict != nil {
+		t.Fatalf("the fixture tree does not have custody (%v), so this test would not isolate the flag", verdict)
+	}
+	if _, ok := m.selectActive(context.Background()); ok {
+		t.Fatal("selectActive accepted a pre-existing version directory although Untrusted is set on a tree WITH custody")
+	}
+
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if env.fetchCount() != 1 {
+		t.Errorf("fetches = %d, want 1: Untrusted must force a digest-verified reinstall even on a private tree", env.fetchCount())
+	}
+	if ready, why := m.Ready(); !ready {
+		t.Errorf("Ready() = false (%s), want true after the verified reinstall", why)
+	}
+}
+
+// TestSelectActiveExcludesAVersionWithAWritableOptionalArtifact pins the half of the
+// artifact rule that the first fix missed. An optional artifact is executed too:
+// PathEntry puts the whole version directory at the front of PATH, and a
+// multi-binary release's primary artifact resolves its sidecars from there by bare
+// name, so a rewritable optional artifact is as much a root-executed binary as a
+// required one.
+func TestSelectActiveExcludesAVersionWithAWritableOptionalArtifact(t *testing.T) {
+	env := newFakeEnv(t)
+	dir := env.placeVersion(pinnedVersion, toolName, toolSidecar, toolExtra)
+	optional := filepath.Join(dir, toolExtra)
+	if _, err := os.Lstat(optional); err != nil {
+		t.Fatalf("the fixture did not place the optional artifact %s: %v", toolExtra, err)
+	}
+	if err := os.Chmod(optional, 0o777); err != nil {
+		t.Fatalf("chmod the optional artifact: %v", err)
+	}
+	m := env.manager()
+	m.checkCustody()
+
+	if _, ok := m.selectActive(context.Background()); ok {
+		t.Fatal("selectActive accepted a version whose optional artifact is writable by another principal")
+	}
+}
+
+// TestPruneKeepsAUsablePredecessorWhenANewerVersionIsUnactivatable pins retention
+// against the interaction the artifact rule introduced. A version excluded for
+// holding a rewritable artifact must not spend the retain slot the usable
+// predecessor needs: doing so deletes the fallback and leaves the recovery
+// guarantee resting on a directory selection already refuses.
+func TestPruneKeepsAUsablePredecessorWhenANewerVersionIsUnactivatable(t *testing.T) {
+	env := newFakeEnv(t)
+	wide := env.placeVersion("2.0.0")
+	env.placeVersion("1.0.0")
+	if err := os.Chmod(filepath.Join(wide, toolName), 0o777); err != nil {
+		t.Fatalf("chmod the artifact of 2.0.0: %v", err)
+	}
+	m := env.manager(func(c *Config) { c.Retain = 1 })
+
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !exists(env.versionDir("1.0.0")) {
+		t.Error("pruning deleted the usable predecessor 1.0.0 while retaining 2.0.0, which selection refuses to activate")
+	}
+	if !exists(wide) {
+		t.Error("pruning deleted 2.0.0, which it should leave exactly as found for the operator to look at")
 	}
 }
