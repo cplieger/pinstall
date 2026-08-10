@@ -110,16 +110,21 @@ func (m *Manager) completeVersions() []string {
 	return out
 }
 
-// trusted reports whether a version directory may be activated. When Root was
-// writable by others, a sentinel proves nothing (it is trivially forgeable,
-// unlike a digest), so only a version THIS process installed from a verified
+// trusted reports whether a version directory may be activated. Without custody
+// of the tree a sentinel proves nothing — it is a plain file, trivially forgeable,
+// unlike a digest — so only a version THIS process installed from a verified
 // archive qualifies.
+//
+// The verdict is MEASURED (see [verifyCustody]) rather than declared by the
+// caller. [Config.Untrusted] waives the refusal to install into such a tree; it is
+// not what decides whether the tree is trustworthy, because a caller cannot be
+// expected to know that its volume carries an inherited ACL.
 func (m *Manager) trusted(version string) bool {
-	if !m.cfg.Untrusted {
-		return true
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.custodyErr == nil {
+		return true
+	}
 	return m.installed[version]
 }
 

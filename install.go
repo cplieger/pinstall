@@ -7,17 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
-
-	"github.com/cplieger/atomicfile/v2"
 )
 
 // The placeholders a URL template carries.
@@ -197,24 +193,28 @@ type stageTree struct {
 // nothing outside the staging tree is left behind and the versions already on the
 // volume keep serving.
 //
-// The archive is downloaded and verified into a process-local temp dir BEFORE any
-// staging tree exists, so on a digest mismatch nothing has been created under the
-// installation root at all — not even an empty directory. It stays open from the
-// digest check through the extraction, so the unpacker reads the bytes that were
-// proved rather than whatever the archive's name resolves to by then.
+// Custody of the installation root is proved FIRST, before a byte is fetched: the
+// digest gate downstream is only worth running on a tree nobody else can write to
+// (see [verifyCustody]). Then the archive is downloaded into a file that is
+// unlinked the instant it exists, so from that point on it has no name at all —
+// nothing to swap, nothing to rewrite by path, and nothing left on the volume if
+// this process dies mid-install. The same descriptor carries the bytes through the
+// digest check and into the extraction, so the proof and the use are about the
+// same bytes by construction.
 func (m *Manager) install(ctx context.Context) error {
 	slog.Info("installing", "package", m.cfg.Release.Name, "version", m.cfg.Version, "arch", m.cfg.GOARCH)
 	if m.cfg.Release.Notice != "" {
 		slog.Info(m.cfg.Release.Notice, "package", m.cfg.Release.Name, "version", m.cfg.Version)
 	}
 
-	work, mkErr := os.MkdirTemp("", "pinstall-*")
-	if mkErr != nil {
-		return fmt.Errorf("creating the download temp dir: %w", mkErr)
+	if err := m.ensureVersionsDir(); err != nil {
+		return err
 	}
-	defer os.RemoveAll(work)
+	if err := m.requireCustody(); err != nil {
+		return err
+	}
 
-	archive, dlErr := m.downloadArchive(ctx, filepath.Join(work, "archive"))
+	archive, dlErr := m.downloadArchive(ctx)
 	if dlErr != nil {
 		return dlErr
 	}
@@ -226,7 +226,12 @@ func (m *Manager) install(ctx context.Context) error {
 	}
 	defer os.RemoveAll(stage.root)
 
-	if err := m.unpack(ctx, archive.reader(), stage.extract); err != nil {
+	extract, extractErr := os.OpenRoot(stage.extract)
+	if extractErr != nil {
+		return fmt.Errorf("opening the extraction directory: %w", extractErr)
+	}
+	defer func() { _ = extract.Close() }()
+	if err := m.unpack(ctx, archive.reader(), extract); err != nil {
 		return fmt.Errorf("unpacking the archive: %w", err)
 	}
 	src, srcErr := m.runInstaller(ctx, stage)
@@ -254,22 +259,25 @@ func (m *Manager) install(ctx context.Context) error {
 // pin names. Verification is the whole point: nothing downstream re-checks the
 // digest, and nothing is placed on the persistent volume until it passes.
 //
+// The archive is created inside the installation root and UNLINKED immediately, so
+// for the entire time it holds bytes it has no name. That is a deletion rather than
+// a defence added: with no name there is nothing for another principal to point
+// elsewhere, nothing to rewrite by path, no temp directory whose permissions need
+// checking, no TMPDIR the caller controls in the threat surface, and no cleanup to
+// get right — the kernel reclaims the space when the last descriptor closes,
+// including when this process dies mid-download. The installation root is the right
+// home for it because custody there has just been proved, and it is the same
+// filesystem the extracted tree lands on.
+//
 // It returns the archive still OPEN, because the proof and the extraction have to
 // be about the same bytes. Digesting a file and then handing its PATH to the
-// unpacker proves nothing: the name can be pointed at another inode in between,
-// and the extraction would take whatever is there now — the same defeat as
-// swapping the installed binary, one step earlier. The descriptor these bytes
-// were written and hashed through is the one the unpacker reads, so there is no
-// name left to swap. The caller closes it.
-//
-// O_EXCL is what makes that descriptor exclusively this install's. dst is a fresh
-// name in a private temp directory, so anything already sitting there — a symlink
-// into a directory this process can write included — is not a file to truncate
-// but a reason to fail.
-func (m *Manager) downloadArchive(ctx context.Context, dst string) (*verifiedArchive, error) {
-	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, fileMode)
+// unpacker proves nothing even while a name exists: a name can be pointed at
+// another inode in between. The descriptor these bytes were written and hashed
+// through is the one the unpacker reads. The caller closes it.
+func (m *Manager) downloadArchive(ctx context.Context) (*verifiedArchive, error) {
+	f, err := m.anonymousFile()
 	if err != nil {
-		return nil, fmt.Errorf("creating the archive file: %w", err)
+		return nil, err
 	}
 	sum := sha256.New()
 	// Digest the bytes as they land, so a large archive is read once.
@@ -296,13 +304,35 @@ func (m *Manager) downloadArchive(ctx context.Context, dst string) (*verifiedArc
 	return &verifiedArchive{file: f, size: size}, nil
 }
 
+// anonymousFile returns an open, writable file under the installation root that
+// has already been removed from the directory, so it is reachable only through the
+// returned descriptor.
+//
+// Create-then-unlink rather than O_TMPFILE: that flag's value is
+// architecture-dependent and reaching it means a dependency outside the standard
+// library, while the only thing it buys here is closing the instant between the
+// create and the unlink — an instant inside a directory whose custody was just
+// proved, where no other principal can act at all. The dot prefix keeps the name
+// out of the version scan and out of prunePartials for that instant.
+func (m *Manager) anonymousFile() (*os.File, error) {
+	f, err := os.CreateTemp(m.versionsDir, ".download-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating the archive file: %w", err)
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("unlinking the archive file: %w", err)
+	}
+	return f, nil
+}
+
 // verifiedArchive is a downloaded archive whose digest matched, held open on the
 // descriptor its bytes were written and hashed through, with the exact length
 // that hash covers.
 //
-// The PATH is deliberately not a field. Nothing downstream re-checks the digest,
-// so the only thing making the extraction trustworthy is that it reads these
-// bytes rather than whatever the archive's name resolves to by then.
+// It has no path field because it has no path: the file was unlinked before the
+// first byte arrived. Nothing downstream re-checks the digest, so the only thing
+// making the extraction trustworthy is that it reads these bytes.
 type verifiedArchive struct {
 	file *os.File
 	size int64
@@ -315,36 +345,20 @@ func (a *verifiedArchive) reader() *io.SectionReader {
 	return io.NewSectionReader(a.file, 0, a.size)
 }
 
-// close releases the descriptor. The archive file itself goes with the temp
-// directory the caller removes.
+// close releases the descriptor, which is also what frees the archive's disk
+// space: the file is already unlinked, so this is its last reference.
 func (a *verifiedArchive) close() error { return a.file.Close() }
 
 // newStage creates the staging tree under the installation root.
 //
-// The staging root's own stored mode is verified, and it is the one check that
-// covers the whole subtree: at 0700 nothing else on the host can even traverse
-// into it, so the modes of the directories inside it are not a boundary. Widened
-// to 0770 it becomes one, and the exposure is worse than a published directory's
-// — the extracted tree holds the archive's own installer, which this package
-// EXECUTES, so a group member who can write there runs code as whatever user the
-// install runs as. os.MkdirTemp asks for 0700 and, like every other mkdir, does
-// not read the result back.
-//
-// A staging root whose mode cannot be verified is removed before returning
-// rather than left for the next start's prunePartials: the failure means that
-// directory is writable by others, and leaving one sitting under the
-// installation root is the exposure itself.
+// No mode is verified here and none is repaired. The staging tree sits inside a
+// root whose custody install() proved before anything was created, so the modes of
+// the directories under it are not a boundary anybody can be on the wrong side of.
+// That is the point of proving custody once instead of per-directory.
 func (m *Manager) newStage() (*stageTree, error) {
-	if err := m.ensureVersionsDir(); err != nil {
-		return nil, err
-	}
 	root, err := os.MkdirTemp(m.versionsDir, stagePrefix+"*")
 	if err != nil {
 		return nil, fmt.Errorf("creating the staging tree: %w", err)
-	}
-	if err := enforceDirMode(root, stageMode); err != nil {
-		_ = os.RemoveAll(root)
-		return nil, fmt.Errorf("the staging tree is not private to this install: %w", err)
 	}
 	stage := &stageTree{
 		root:       root,
@@ -360,36 +374,14 @@ func (m *Manager) newStage() (*stageTree, error) {
 	return stage, nil
 }
 
-// ensureVersionsDir creates the installation root and, when THIS call created it,
-// verifies the mode the filesystem stored for it.
-//
-// The root is the directory every version tree sits in, so group-writable it
-// defeats every check below it: another principal can rename a published version
-// directory away and put its own tree at that name, and nothing re-digests what is
-// inside the substitute.
-//
-// It is created in two steps rather than one os.MkdirAll only so this call can
-// tell that it was the creator — MkdirAll returns nil for a directory that was
-// already there, and os.Mkdir's fs.ErrExist is that answer without the
-// stat-then-act window a pre-check would open. The same directories are created at
-// the same requested mode either way. A PRE-EXISTING root is deliberately left
-// alone: an operator may have widened it on purpose, repairing another principal's
-// directory is not this library's call, and [Config.Untrusted] is the channel that
-// already exists for reporting a root that was writable by others — it refuses to
-// activate any version directory this process did not install itself.
+// ensureVersionsDir creates the installation root, so custody can be judged on the
+// directory that will actually hold the tree rather than on the deepest ancestor
+// that happened to exist. It requests dirMode and does not read the result back:
+// what the filesystem stored is [verifyCustody]'s question, and its answer is a
+// verdict rather than a repair.
 func (m *Manager) ensureVersionsDir() error {
-	if err := os.MkdirAll(filepath.Dir(m.versionsDir), dirMode); err != nil {
+	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
 		return fmt.Errorf("creating the installation root: %w", err)
-	}
-	switch err := os.Mkdir(m.versionsDir, dirMode); {
-	case err == nil:
-	case errors.Is(err, fs.ErrExist):
-		return nil
-	default:
-		return fmt.Errorf("creating the installation root: %w", err)
-	}
-	if err := enforceDirMode(m.versionsDir, dirMode); err != nil {
-		return fmt.Errorf("the installation root was created writable by others: %w", err)
 	}
 	return nil
 }
@@ -467,19 +459,9 @@ func (m *Manager) gateStaged(ctx context.Context, staged string) error {
 // directory entry or the file data reached stable storage. Any sync failure —
 // ENOSPC included — fails the install, which leaves every complete version
 // already on the volume untouched.
-//
-// The staged directory's stored mode is verified before anything moves into it,
-// and that verdict is what the PUBLISHED directory carries: publish renames this
-// same inode into place, and a rename cannot change a mode. A directory born
-// group-writable would let a group member replace the root-executed binary the
-// digest check just admitted, so a mode the filesystem refused to store fails the
-// install like any other durability failure.
 func (m *Manager) assemble(stage *stageTree, src string) error {
 	if err := os.MkdirAll(stage.versionDir, dirMode); err != nil {
 		return fmt.Errorf("creating the staged version directory: %w", err)
-	}
-	if err := enforceDirMode(stage.versionDir, dirMode); err != nil {
-		return fmt.Errorf("the staged version directory would be published writable by others: %w", err)
 	}
 	moved := make([]string, 0, len(m.cfg.Require)+len(m.cfg.Optional))
 	for _, name := range m.cfg.Require {
@@ -531,46 +513,18 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 // full artifact set the directory contains. It lives inside the directory it
 // describes, so it cannot drift from those artifacts.
 //
-// fileMode is verified on the open descriptor before any bytes go in, because the
-// sentinel's own mode is the only thing protecting its contents: the version
-// directory's verified 0755 stops another principal creating, replacing or
-// removing entries, not writing to an entry whose own mode the filesystem
-// widened. A group-writable sentinel is rewritable, and a sentinel that no longer
-// names its directory makes a COMPLETE version read as a partial — which
-// prunePartials then deletes, costing the operator the retained fallback set the
-// availability posture depends on.
+// It is a plain file and therefore forgeable by anyone who can write into the
+// tree, which is exactly what custody excludes; see [verifyCustody] for why that
+// is the defence rather than the sentinel's own mode.
 func (m *Manager) writeSentinel(dir string) error {
 	path := filepath.Join(dir, sentinelName)
-	if err := writeFileVerifiedMode(path, []byte(m.cfg.Version+"\n"), fileMode); err != nil {
+	if err := os.WriteFile(path, []byte(m.cfg.Version+"\n"), fileMode); err != nil {
 		return fmt.Errorf("writing the completion sentinel: %w", err)
 	}
 	if err := m.fsync(path); err != nil {
 		return fmt.Errorf("syncing the completion sentinel: %w", err)
 	}
 	return nil
-}
-
-// writeFileVerifiedMode writes data to path with mode, proving the filesystem
-// STORED mode before the content is written rather than trusting the mode the
-// create asked for. Same rule as [enforceDirMode], on the descriptor the create
-// returned: the file never holds content while its permissions are wider than
-// asked for, so there is no window in which a widened file has anything worth
-// rewriting.
-func writeFileVerifiedMode(path string, data []byte, mode os.FileMode) error {
-	// #nosec G304 -- path is built from Root and this package's own constants.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	if _, err := atomicfile.EnforceMode(f, mode); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 // publish renames the staged version directory to its final name and syncs the
@@ -615,55 +569,6 @@ func (m *Manager) writeFileDurably(path string, data []byte, mode os.FileMode) e
 		return err
 	}
 	return m.fsync(dir)
-}
-
-// enforceDirMode proves that the filesystem STORED want for the directory this
-// process just created, instead of trusting that it honoured the mode the mkdir
-// asked for.
-//
-// A mode argument is a REQUEST, not a result. mkdir(2) passes it through umask,
-// and a filesystem carrying an inheritable group ACL can store something wider
-// than what was asked for regardless: measured on a ZFS nfs4acl dataset an
-// inheritable group@:rwx ACE yields 0770 from a 0o700 mkdir, and tightening the
-// parent does not cover it. Consumers of this library keep their installation
-// root on exactly such a volume, and nothing here ever read the mode back.
-//
-// What that costs is the integrity gate the whole version-addressed layout
-// exists to provide. A version directory holds the artifacts a consumer executes
-// AS ROOT, admitted only because the archive they came out of matched the pinned
-// digest. Born group-writable, that directory lets any member of the widening
-// group replace the binary AFTER the digest check passed, and nothing downstream
-// would notice: the completion sentinel is a plain file, so it is forgeable
-// rather than evidence, and the version probe re-reads whatever binary is at the
-// path now. The mode is the only thing standing between a verified install and a
-// substituted one.
-//
-// The verdict comes from an OPEN HANDLE — atomicfile.EnforceMode fchmods and
-// then fstats the same descriptor — so a name swapped in between the repair and
-// the check cannot make it certify a different directory. O_NOFOLLOW makes the
-// kernel refuse a symlink at the final component and O_DIRECTORY refuses
-// anything that is not a directory; O_NONBLOCK is what keeps a planted FIFO from
-// parking this call in open(2) indefinitely with no writer on the other end.
-//
-// It is only ever called on a directory THIS process created, which is what
-// makes the chmod inside it safe: no other writer has ever held that name, so
-// the repair cannot be taking over a directory somebody else made. A directory
-// that was already there when the install started — an installation root a
-// consumer's entrypoint creates and hardens — is never handed to it; see
-// ensureVersionsDir for why repairing one is not this library's call.
-func enforceDirMode(dir string, want os.FileMode) error {
-	// #nosec G304 -- dir is always a path this package just created under Root,
-	// never request data, and the open flags refuse a link or a non-directory in
-	// the kernel rather than after the fact.
-	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return fmt.Errorf("opening %s to verify the mode it was created with: %w", dir, err)
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := atomicfile.EnforceMode(f, want); err != nil {
-		return err
-	}
-	return nil
 }
 
 // fsyncPath commits the file or directory at path to stable storage. fsync on a

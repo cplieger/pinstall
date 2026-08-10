@@ -509,15 +509,15 @@ func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T
 // TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts pins the Unpacker
 // seam's CONTRACT rather than a second archive format: the library ships and tests
 // exactly one unpacker, and what a custom one can rely on is that it receives the
-// digest-verified archive and that its error aborts the install with nothing
-// published.
+// digest-verified archive, a destination it cannot write outside of, and that its
+// error aborts the install with nothing published.
 func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
-	t.Run("receives the verified archive and the staging extraction dir", func(t *testing.T) {
+	t.Run("receives the verified archive and a root on the staging extraction dir", func(t *testing.T) {
 		env := newFakeEnv(t)
 		var gotArchive []byte
 		var gotDir string
-		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, dir string) error {
-			gotDir = dir
+		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, dst *os.Root) error {
+			gotDir = dst.Name()
 			raw, err := io.ReadAll(archive)
 			gotArchive = raw
 			return err
@@ -531,14 +531,35 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 			t.Errorf("unpacker got %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
 		}
 		if !strings.HasPrefix(gotDir, env.versionsRoot()) || !strings.Contains(gotDir, stagePrefix) {
-			t.Errorf("unpacker got dir %q, want one inside a staging tree under %q", gotDir, env.versionsRoot())
+			t.Errorf("unpacker got a root on %q, want one inside a staging tree under %q", gotDir, env.versionsRoot())
+		}
+	})
+
+	t.Run("cannot write outside the destination it is handed", func(t *testing.T) {
+		// The containment is the destination's, not the unpacker's discipline: a
+		// custom implementation that tries to escape is refused by os.Root rather
+		// than trusted to have validated the name itself.
+		env := newFakeEnv(t)
+		var escapeErr error
+		env.release.Unpack = func(_ context.Context, _ *io.SectionReader, dst *os.Root) error {
+			_, escapeErr = dst.OpenFile("../../pwn", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			return escapeErr
+		}
+		m := env.manager()
+
+		_ = m.Ensure(context.Background())
+		if escapeErr == nil {
+			t.Fatal("the destination root accepted a traversing name")
+		}
+		if exists(filepath.Join(env.versionsRoot(), "pwn")) || exists(filepath.Join(env.root, "pwn")) {
+			t.Error("an unpacker wrote outside the destination it was handed")
 		}
 	})
 
 	t.Run("is never called on a digest mismatch", func(t *testing.T) {
 		env := newFakeEnv(t)
 		called := false
-		env.release.Unpack = func(context.Context, *io.SectionReader, string) error {
+		env.release.Unpack = func(context.Context, *io.SectionReader, *os.Root) error {
 			called = true
 			return nil
 		}
@@ -559,7 +580,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	t.Run("its error aborts the install and publishes nothing", func(t *testing.T) {
 		env := newFakeEnv(t)
 		injected := errors.New("unsupported archive format")
-		env.release.Unpack = func(context.Context, *io.SectionReader, string) error { return injected }
+		env.release.Unpack = func(context.Context, *io.SectionReader, *os.Root) error { return injected }
 		m := env.manager()
 
 		if err := m.Ensure(context.Background()); !errors.Is(err, injected) {
@@ -569,67 +590,55 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 			t.Errorf("installation root holds %v, want nothing", dirs)
 		}
 	})
-
-	t.Run("reads the digested bytes after the archive path is replaced", func(t *testing.T) {
-		// The unpacker holds a reader over the descriptor the digest was computed
-		// on, so replacing the file at the download path -- a new inode under the
-		// same name, which is what an attacker with write access to the temp
-		// directory gets -- cannot change what is extracted. Handing the seam a
-		// PATH instead made this substitution a complete bypass of the pin: the
-		// digest would have proved bytes nobody went on to unpack.
-		//
-		// TMPDIR is redirected so the swap can find the download directory the
-		// manager created for itself, and only that one.
-		tmp := t.TempDir()
-		t.Setenv("TMPDIR", tmp)
-		env := newFakeEnv(t)
-		var gotArchive []byte
-		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, _ string) error {
-			replaceDownloadedArchive(t, tmp, []byte("hostile bytes that were never digested"))
-			raw, err := io.ReadAll(archive)
-			gotArchive = raw
-			return err
-		}
-		m := env.manager()
-
-		_ = m.Ensure(context.Background())
-		if !bytes.Equal(gotArchive, env.archive) {
-			t.Errorf("unpacker read %q, want the %d verified archive bytes: the extraction followed the name instead of the verified descriptor",
-				gotArchive, len(env.archive))
-		}
-	})
 }
 
-// replaceDownloadedArchive swaps the archive in the manager's download directory
-// under tmp for body, as a NEW inode: the name is removed and recreated, which is
-// the substitution a path-based extraction would follow and a shared descriptor
-// cannot see. Writing over the existing file would prove nothing, since that is
-// the same inode the descriptor holds.
-func replaceDownloadedArchive(t *testing.T, tmp string, body []byte) {
+// TestDownloadedArchiveHasNoNameWhileItIsBeingUsed pins the strongest form of the
+// TOCTOU fix. The archive is unlinked the instant it exists, so there is no name to
+// substitute rather than a name that must not be re-resolved: while the unpacker
+// holds its reader, NOTHING in the installation tree refers to those bytes, and the
+// reader still yields exactly what the digest proved.
+//
+// The predecessor of this design digested a file and let the unpacker re-open its
+// PATH, which a second process could repoint between the two steps. Both halves are
+// asserted here because either alone would be satisfiable by the broken shape: a
+// nameless file whose reader returned other bytes, or the right bytes reached
+// through a name that still exists.
+func TestDownloadedArchiveHasNoNameWhileItIsBeingUsed(t *testing.T) {
+	env := newFakeEnv(t)
+	var gotArchive []byte
+	var namesDuringUnpack []string
+	env.release.Unpack = func(_ context.Context, archive *io.SectionReader, _ *os.Root) error {
+		namesDuringUnpack = archiveCandidateNames(t, env.versionsRoot())
+		raw, err := io.ReadAll(archive)
+		gotArchive = raw
+		return err
+	}
+	m := env.manager()
+
+	_ = m.Ensure(context.Background())
+	if !bytes.Equal(gotArchive, env.archive) {
+		t.Errorf("unpacker read %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
+	}
+	if len(namesDuringUnpack) != 0 {
+		t.Errorf("the installation tree still names the archive as %v while it is being extracted; a name is something another principal can repoint", namesDuringUnpack)
+	}
+}
+
+// archiveCandidateNames lists every entry directly under the installation root
+// that could name a downloaded archive.
+func archiveCandidateNames(t *testing.T, versionsRoot string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(tmp, "pinstall-*", "archive"))
+	entries, err := os.ReadDir(versionsRoot)
 	if err != nil {
-		t.Fatalf("looking for the downloaded archive: %v", err)
+		t.Fatalf("ReadDir the installation root: %v", err)
 	}
-	if len(matches) != 1 {
-		t.Fatalf("found %v downloaded archives under %s, want exactly 1", matches, tmp)
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".download") {
+			out = append(out, e.Name())
+		}
 	}
-	if err := os.Remove(matches[0]); err != nil {
-		t.Fatalf("removing the downloaded archive: %v", err)
-	}
-	if err := os.WriteFile(matches[0], body, 0o600); err != nil {
-		t.Fatalf("planting a substitute archive: %v", err)
-	}
-	// The witness: the name now resolves to the substitute, so a reader that
-	// followed the path WOULD get it. Without this the assertion could pass on a
-	// swap that never landed.
-	planted, err := os.ReadFile(matches[0])
-	if err != nil {
-		t.Fatalf("reading back the substitute archive: %v", err)
-	}
-	if !bytes.Equal(planted, body) {
-		t.Fatalf("the substitute archive did not land at %s, so the test proves nothing", matches[0])
-	}
+	return out
 }
 
 // TestHTTPFetchRefusesEmptyAndNonOK pins the fetch boundary's two cheap refusals.
@@ -885,189 +894,4 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 			t.Error("execRunner returned nil for a program that does not exist")
 		}
 	})
-}
-
-// TestEnsurePublishesOnlyAVersionDirectoryWhoseStoredModeWasVerified is the
-// integration statement of the bug the mode checks fix: os.MkdirAll's dirMode is
-// a REQUEST, and this package never read the result back, so on a filesystem that
-// widens a fresh directory the install published a version directory carrying a
-// mode nobody asked for. That directory holds the artifacts a consumer executes
-// as root, admitted only because the archive matched the pinned digest; group-
-// writable, it lets a member of the widening group replace the binary after the
-// digest check passed, and nothing downstream notices — the sentinel is a plain
-// file, so it is forgeable rather than evidence.
-//
-// The widening is driven for real by a setgid installation root (see
-// setgidParentThatWidens), which the witness there proves is live or skips.
-func TestEnsurePublishesOnlyAVersionDirectoryWhoseStoredModeWasVerified(t *testing.T) {
-	env := newFakeEnv(t)
-	setgidParentThatWidens(t, env.root)
-	m := env.manager()
-
-	if err := m.Ensure(context.Background()); err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	dir := env.versionDir(pinnedVersion)
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		t.Fatalf("lstat the published version directory: %v", err)
-	}
-	if got, want := fi.Mode(), os.ModeDir|dirMode; got != want {
-		t.Fatalf("published version directory mode = %v, want %v: the install published a mode it did not verify", got, want)
-	}
-}
-
-// TestAssembleVerifiesTheModeThePublishedDirectoryWillCarry pins the check at the
-// site that decides the published directory's mode. publish renames this same
-// inode into place and a rename cannot change a mode, so whatever assemble leaves
-// here is what the version directory has for its whole life.
-func TestAssembleVerifiesTheModeThePublishedDirectoryWillCarry(t *testing.T) {
-	env := newFakeEnv(t)
-	m := env.manager()
-
-	stageRoot := filepath.Join(env.root, "stage")
-	if err := os.MkdirAll(stageRoot, 0o700); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", stageRoot, err)
-	}
-	setgidParentThatWidens(t, stageRoot)
-	stage := &stageTree{
-		root:       stageRoot,
-		extract:    filepath.Join(stageRoot, "x"),
-		home:       filepath.Join(stageRoot, "home"),
-		versionDir: filepath.Join(stageRoot, "v"),
-	}
-	src := filepath.Join(stageRoot, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", src, err)
-	}
-	for _, name := range []string{toolName, toolSidecar, toolExtra} {
-		if err := writeFakeBinary(filepath.Join(src, name), pinnedVersion); err != nil {
-			t.Fatalf("writeFakeBinary(%s): %v", name, err)
-		}
-	}
-
-	if err := m.assemble(stage, src); err != nil {
-		t.Fatalf("assemble: %v", err)
-	}
-	fi, err := os.Lstat(stage.versionDir)
-	if err != nil {
-		t.Fatalf("lstat the staged version directory: %v", err)
-	}
-	if got, want := fi.Mode(), os.ModeDir|dirMode; got != want {
-		t.Fatalf("staged version directory mode = %v, want %v: publish would rename that mode into place", got, want)
-	}
-}
-
-// TestNewStageVerifiesTheStagingTreeIsPrivate pins the staging root's own stored
-// mode, which is the one check that covers the whole staging subtree: at 0700
-// nothing else on the host can traverse into it. Widened to 0770 it stops being a
-// boundary, and the exposure is worse than a published directory's — the extract
-// tree holds the archive's own installer, which this package EXECUTES.
-func TestNewStageVerifiesTheStagingTreeIsPrivate(t *testing.T) {
-	env := newFakeEnv(t)
-	m := env.manager()
-	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", m.versionsDir, err)
-	}
-	setgidParentThatWidens(t, m.versionsDir)
-
-	stage, err := m.newStage()
-	if err != nil {
-		t.Fatalf("newStage: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(stage.root) })
-
-	fi, err := os.Lstat(stage.root)
-	if err != nil {
-		t.Fatalf("lstat the staging root: %v", err)
-	}
-	if got, want := fi.Mode(), os.ModeDir|stageMode; got != want {
-		t.Fatalf("staging root mode = %v, want %v: the staging tree is not private to this install", got, want)
-	}
-}
-
-// TestWriteSentinelVerifiesTheModeItAskedFor pins the sentinel's own mode,
-// because it is the only thing protecting the sentinel's CONTENTS: the version
-// directory's verified 0755 stops another principal creating, replacing or
-// removing entries, not writing to an entry the filesystem stored wider than
-// asked for. A rewritten sentinel makes a complete version read as a partial,
-// which prunePartials then deletes — so a widened sentinel costs the operator the
-// retained fallback set the availability posture depends on.
-func TestWriteSentinelVerifiesTheModeItAskedFor(t *testing.T) {
-	env := newFakeEnv(t)
-	m := env.manager()
-	dir := t.TempDir()
-	path := filepath.Join(dir, sentinelName)
-	preexistingFileIgnoringTheMode(t, path, 0o666, fileMode)
-
-	if err := m.writeSentinel(dir); err != nil {
-		t.Fatalf("writeSentinel: %v", err)
-	}
-	fi, err := os.Lstat(path)
-	if err != nil {
-		t.Fatalf("lstat the sentinel: %v", err)
-	}
-	if got, want := fi.Mode().Perm(), fileMode; got != want {
-		t.Errorf("sentinel mode = %#o, want %#o: the mode was requested, not verified", got, want)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read the sentinel: %v", err)
-	}
-	if got := strings.TrimSpace(string(raw)); got != pinnedVersion {
-		t.Errorf("sentinel = %q, want %q", got, pinnedVersion)
-	}
-}
-
-// TestEnsureVersionsDirVerifiesTheRootItCreated covers the highest-consequence
-// directory of the set. The installation root is what every version tree sits in,
-// so group-writable it defeats every check below it: another principal renames a
-// published version directory away, puts its own tree at that name, and nothing
-// re-digests what is inside the substitute.
-//
-// The first install is the one that creates it, and os.MkdirAll's mode was never
-// read back. A setgid parent (the consumer's Root) drives the widening for real.
-func TestEnsureVersionsDirVerifiesTheRootItCreated(t *testing.T) {
-	env := newFakeEnv(t)
-	setgidParentThatWidens(t, env.root)
-	m := env.manager()
-
-	if err := m.ensureVersionsDir(); err != nil {
-		t.Fatalf("ensureVersionsDir: %v", err)
-	}
-	fi, err := os.Lstat(m.versionsDir)
-	if err != nil {
-		t.Fatalf("lstat the installation root: %v", err)
-	}
-	if got, want := fi.Mode(), os.ModeDir|dirMode; got != want {
-		t.Fatalf("installation root mode = %v, want %v: the root was created with a mode nobody asked for", got, want)
-	}
-}
-
-// TestEnsureVersionsDirLeavesAPreExistingRootAlone pins the other half of the
-// rule, which is a deliberate limit rather than an oversight: only a directory
-// this call created is repaired. An operator may have widened the root on purpose,
-// taking over a directory another principal made would hand them whatever gets
-// written under it, and Config.Untrusted is the channel that already exists for
-// reporting a root that was writable by others.
-func TestEnsureVersionsDirLeavesAPreExistingRootAlone(t *testing.T) {
-	env := newFakeEnv(t)
-	m := env.manager()
-	if err := os.MkdirAll(m.versionsDir, dirMode); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", m.versionsDir, err)
-	}
-	if err := os.Chmod(m.versionsDir, 0o775); err != nil {
-		t.Fatalf("chmod the root: %v", err)
-	}
-
-	if err := m.ensureVersionsDir(); err != nil {
-		t.Fatalf("ensureVersionsDir on a pre-existing root: %v", err)
-	}
-	fi, err := os.Lstat(m.versionsDir)
-	if err != nil {
-		t.Fatalf("lstat the installation root: %v", err)
-	}
-	if got, want := fi.Mode().Perm(), os.FileMode(0o775); got != want {
-		t.Errorf("pre-existing installation root mode = %#o, want it untouched at %#o", got, want)
-	}
 }

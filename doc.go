@@ -5,8 +5,15 @@
 // populated only from a digest-verified archive, published by a single
 // same-filesystem rename, and marked by a ".complete" sentinel written LAST —
 // so an interrupted install is detectable by absence of the sentinel and never
-// becomes a selection candidate. Nothing at all is placed under Root before the
-// archive digest matches the pin.
+// becomes a selection candidate.
+//
+// Custody of that tree is the precondition everything else rests on, verified
+// before any byte is fetched and never repaired: Root and every directory above
+// it must be modifiable only by this process's identity or root. See
+// [ErrNoCustody]. The verified archive itself is unlinked before the first byte
+// arrives and reaches the unpacker as a reader on that same descriptor, so it has
+// no name to substitute, and the unpacker writes through an [os.Root] on the
+// extraction directory, so no archive entry can escape it.
 //
 // Every start re-probes the artifact it is about to activate, re-asserts the
 // caller's assertions against it, retains N predecessors and reports a readiness
@@ -40,6 +47,8 @@
 // packages is data: the URL shape, the architecture tokens, the in-archive
 // installer, the probe argv, the assertions.
 //
-// Linux only. The publish protocol relies on same-filesystem rename and fsync
-// of a directory, and the confined deletes use os.Root.
+// Linux only. The publish protocol relies on same-filesystem rename and fsync of
+// a directory, the confined writes and deletes use os.Root, and the custody check
+// reads Unix ownership plus the extended attributes through which a filesystem
+// exposes an access-control list.
 package pinstall

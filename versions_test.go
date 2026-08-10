@@ -204,23 +204,33 @@ func TestSelectActiveExcludesAReplacedArtifactUnderAnIntactSentinel(t *testing.T
 	})
 }
 
-// TestSelectActiveIgnoresExistingDirectoriesOnAnUntrustedRoot pins the Untrusted
-// contract: a sentinel is trivially forgeable, unlike a digest, so when the root was
-// writable by others a pre-existing version directory may not be activated -- only
-// one this process installed from a verified archive.
-func TestSelectActiveIgnoresExistingDirectoriesOnAnUntrustedRoot(t *testing.T) {
+// TestSelectActiveIgnoresExistingDirectoriesWithoutCustody pins the contract a
+// tree without custody gets: a sentinel is a plain file and therefore trivially
+// forgeable, unlike a digest, so a pre-existing version directory may not be
+// activated -- only one this process installed from a verified archive.
+//
+// The trigger is the MEASURED verdict rather than the Untrusted flag. Untrusted
+// waives the refusal to install into such a tree; it is not a declaration that the
+// tree is bad, because a caller cannot be expected to know its volume carries an
+// inherited ACL. So the fixture makes the root genuinely writable by others and
+// then waives the install refusal, which is the real deployment this covers.
+func TestSelectActiveIgnoresExistingDirectoriesWithoutCustody(t *testing.T) {
 	env := newFakeEnv(t)
 	env.placeVersion(pinnedVersion)
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
 	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m.checkCustody()
 
 	if _, ok := m.selectActive(context.Background()); ok {
-		t.Fatal("selectActive accepted a pre-existing directory on an untrusted root")
+		t.Fatal("selectActive accepted a pre-existing directory in a tree without custody")
 	}
 	if err := m.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
-		t.Errorf("fetches = %d, want 1 -- an untrusted root must force a digest-verified reinstall", env.fetchCount())
+		t.Errorf("fetches = %d, want 1 -- a tree without custody must force a digest-verified reinstall", env.fetchCount())
 	}
 	if ready, why := m.Ready(); !ready {
 		t.Errorf("Ready() = false (%s), want true after the verified reinstall", why)

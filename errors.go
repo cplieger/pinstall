@@ -17,4 +17,10 @@ var (
 	// probe with something other than the version its directory and sentinel
 	// claim.
 	ErrVersionMismatch = errors.New("binary reported a version its install directory does not claim")
+	// ErrNoCustody reports that the installation root, or a directory on the way
+	// to it, can be modified by a principal other than this process's identity or
+	// root — so nothing installed there can be trusted to stay what was
+	// installed. The wrapped text names the offending path and what is wrong with
+	// it. Fix the volume, or set [Config.Untrusted] to proceed anyway.
+	ErrNoCustody = errors.New("the installation root is not under this process's exclusive control")
 )

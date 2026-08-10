@@ -133,34 +133,75 @@ func newFakeEnv(t *testing.T) *fakeEnv {
 	return env
 }
 
-// zipEntry is one file in a test archive.
+// zipEntry is one entry in a test archive: a file by default, or a directory when
+// dir is set (which is how a real archiver emits an explicit "./" or "pkg/" entry).
 type zipEntry struct {
 	body string
 	mode os.FileMode
+	dir  bool
+}
+
+// namedEntry is a zipEntry with its name attached, for the archives whose ORDER or
+// duplicate names matter and a map therefore cannot express.
+type namedEntry struct {
+	name string
+	zipEntry
 }
 
 // buildZip builds a real zip in memory, so extraction is exercised for real
 // while the runner seam stands in for executing what comes out of it.
 func buildZip(t *testing.T, entries map[string]zipEntry) []byte {
 	t.Helper()
+	ordered := make([]namedEntry, 0, len(entries))
+	for _, name := range slices.Sorted(maps.Keys(entries)) {
+		ordered = append(ordered, namedEntry{name: name, zipEntry: entries[name]})
+	}
+	return buildZipOrdered(t, ordered)
+}
+
+// buildZipOrdered writes entries in the given order, so a test can express a
+// duplicate name or a specific sequence.
+func buildZipOrdered(t *testing.T, entries []namedEntry) []byte {
+	t.Helper()
+	raw, err := encodeZip(entries)
+	if err != nil {
+		t.Fatalf("building the test archive: %v", err)
+	}
+	return raw
+}
+
+// encodeZip is the writer both builders share, returning an error instead of
+// failing a test so a fuzz target can use it on names archive/zip may reject.
+func encodeZip(entries []namedEntry) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
-	for _, name := range slices.Sorted(maps.Keys(entries)) {
-		e := entries[name]
-		h := &zip.FileHeader{Name: name, Method: zip.Deflate}
-		h.SetMode(e.mode)
+	for _, e := range entries {
+		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		mode := e.mode
+		if e.dir {
+			mode |= os.ModeDir
+		}
+		h.SetMode(mode)
 		w, err := zw.CreateHeader(h)
 		if err != nil {
-			t.Fatalf("zip CreateHeader(%s): %v", name, err)
+			return nil, fmt.Errorf("CreateHeader(%q): %w", e.name, err)
 		}
 		if _, err := w.Write([]byte(e.body)); err != nil {
-			t.Fatalf("zip Write(%s): %v", name, err)
+			return nil, fmt.Errorf("Write(%q): %w", e.name, err)
 		}
 	}
 	if err := zw.Close(); err != nil {
-		t.Fatalf("zip Close: %v", err)
+		return nil, fmt.Errorf("closing the archive: %w", err)
 	}
-	return buf.Bytes()
+	return buf.Bytes(), nil
+}
+
+// zipWithRawName builds a one-entry archive carrying name verbatim, for the fuzz
+// target. archive/zip rejects some byte sequences outright, which is the writer's
+// business rather than the extractor's, so the error is returned for the caller to
+// skip on.
+func zipWithRawName(name string) ([]byte, error) {
+	return encodeZip([]namedEntry{{name: name, zipEntry: zipEntry{body: "x", mode: 0o644}}})
 }
 
 // installerArchive is an archive whose only useful content is the installer the
@@ -450,83 +491,4 @@ func exists(path string) bool {
 func digestOf(archive []byte) string {
 	sum := sha256.Sum256(archive)
 	return hex.EncodeToString(sum[:])
-}
-
-// setgidParentThatWidens makes dir setgid and then PROVES that a mkdir inside it
-// stores a mode it did not ask for. It skips the calling test when the widening
-// does not happen.
-//
-// The skip is the point. A create-path mode test on a filesystem that honours
-// every request cannot distinguish a directory whose stored mode was VERIFIED
-// from one whose mode was merely requested, so it would pass vacuously and go on
-// passing after the verification was deleted. Failing as INVALID is the only
-// honest outcome there.
-//
-// The widening is real rather than mocked: Linux propagates S_ISGID from a setgid
-// directory to every new subdirectory, so os.Mkdir(child, 0o700) genuinely stores
-// setgid|0700. It is the same class of surprise as the inheritable group ACL that
-// motivated the checks under test — measured on a ZFS nfs4acl dataset, an
-// inheritable group@:rwx ACE yields 0770 from a 0o700 mkdir — and unlike that one
-// it needs no special filesystem to reproduce.
-func setgidParentThatWidens(t *testing.T, dir string) {
-	t.Helper()
-	if err := os.Chmod(dir, 0o700|os.ModeSetgid); err != nil {
-		t.Fatalf("chmod %s setgid: %v", dir, err)
-	}
-	witness := filepath.Join(dir, ".mode-witness")
-	if err := os.Mkdir(witness, 0o700); err != nil {
-		t.Fatalf("mkdir the witness under %s: %v", dir, err)
-	}
-	fi, err := os.Lstat(witness)
-	if err != nil {
-		t.Fatalf("lstat the witness: %v", err)
-	}
-	if err := os.RemoveAll(witness); err != nil {
-		t.Fatalf("remove the witness: %v", err)
-	}
-	if fi.Mode()&os.ModeSetgid == 0 {
-		t.Skipf("this kernel did not widen a 0o700 mkdir under a setgid parent (stored %v); "+
-			"the test cannot distinguish a verified create from an unverified one here", fi.Mode())
-	}
-}
-
-// preexistingFileIgnoringTheMode creates path at wide and then PROVES that an
-// O_CREATE|O_TRUNC open asking for ask leaves the stored mode at wide. It leaves
-// path in place at wide, for the production call under test to be handed, and
-// skips the calling test when the kernel honours the mode argument after all.
-//
-// This is the file half of the same "a mode argument is a REQUEST" bug, in the
-// one form this environment can demonstrate. The widening that motivated the
-// checks is an inheritable group ACL storing 0775 for a 0o755 create, which needs
-// a filesystem carrying such an ACL (there is no setfacl here, and overlayfs
-// would not carry one). open(2) ignoring the mode argument outright when the path
-// already exists is the same defect with the same consequence — a file left
-// group- and other-writable by a create that reported success — and it is
-// reachable in production wherever a path can already be occupied, which for the
-// extraction tree is an archive carrying the same entry name twice.
-func preexistingFileIgnoringTheMode(t *testing.T, path string, wide, ask os.FileMode) {
-	t.Helper()
-	if err := os.WriteFile(path, nil, wide); err != nil {
-		t.Fatalf("pre-create %s: %v", path, err)
-	}
-	// WriteFile's own mode goes through umask, so set the wide mode explicitly
-	// rather than assuming the process umask left it alone.
-	if err := os.Chmod(path, wide); err != nil {
-		t.Fatalf("chmod %s to %#o: %v", path, wide, err)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, ask)
-	if err != nil {
-		t.Fatalf("open the witness at %s: %v", path, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close the witness: %v", err)
-	}
-	fi, err := os.Lstat(path)
-	if err != nil {
-		t.Fatalf("lstat the witness: %v", err)
-	}
-	if fi.Mode().Perm() == ask.Perm() {
-		t.Skipf("this kernel applied the O_CREATE mode %#o to an already-existing file; "+
-			"the test cannot distinguish a verified create from an unverified one here", ask.Perm())
-	}
 }

@@ -34,13 +34,12 @@ const (
 	// lookup can reach it.
 	stagePrefix = ".stage-"
 
+	// dirMode and fileMode are what this package REQUESTS. Nothing reads them
+	// back: whether the filesystem stored something wider is [verifyCustody]'s
+	// question, asked once about the tree rather than per directory, and answered
+	// with a verdict rather than a repair.
 	dirMode  os.FileMode = 0o755
 	fileMode os.FileMode = 0o600
-	// stageMode is the mode os.MkdirTemp requests for a staging tree. It is
-	// named here only so the value the staging root is VERIFIED against is the
-	// same literal its creation asks for, instead of a number restated at the
-	// check and free to drift from it.
-	stageMode os.FileMode = 0o700
 )
 
 // Bounded deadlines for every external command. A wedged artifact must not stall
@@ -183,11 +182,18 @@ type Manager struct {
 	// admission gates; the wait belongs here, with the lock it is waiting on.
 	opSem chan struct{}
 
-	// mu guards active, state, phase, assertionsOK and purged, and is never
-	// held across I/O.
+	// mu guards active, state, custodyErr, phase, assertionsOK and purged, and is
+	// never held across I/O.
 	mu     sync.Mutex
 	active selection
 	state  State
+
+	// custodyErr is the last [verifyCustody] verdict on the installation tree,
+	// re-evaluated at the start of every operation because a volume can be
+	// remounted or re-permissioned under a running process. nil means this
+	// process has exclusive control, which is what makes a sentinel in that tree
+	// worth believing.
+	custodyErr error
 
 	// phase and the two flags sit at the end rather than beside what they
 	// describe only because a one-byte field in the middle of this set costs
@@ -383,6 +389,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	defer m.releaseOp()
 
 	m.purgeOnce()
+	m.checkCustody()
 	m.prunePartials()
 
 	sel, ok := m.selectActive(ctx)
@@ -499,6 +506,7 @@ func (m *Manager) Rescan(ctx context.Context) (bool, error) {
 	defer m.releaseOp()
 	ctx = context.WithoutCancel(ctx)
 
+	m.checkCustody()
 	sel, ok := m.selectActive(ctx)
 	if !ok {
 		err := m.recordUnavailable(nil)

@@ -1,8 +1,2 @@
-github.com/cplieger/atomicfile/v2 v2.8.0 h1:Kxhv2xyomWSlarfuxkKRht4kaQlfjV213xV7LdPnBhQ=
-github.com/cplieger/atomicfile/v2 v2.8.0/go.mod h1:jgwJ7oU3qahL4NwiF+1iBIzPRpR8LwXnicSalGoJeVA=
-github.com/cplieger/atomicfile/v2 v2.9.0 h1:WuUuhNQJiihqUcy7xgvf0fB9dGZQJ1L/TRlZxs4SQpo=
-github.com/cplieger/atomicfile/v2 v2.9.0/go.mod h1:jgwJ7oU3qahL4NwiF+1iBIzPRpR8LwXnicSalGoJeVA=
 github.com/cplieger/pathinside v1.0.0 h1:w58q7tntX7VcVnDmF4r/FNKnvl1yLq4tDac845XTdBU=
 github.com/cplieger/pathinside v1.0.0/go.mod h1:yHMRs1HFsqkCGWYUzRCD+DoKWCIZE8Uj0wTKkFTFUsg=
-pgregory.net/rapid v1.3.0 h1:vBvO0VSqti75J1jjYqpgPNBLKMd1+gxa9fYo7vk/Exc=
-pgregory.net/rapid v1.3.0/go.mod h1:dPlE4OBBxgXPqkP79flB6sJL1dx5azpI7HQ9MY9Z7uk=

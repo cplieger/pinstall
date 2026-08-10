@@ -7,15 +7,15 @@ of the library, so most of this guide is about preserving them.
 ## What the library is
 
 `pinstall` installs a digest-pinned upstream release into a version-addressed
-directory, activates it, and reports whether the result is usable. Its
-dependencies outside the standard library are `cplieger/pathinside` (the lexical
-path-containment predicate) and `cplieger/atomicfile` (whose `EnforceMode` proves
-what mode the filesystem actually STORED for a directory or file this library
-created, since a mode argument is only a request), and it is Linux-only:
+directory, activates it, and reports whether the result is usable. Its only
+dependency outside the standard library is `cplieger/pathinside` (the lexical
+path-containment predicate, itself standard-library-only), and it is Linux-only:
 the publish protocol relies on a same-filesystem rename plus `fsync` of a
-directory, and every delete is confined by `os.Root`.
+directory, every write and delete inside the tree is confined by `os.Root`, and the
+custody check reads Unix ownership plus the extended attributes a filesystem uses
+to expose an access-control list.
 
-Five invariants are load-bearing. A change that weakens one is a breaking change
+Six invariants are load-bearing. A change that weakens one is a breaking change
 even if the API is untouched.
 
 - **The durability protocol, in order.** Write each artifact, `fsync` each one,
@@ -23,9 +23,20 @@ even if the API is untouched.
   rename it into place, `fsync` the installation root. Any sync failure fails the
   install. Do not reorder these, do not batch them, and do not treat the rename as
   sufficient: atomic visibility is not crash durability.
-- **Nothing reaches `Root` before the digest matches.** The archive is downloaded
-  and verified in a process-local temp dir; the staging tree is created only
-  afterwards. `TestEnsureDigestMismatchPlacesNothing` asserts the empty root.
+- **Custody is verified, never repaired.** `verifyCustody` runs before anything is
+  fetched and returns a verdict; no code path in this library calls `chmod` on a
+  directory it did not like. Adding a repair would take an authority over the
+  operator's volume that the library does not have, and forcing an exact mode also
+  _widens_ a tree a stricter umask had narrowed. If you find yourself wanting to fix
+  a permission, the answer is a clearer refusal.
+- **The verified archive has no name, and nothing re-resolves one.** It is unlinked
+  before the first byte arrives, the digest and the extraction share its descriptor,
+  and the unpacker receives an `os.Root` rather than a directory path. Do not
+  reintroduce a path for either: `TestDownloadedArchiveHasNoNameWhileItIsBeingUsed`
+  and the `Unpacker` seam tests are what hold this.
+- **Nothing reaches a version directory before the digest matches.** The staging
+  tree is created only after the archive is verified.
+  `TestEnsureDigestMismatchPlacesNothing` asserts nothing is published.
 - **A sentinel is not proof.** `selectActive` probes every candidate's primary
   artifact and requires it to answer with the version its own directory claims.
   Do not add a fast path that trusts the sentinel alone.
@@ -47,11 +58,14 @@ behaviour that varies per package, the order of preference is:
    universal form (`ParseVersion`) or where an enum with one implemented value
    would be a partially built public surface (`Unpack`).
 
-   A function field still owes the caller the guarantees the library made. An
-   `Unpacker` takes a reader over the open, digest-verified archive rather than
-   its path, because a path is re-resolvable: the name could be pointed at
-   another inode after the digest passed, and a custom unpacker would have no way
-   to notice.
+   A function field still owes the caller the guarantees the library made, and the
+   way to keep that promise is to hand it primitives instead of instructions. An
+   `Unpacker` takes a reader over the open, digest-verified archive rather than its
+   path (a path is re-resolvable, and the archive has no name anyway), and an
+   `os.Root` on the destination rather than a directory name, so containment is the
+   kernel's answer on every write instead of a rule a third-party implementation
+   has to remember. The previous shape asked custom unpackers to refuse traversing
+   entry names themselves; documentation is the weakest mechanism available.
 3. **Nothing** — where one strategy exists and no consumer differs on it. The
    private-staging-home approach is deliberately not a knob; `Installer.HomeEnv`
    plus `ArtifactDir` is all the genericity it needs.
@@ -82,7 +96,8 @@ Flat, one concept per file:
 | `pinstall.go` | `Config`, `Manager`, `New`, the lifecycle, `Reason`, `State`, validation  |
 | `release.go`  | `Release`, `ArchiveInstaller`, `Assertion`, `Purge`, and their validation |
 | `install.go`  | fetch, digest verification, staging, assembly, the publish protocol       |
-| `unpack.go`   | `Unpacker`, `UnpackZip`, `safeJoin`                                       |
+| `unpack.go`   | `Unpacker`, `UnpackZip`, entry normalisation                              |
+| `custody.go`  | the custody precondition: `verifyCustody`, the ACL-dialect judgement      |
 | `versions.go` | completeness, the version probe, selection, ordering, retention, pruning  |
 | `purge.go`    | the one-shot sweep and the convenience link                               |
 | `errors.go`   | the sentinel errors                                                       |
@@ -147,16 +162,21 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `install_test.go`: the happy path, the digest refusal, per-architecture digest
   selection, a sync failure at every point of the durability protocol, the publish
   boundary, the staged gates, the `Installer == nil` axis, `ArtifactDir`'s two
-  meanings, the `Unpacker` seam's contract (including that it reads the digested
-  bytes after the download path is repointed at another inode), and the fetch
-  boundary.
+  meanings, the `Unpacker` seam's contract (including that it cannot write outside
+  the root it is handed), that the verified archive has no name while it is being
+  read, and the fetch boundary.
 - `versions_test.go`: every incomplete directory shape, partial pruning, a
   replaced artifact under an intact sentinel, the `Untrusted` contract, the
   retention table across every `Retain` value, and version ordering.
 - `purge_test.go`: the injected sweep, the shape refusals, idempotence and
   resumption, the marker's two jobs, the off switches, and the convenience link.
-- `unpack_test.go`: the zip-slip guards positively and negatively, mode handling,
-  and the size budget.
+- `unpack_test.go`: containment positively and negatively (asserted on the
+  filesystem, not on a lexical helper), mode handling, duplicate entry names, and
+  the entry-count and size budgets.
+- `custody_test.go`: the precondition — a private tree accepted including its
+  sticky world-writable ancestor, every shape of non-owner write refused at every
+  depth, the NFSv4-ACL refusal, the POSIX-ACL exemption against a real ACL, the
+  resolved-chain rule, and the two Untrusted halves end to end.
 - `release_test.go`: the profile and sweep validation tables, the package-name
   versus artifact-name separation, and the pin validator.
 - `widget_test.go`: the synthetic second profile, end to end.

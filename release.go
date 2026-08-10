@@ -17,9 +17,9 @@ import (
 // data, not policy — durability, version selection, retry, retention and the
 // readiness verdict belong to the library and are not configurable.
 type Release struct {
-	// Unpack extracts the verified archive from an open reader over it. A nil
-	// Unpack uses [UnpackZip]. It is handed no path, deliberately — see
-	// [Unpacker].
+	// Unpack extracts the verified archive from an open reader, into an
+	// [os.Root] on the extraction directory. A nil Unpack uses [UnpackZip].
+	// Neither parameter is a path, deliberately — see [Unpacker].
 	Unpack Unpacker
 	// Installer describes an installer script shipped INSIDE the archive. A nil
 	// Installer means the archive already holds the artifacts.
@@ -179,10 +179,16 @@ type Config struct {
 	// are bounded deliberately: an endless loop re-downloading a large archive
 	// is worse than a visible failure an operator can repair.
 	MaxAttempts int
-	// Untrusted records that Root was writable by others. A sentinel is
-	// trivially forgeable, unlike a digest, so when it is set no pre-existing
-	// version directory may be activated: only a version THIS process
-	// installed from a verified archive counts.
+	// Untrusted waives the custody precondition: install into Root even when this
+	// process does not exclusively control it. It is an informed acceptance of
+	// risk, not a way to silence the check — the library still measures custody
+	// itself (see the ErrNoCustody documentation), still logs what is wrong, and
+	// still refuses to activate any version directory this process did not install
+	// from a verified archive, because a completion sentinel in a tree another
+	// principal can write is forgeable rather than evidence.
+	//
+	// Leave it false unless you have read the refusal and decided to accept it.
+	// Fixing the volume is the better answer, and the error names the path.
 	Untrusted bool
 }
 
