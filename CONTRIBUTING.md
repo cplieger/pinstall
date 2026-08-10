@@ -46,6 +46,12 @@ behaviour that varies per package, the order of preference is:
 2. **A nil-defaultable function field** — only where the shape genuinely has no
    universal form (`ParseVersion`) or where an enum with one implemented value
    would be a partially built public surface (`Unpack`).
+
+   A function field still owes the caller the guarantees the library made. An
+   `Unpacker` takes a reader over the open, digest-verified archive rather than
+   its path, because a path is re-resolvable: the name could be pointed at
+   another inode after the digest passed, and a custom unpacker would have no way
+   to notice.
 3. **Nothing** — where one strategy exists and no consumer differs on it. The
    private-staging-home approach is deliberately not a knob; `Installer.HomeEnv`
    plus `ArtifactDir` is all the genericity it needs.
@@ -141,7 +147,9 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `install_test.go`: the happy path, the digest refusal, per-architecture digest
   selection, a sync failure at every point of the durability protocol, the publish
   boundary, the staged gates, the `Installer == nil` axis, `ArtifactDir`'s two
-  meanings, the `Unpacker` seam's contract, and the fetch boundary.
+  meanings, the `Unpacker` seam's contract (including that it reads the digested
+  bytes after the download path is repointed at another inode), and the fetch
+  boundary.
 - `versions_test.go`: every incomplete directory shape, partial pruning, a
   replaced artifact under an intact sentinel, the `Untrusted` contract, the
   retention table across every `Retain` value, and version ordering.

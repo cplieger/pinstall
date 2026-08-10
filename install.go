@@ -199,7 +199,9 @@ type stageTree struct {
 //
 // The archive is downloaded and verified into a process-local temp dir BEFORE any
 // staging tree exists, so on a digest mismatch nothing has been created under the
-// installation root at all — not even an empty directory.
+// installation root at all — not even an empty directory. It stays open from the
+// digest check through the extraction, so the unpacker reads the bytes that were
+// proved rather than whatever the archive's name resolves to by then.
 func (m *Manager) install(ctx context.Context) error {
 	slog.Info("installing", "package", m.cfg.Release.Name, "version", m.cfg.Version, "arch", m.cfg.GOARCH)
 	if m.cfg.Release.Notice != "" {
@@ -212,10 +214,11 @@ func (m *Manager) install(ctx context.Context) error {
 	}
 	defer os.RemoveAll(work)
 
-	archive := filepath.Join(work, "archive")
-	if err := m.downloadArchive(ctx, archive); err != nil {
-		return err
+	archive, dlErr := m.downloadArchive(ctx, filepath.Join(work, "archive"))
+	if dlErr != nil {
+		return dlErr
 	}
+	defer func() { _ = archive.close() }()
 
 	stage, stageErr := m.newStage()
 	if stageErr != nil {
@@ -223,7 +226,7 @@ func (m *Manager) install(ctx context.Context) error {
 	}
 	defer os.RemoveAll(stage.root)
 
-	if err := m.unpack(ctx, archive, stage.extract); err != nil {
+	if err := m.unpack(ctx, archive.reader(), stage.extract); err != nil {
 		return fmt.Errorf("unpacking the archive: %w", err)
 	}
 	src, srcErr := m.runInstaller(ctx, stage)
@@ -250,30 +253,71 @@ func (m *Manager) install(ctx context.Context) error {
 // downloadArchive fetches the pinned archive and proves it is the artifact the
 // pin names. Verification is the whole point: nothing downstream re-checks the
 // digest, and nothing is placed on the persistent volume until it passes.
-func (m *Manager) downloadArchive(ctx context.Context, dst string) error {
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
+//
+// It returns the archive still OPEN, because the proof and the extraction have to
+// be about the same bytes. Digesting a file and then handing its PATH to the
+// unpacker proves nothing: the name can be pointed at another inode in between,
+// and the extraction would take whatever is there now — the same defeat as
+// swapping the installed binary, one step earlier. The descriptor these bytes
+// were written and hashed through is the one the unpacker reads, so there is no
+// name left to swap. The caller closes it.
+//
+// O_EXCL is what makes that descriptor exclusively this install's. dst is a fresh
+// name in a private temp directory, so anything already sitting there — a symlink
+// into a directory this process can write included — is not a file to truncate
+// but a reason to fail.
+func (m *Manager) downloadArchive(ctx context.Context, dst string) (*verifiedArchive, error) {
+	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, fileMode)
 	if err != nil {
-		return fmt.Errorf("creating the archive file: %w", err)
+		return nil, fmt.Errorf("creating the archive file: %w", err)
 	}
 	sum := sha256.New()
 	// Digest the bytes as they land, so a large archive is read once.
-	fetchErr := m.fetch(ctx, m.archiveURL(), io.MultiWriter(f, sum))
-	closeErr := f.Close()
-	switch {
-	case fetchErr != nil:
-		return fetchErr
-	case closeErr != nil:
-		return fmt.Errorf("closing the archive file: %w", closeErr)
+	if fetchErr := m.fetch(ctx, m.archiveURL(), io.MultiWriter(f, sum)); fetchErr != nil {
+		_ = f.Close()
+		return nil, fetchErr
+	}
+	// The verified length is the descriptor's own write offset, not a stat of the
+	// path: it counts the bytes that went through the hash, so the reader handed
+	// out below cannot reach past what was proved.
+	size, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("measuring the archive that was written: %w", err)
 	}
 	got := hex.EncodeToString(sum.Sum(nil))
 	if got != m.digest {
-		return fmt.Errorf("%w: arch=%s expected=%s actual=%s (bump the version and every digest literal together)",
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: arch=%s expected=%s actual=%s (bump the version and every digest literal together)",
 			ErrDigestMismatch, m.cfg.GOARCH, m.digest, got)
 	}
 	slog.Info("archive SHA-256 verified against the pinned digest",
 		"package", m.cfg.Release.Name, "arch", m.cfg.GOARCH, "sha256", got)
-	return nil
+	return &verifiedArchive{file: f, size: size}, nil
 }
+
+// verifiedArchive is a downloaded archive whose digest matched, held open on the
+// descriptor its bytes were written and hashed through, with the exact length
+// that hash covers.
+//
+// The PATH is deliberately not a field. Nothing downstream re-checks the digest,
+// so the only thing making the extraction trustworthy is that it reads these
+// bytes rather than whatever the archive's name resolves to by then.
+type verifiedArchive struct {
+	file *os.File
+	size int64
+}
+
+// reader returns a reader over exactly the verified bytes. Each call builds a
+// fresh one: a [io.SectionReader] carries its own offset, so sequential reading
+// by an unpacker moves nothing on the shared descriptor.
+func (a *verifiedArchive) reader() *io.SectionReader {
+	return io.NewSectionReader(a.file, 0, a.size)
+}
+
+// close releases the descriptor. The archive file itself goes with the temp
+// directory the caller removes.
+func (a *verifiedArchive) close() error { return a.file.Close() }
 
 // newStage creates the staging tree under the installation root.
 //

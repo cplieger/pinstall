@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +34,7 @@ func TestUnpackZipRefusesEscapingEntries(t *testing.T) {
 			// The same refusal must hold through the real extraction path.
 			archive := filepath.Join(dir, "hostile.zip")
 			writeZip(t, archive, map[string]string{entry: "pwned"})
-			if err := UnpackZip(context.Background(), archive, filepath.Join(dir, "out")); err == nil {
+			if err := UnpackZip(context.Background(), openArchive(t, archive), filepath.Join(dir, "out")); err == nil {
 				t.Errorf("UnpackZip accepted an archive holding %q", entry)
 			}
 			if exists(filepath.Join(dir, "pwn")) || exists("/etc/cron.d/pwn") {
@@ -100,7 +101,7 @@ func TestUnpackZipUnpacksARealArchive(t *testing.T) {
 		"pkg/lib/README.md": "docs\n",
 	})
 	out := filepath.Join(dir, "out")
-	if err := UnpackZip(context.Background(), archive, out); err != nil {
+	if err := UnpackZip(context.Background(), openArchive(t, archive), out); err != nil {
 		t.Fatalf("UnpackZip: %v", err)
 	}
 	fi, err := os.Stat(filepath.Join(out, "pkg", "install.sh"))
@@ -130,7 +131,7 @@ func TestUnpackZipHonoursCancellation(t *testing.T) {
 	writeZip(t, archive, entries)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := UnpackZip(ctx, archive, filepath.Join(dir, "out")); err == nil {
+	if err := UnpackZip(ctx, openArchive(t, archive), filepath.Join(dir, "out")); err == nil {
 		t.Error("UnpackZip ran to completion on a cancelled context")
 	}
 }
@@ -143,7 +144,7 @@ func TestUnpackZipRefusesAnUnreadableArchive(t *testing.T) {
 	if err := os.WriteFile(archive, []byte("PK-ish but not really"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := UnpackZip(context.Background(), archive, filepath.Join(dir, "out")); err == nil {
+	if err := UnpackZip(context.Background(), openArchive(t, archive), filepath.Join(dir, "out")); err == nil {
 		t.Error("UnpackZip accepted a file that is not a zip archive")
 	}
 }
@@ -208,6 +209,22 @@ func FuzzSafeJoin(f *testing.F) {
 			t.Fatalf("safeJoin(%q) = %q, which escapes %q", name, got, dir)
 		}
 	})
+}
+
+// openArchive opens path and returns it in the shape an [Unpacker] is handed: a
+// reader over a bounded range of an open descriptor, with no path to re-open.
+func openArchive(t *testing.T, path string) *io.SectionReader {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("opening the archive: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat the archive: %v", err)
+	}
+	return io.NewSectionReader(f, 0, fi.Size())
 }
 
 // writeZip builds a zip at path from name -> body. A ".sh" entry gets the executable

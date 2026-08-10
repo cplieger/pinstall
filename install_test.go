@@ -1,6 +1,7 @@
 package pinstall
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -515,9 +516,9 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 		env := newFakeEnv(t)
 		var gotArchive []byte
 		var gotDir string
-		env.release.Unpack = func(_ context.Context, archive, dir string) error {
+		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, dir string) error {
 			gotDir = dir
-			raw, err := os.ReadFile(archive)
+			raw, err := io.ReadAll(archive)
 			gotArchive = raw
 			return err
 		}
@@ -537,7 +538,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	t.Run("is never called on a digest mismatch", func(t *testing.T) {
 		env := newFakeEnv(t)
 		called := false
-		env.release.Unpack = func(context.Context, string, string) error {
+		env.release.Unpack = func(context.Context, *io.SectionReader, string) error {
 			called = true
 			return nil
 		}
@@ -558,7 +559,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 	t.Run("its error aborts the install and publishes nothing", func(t *testing.T) {
 		env := newFakeEnv(t)
 		injected := errors.New("unsupported archive format")
-		env.release.Unpack = func(context.Context, string, string) error { return injected }
+		env.release.Unpack = func(context.Context, *io.SectionReader, string) error { return injected }
 		m := env.manager()
 
 		if err := m.Ensure(context.Background()); !errors.Is(err, injected) {
@@ -568,6 +569,67 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 			t.Errorf("installation root holds %v, want nothing", dirs)
 		}
 	})
+
+	t.Run("reads the digested bytes after the archive path is replaced", func(t *testing.T) {
+		// The unpacker holds a reader over the descriptor the digest was computed
+		// on, so replacing the file at the download path -- a new inode under the
+		// same name, which is what an attacker with write access to the temp
+		// directory gets -- cannot change what is extracted. Handing the seam a
+		// PATH instead made this substitution a complete bypass of the pin: the
+		// digest would have proved bytes nobody went on to unpack.
+		//
+		// TMPDIR is redirected so the swap can find the download directory the
+		// manager created for itself, and only that one.
+		tmp := t.TempDir()
+		t.Setenv("TMPDIR", tmp)
+		env := newFakeEnv(t)
+		var gotArchive []byte
+		env.release.Unpack = func(_ context.Context, archive *io.SectionReader, _ string) error {
+			replaceDownloadedArchive(t, tmp, []byte("hostile bytes that were never digested"))
+			raw, err := io.ReadAll(archive)
+			gotArchive = raw
+			return err
+		}
+		m := env.manager()
+
+		_ = m.Ensure(context.Background())
+		if !bytes.Equal(gotArchive, env.archive) {
+			t.Errorf("unpacker read %q, want the %d verified archive bytes: the extraction followed the name instead of the verified descriptor",
+				gotArchive, len(env.archive))
+		}
+	})
+}
+
+// replaceDownloadedArchive swaps the archive in the manager's download directory
+// under tmp for body, as a NEW inode: the name is removed and recreated, which is
+// the substitution a path-based extraction would follow and a shared descriptor
+// cannot see. Writing over the existing file would prove nothing, since that is
+// the same inode the descriptor holds.
+func replaceDownloadedArchive(t *testing.T, tmp string, body []byte) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(tmp, "pinstall-*", "archive"))
+	if err != nil {
+		t.Fatalf("looking for the downloaded archive: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("found %v downloaded archives under %s, want exactly 1", matches, tmp)
+	}
+	if err := os.Remove(matches[0]); err != nil {
+		t.Fatalf("removing the downloaded archive: %v", err)
+	}
+	if err := os.WriteFile(matches[0], body, 0o600); err != nil {
+		t.Fatalf("planting a substitute archive: %v", err)
+	}
+	// The witness: the name now resolves to the substitute, so a reader that
+	// followed the path WOULD get it. Without this the assertion could pass on a
+	// swap that never landed.
+	planted, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("reading back the substitute archive: %v", err)
+	}
+	if !bytes.Equal(planted, body) {
+		t.Fatalf("the substitute archive did not land at %s, so the test proves nothing", matches[0])
+	}
 }
 
 // TestHTTPFetchRefusesEmptyAndNonOK pins the fetch boundary's two cheap refusals.

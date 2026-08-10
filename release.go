@@ -17,7 +17,9 @@ import (
 // data, not policy — durability, version selection, retry, retention and the
 // readiness verdict belong to the library and are not configurable.
 type Release struct {
-	// Unpack extracts the verified archive. A nil Unpack uses [UnpackZip].
+	// Unpack extracts the verified archive from an open reader over it. A nil
+	// Unpack uses [UnpackZip]. It is handed no path, deliberately — see
+	// [Unpacker].
 	Unpack Unpacker
 	// Installer describes an installer script shipped INSIDE the archive. A nil
 	// Installer means the archive already holds the artifacts.

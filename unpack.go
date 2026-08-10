@@ -23,12 +23,25 @@ const (
 
 // Unpacker extracts a verified archive into dir.
 //
+// archive reads exactly the byte range the pinned digest was proved over, on the
+// very descriptor the download wrote and hashed. Both access shapes work:
+// [io.SectionReader] is an [io.ReaderAt] for a format that needs random access
+// (zip reads its directory from the tail) and an [io.Reader] for one that
+// streams. [io.SectionReader.Size] is the verified length.
+//
+// There is deliberately NO PATH in this signature. A name can be pointed at a
+// different inode between the digest check and the read, so an implementation
+// that opened one would extract bytes nothing ever proved — defeating the pin as
+// completely as replacing the installed binary would. Sharing the descriptor is
+// what makes the proof and the extraction the same bytes by construction, and a
+// signature that cannot express a path is what keeps a custom unpacker from
+// reintroducing the gap.
+//
 // A custom implementation MUST refuse absolute and traversing entry names rather
 // than sanitising them (a legitimate archive has no such entry, so rewriting one
 // hides the archive that carries it), and MUST bound both the entry count and
-// the total bytes written. The archive it is handed has already been proved
-// against the pinned digest.
-type Unpacker func(ctx context.Context, archive, dir string) error
+// the total bytes written.
+type Unpacker func(ctx context.Context, archive *io.SectionReader, dir string) error
 
 // UnpackZip is the shipped [Unpacker]: archive/zip with traversal, entry-count
 // and total-size guards. It is used whenever [Release.Unpack] is nil.
@@ -36,12 +49,11 @@ type Unpacker func(ctx context.Context, archive, dir string) error
 // Executable bits survive (an in-archive installer has to run) but nothing wider
 // than owner-write does, because the extracted tree lands on a persistent
 // volume.
-func UnpackZip(ctx context.Context, archive, dir string) error {
-	r, err := zip.OpenReader(archive)
+func UnpackZip(ctx context.Context, archive *io.SectionReader, dir string) error {
+	r, err := zip.NewReader(archive, archive.Size())
 	if err != nil {
 		return fmt.Errorf("opening the archive: %w", err)
 	}
-	defer r.Close()
 	if len(r.File) > maxExtractEntries {
 		return fmt.Errorf("archive holds %d entries, over the %d limit", len(r.File), maxExtractEntries)
 	}

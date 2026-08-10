@@ -20,13 +20,13 @@ Nothing here exits your process, reads the environment, or does work at import t
 Four decisions drive everything else:
 
 - **A version directory is complete or it does not exist.** Artifacts are written into a staging tree, each one is synced, a `.complete` sentinel naming the version is written and synced _last_, the directory is synced, and only then is it renamed into place. An interrupted install is detectable by the absence of the sentinel and is never a selection candidate. Atomic visibility is not crash durability, which is why the syncs are separate steps rather than an afterthought.
-- **Nothing reaches the installation root before the digest matches.** The archive is downloaded and verified in a process-local temp directory. On a mismatch there is not even an empty directory to find later.
+- **Nothing reaches the installation root before the digest matches, and the extraction reads the bytes that matched.** The archive is downloaded and verified in a process-local temp directory. On a mismatch there is not even an empty directory to find later. It stays open from the digest check through the extraction, and the unpacker is handed a reader over that descriptor rather than a path, so nothing can be substituted between proving the archive and using it.
 - **A sentinel is not proof.** Before a version is activated its primary artifact is probed and must answer with the version its own directory claims. An artifact replaced on the volume under an intact sentinel is excluded, which falls through to another complete version and leaves the pin unsatisfied so the next pass reinstalls.
 - **A failed install is survivable.** Every complete version already on the volume keeps serving. Pruning runs only after a successful publish, because those directories _are_ the fallback set. Retries are bounded, and a repair made in place is picked up by `Rescan` without restarting your process.
 
 ## Install
 
-`go get github.com/cplieger/pinstall@latest`
+`go get github.com/cplieger/pinstall/v2@latest`
 
 ## Usage
 
@@ -40,7 +40,7 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/cplieger/pinstall"
+	"github.com/cplieger/pinstall/v2"
 )
 
 // The pinned digests. Whatever bumps your version literal bumps these with it.
@@ -120,7 +120,7 @@ The library writes only under `Root`:
 | `ArchTokens`   | `GOARCH` to the publisher's token (`"amd64"` to `"x86_64-linux"`). An unmapped architecture is `ErrUnsupportedArch`    |
 | `ProbeArgs`    | The argv that makes the primary artifact print its version. Required                                                   |
 | `ParseVersion` | Parses the probe's output. Nil uses `LastFieldOfFirstLine`                                                             |
-| `Unpack`       | Extracts the verified archive. Nil uses `UnpackZip`                                                                    |
+| `Unpack`       | Extracts the verified archive, from an open `*io.SectionReader` over it. Nil uses `UnpackZip`                          |
 | `Installer`    | An installer script shipped inside the archive. Nil means the archive already holds the artifacts                      |
 | `ArtifactDir`  | Where the artifacts land: relative to the installer's private home when `Installer` is set, else to the extracted tree |
 | `Mandatory`    | Assertions a deployment cannot configure away. At least one is required — see below                                    |
@@ -195,14 +195,14 @@ Every target is removed only when what is on disk has the _shape_ the old instal
 
 Deliberate non-goals, not TODOs:
 
-| Not included                          | Rationale                                                                                                                                                                        |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Signature or attestation verification | The trust anchor is the digest you pinned, which you obtained out of band. Verify a signature where you produce the pin, not where you consume it                                |
-| Resolving "latest"                    | A resolved version is not a pin. Whatever bumps your version and digest literals owns that decision; this library installs exactly what it was told                              |
-| Rollback, journals, backups           | Nothing is ever overwritten in place, so there is no partial-promotion window to recover from. The retained predecessor _is_ the recovery mechanism                              |
-| Archive formats beyond zip            | One `Unpacker` is shipped and tested. A `tar.gz` consumer supplies a function; an enum with one implemented value would be a partially built public surface                      |
-| Windows and macOS                     | The publish protocol relies on same-filesystem rename plus `fsync` of a directory, and the confined deletes use `os.Root`. Linux only, like the rest of this account's libraries |
-| Live in-process version upgrades      | Retention assumes a new pin arrives by restarting the consumer. Enabling live upgrades would require per-version leases before a directory could be pruned                       |
+| Not included                          | Rationale                                                                                                                                                                                                                           |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Signature or attestation verification | The trust anchor is the digest you pinned, which you obtained out of band. Verify a signature where you produce the pin, not where you consume it                                                                                   |
+| Resolving "latest"                    | A resolved version is not a pin. Whatever bumps your version and digest literals owns that decision; this library installs exactly what it was told                                                                                 |
+| Rollback, journals, backups           | Nothing is ever overwritten in place, so there is no partial-promotion window to recover from. The retained predecessor _is_ the recovery mechanism                                                                                 |
+| Archive formats beyond zip            | One `Unpacker` is shipped and tested. A `tar.gz` consumer supplies a function, reading the verified archive from the `*io.SectionReader` it is handed; an enum with one implemented value would be a partially built public surface |
+| Windows and macOS                     | The publish protocol relies on same-filesystem rename plus `fsync` of a directory, and the confined deletes use `os.Root`. Linux only, like the rest of this account's libraries                                                    |
+| Live in-process version upgrades      | Retention assumes a new pin arrives by restarting the consumer. Enabling live upgrades would require per-version leases before a directory could be pruned                                                                          |
 
 ## Contributing
 
