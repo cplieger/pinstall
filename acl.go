@@ -120,6 +120,14 @@ const (
 const nfs4WriteMask = nfs4WriteData | nfs4AppendData | nfs4DeleteChild |
 	nfs4Delete | nfs4WriteACL | nfs4WriteOwner
 
+// nfs4ControlMask is the subset of nfs4WriteMask that lets a principal dismantle an
+// object's own protection rather than merely write through it: take the ownership that
+// gates chmod and chown, or rewrite the list itself.
+//
+// It exists because the sticky exemption is conditional on facts a holder of these two
+// bits can change. See [controllersOf].
+const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner
+
 // ErrACLUnreadable reports that an access-control list is present but could not be
 // evaluated. It is deliberately distinct from a refusal on the CONTENT of an ACL: this
 // one says the check does not know, which is why it fails closed.
@@ -165,6 +173,12 @@ func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, 
 // genuinely means there is no list to read. Every other error is returned: reading the
 // list is part of establishing custody, so "I could not look" must not read as "there was
 // nothing there".
+//
+// ENOSYS is on the second side of that line, not the first. It means the getxattr call
+// itself did not happen -- an old kernel, or more likely a seccomp filter denying the
+// syscall -- so it says nothing whatever about the object. Treating it as absence let a
+// sandbox that blocks getxattr produce a clean verdict for a tree an ACL grants a stranger
+// write to, which is the sandbox making the check weaker rather than stricter.
 func readACL(path string) (name string, blob []byte, err error) {
 	for _, candidate := range aclXattrs {
 		found, readErr := getxattrAll(path, candidate)
@@ -172,13 +186,36 @@ func readACL(path string) (name string, blob []byte, err error) {
 		case readErr == nil:
 			return candidate, found, nil
 		case errors.Is(readErr, syscall.ENODATA), errors.Is(readErr, syscall.ENOTSUP),
-			errors.Is(readErr, syscall.EOPNOTSUPP), errors.Is(readErr, syscall.ENOSYS):
+			errors.Is(readErr, syscall.EOPNOTSUPP):
 			continue
 		default:
 			return "", nil, fmt.Errorf("%w: reading %s of %s: %w", ErrACLUnreadable, candidate, path, readErr)
 		}
 	}
 	return "", nil, nil
+}
+
+// controllersOf returns every principal that can dismantle path's OWN protection -- take
+// the ownership that gates chmod and chown, or rewrite the access-control list -- as
+// opposed to one that can merely write inside it.
+//
+// Only NFSv4 can express either grant. Under POSIX.1e chmod and chown stay with the owner,
+// whom the caller checks separately, and no mode bit confers them, so both answer with
+// nothing rather than with a guess.
+func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
+	name, blob, err := readACL(path)
+	if err != nil {
+		return nil, err
+	}
+	switch name {
+	case xattrNFS4ACL, xattrNFS4XDR:
+		granted, err := parseNFS4Granted(blob, stat, nfs4ControlMask)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, name, err)
+		}
+		return granted, nil
+	}
+	return nil, nil
 }
 
 // getxattrAll reads an attribute whose size it does not know in advance, asking the
@@ -211,7 +248,7 @@ var getxattrFn = syscall.Getxattr
 func parseACL(name string, blob []byte, stat *syscall.Stat_t) ([]principal, error) {
 	switch name {
 	case xattrPOSIXACL:
-		return parsePOSIXACL(blob)
+		return parsePOSIXACL(blob, stat)
 	case xattrNFS4ACL, xattrNFS4XDR:
 		return parseNFS4ACL(blob, stat)
 	}
@@ -227,7 +264,7 @@ func parseACL(name string, blob []byte, stat *syscall.Stat_t) ([]principal, erro
 // group bits ARE the mask — but the list is parsed anyway rather than trusted to agree,
 // because "these two always match" is exactly the kind of assumption this whole check
 // exists to stop making.
-func parsePOSIXACL(blob []byte) ([]principal, error) {
+func parsePOSIXACL(blob []byte, stat *syscall.Stat_t) ([]principal, error) {
 	entries, err := decodePOSIXACL(blob)
 	if err != nil {
 		return nil, err
@@ -257,6 +294,13 @@ func parsePOSIXACL(blob []byte) ([]principal, error) {
 			out = append(out, principal{kind: principalUser, id: int(e.id)})
 		case posixTagGroup:
 			out = append(out, principal{kind: principalGroup, id: int(e.id)})
+		case posixTagGroupObj:
+			// The OWNING group, whose id the entry does not carry -- it is the object's
+			// own gid. Naming it from the list is the last place this parser could have
+			// read a grant off the mode instead, which is the assumption the rest of it
+			// refuses to make. It IS subject to the mask, unlike OTHER, so it is judged
+			// by the masked test above like any named entry.
+			out = append(out, principal{kind: principalGroup, id: int(stat.Gid)})
 		}
 	}
 	return out, nil
@@ -339,6 +383,13 @@ type posixEntry struct {
 // exists to be copied onto things created inside it. The objects it will be copied onto
 // are checked when they are reached.
 func parseNFS4ACL(blob []byte, stat *syscall.Stat_t) ([]principal, error) {
+	return parseNFS4Granted(blob, stat, nfs4WriteMask)
+}
+
+// parseNFS4Granted is parseNFS4ACL over a caller-chosen set of access-mask bits, so the
+// "who can write here" and "who can dismantle this" questions run one parser rather than
+// two that can drift apart.
+func parseNFS4Granted(blob []byte, stat *syscall.Stat_t, want uint32) ([]principal, error) {
 	if len(blob) < nfs4HeaderSize {
 		return nil, fmt.Errorf("%d bytes is shorter than the %d byte header", len(blob), nfs4HeaderSize)
 	}
@@ -360,7 +411,7 @@ func parseNFS4ACL(blob []byte, stat *syscall.Stat_t) ([]principal, error) {
 		mask := binary.BigEndian.Uint32(raw[12:16])
 		id := binary.BigEndian.Uint32(raw[16:20])
 
-		if aceType != nfs4TypeAllow || flag&nfs4FlagInheritOnly != 0 || mask&nfs4WriteMask == 0 {
+		if aceType != nfs4TypeAllow || flag&nfs4FlagInheritOnly != 0 || mask&want == 0 {
 			continue
 		}
 		switch {
