@@ -313,7 +313,7 @@ func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 			continue
 		}
 		if m.cfg.Untrusted {
-			slog.Error("activating a version on degraded evidence: Config.Untrusted waives custody of the tree, so all that is known is that this process published this version from a verified archive earlier, not that its artifacts are unchanged since",
+			slog.Error("activating a version on degraded evidence: Config.Untrusted declares this tree shared, so all that is known is that this process published this version from a verified archive earlier, not that its artifacts are unchanged since",
 				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict())
 		}
 		dir := m.versionDir(version)
@@ -470,9 +470,9 @@ func (m *Manager) pruneSuperseded(ctx context.Context, active string) {
 // runs while no staging tree of this manager exists — Ensure holds opMu and
 // creates its stage later.
 //
-// Untrusted does not change WHAT is swept, only whether sweeping happens at all: its
-// caller runs this and the purge only when Manager.mayMutateTree allows, and the flag
-// is one of the two ways that returns true. A foreign-writable tree invalidates a
+// InstallWithoutCustody does not change WHAT is swept, only whether sweeping happens at
+// all: its caller runs this and the purge only when Manager.mayMutateTree allows, and the
+// waiver is one of the two ways that returns true. A foreign-writable tree invalidates a
 // directory for ACTIVATION (see trusted); it has never been a reason to delete more
 // than the incomplete directories this sweep already targets, because that would throw
 // away the fallback set.
