@@ -168,6 +168,24 @@ Retention counts only what could actually _serve_. A directory this process may 
 
 `Reason` is an enum, not a message: `ReasonReady`, `ReasonInstalling`, `ReasonRetrying`, `ReasonUnavailable`, `ReasonAssertion`. Your program owns the wording it shows its own users; the library owns only the distinction. Typed errors for classification: `ErrDigestMismatch`, `ErrUnsupportedArch`, `ErrNoVersion`, `ErrVersionMismatch`, `ErrNoCustody`, `ErrACLUnreadable`, `ErrACLDialectUnsupported`.
 
+### ParseIdentities — the trust list, parsed once
+
+`ParseIdentities(raw string) (ids []int, rejected int)` turns a comma-separated list of numeric identities into the shape `TrustedUIDs` and `TrustedGIDs` take. Operators tend to supply that list through the environment, and every consumer was writing the same twenty lines to decode it — so the rule lives here, beside the field whose contract defines it.
+
+It reads no environment variable and logs nothing. You own the variable's name, and you own every word an operator reads about it. What comes back is a count of refusals rather than the entries themselves, and that is the part not to work around: a mis-wired deployment can put a credential on any variable, so echoing what was rejected risks a durable copy of a secret in your log store. The count is enough to say that some of what was written did not land.
+
+Refused: text that is not a number, `0` (root is trusted unconditionally, so naming it grants nothing), and any negative value. A blank between separators is skipped rather than counted — a trailing comma declares no identity. Duplicates collapse, first-seen order is kept.
+
+```go
+uids, rejected := pinstall.ParseIdentities(os.Getenv("MYAPP_TRUSTED_UIDS"))
+if rejected > 0 {
+    slog.Warn("ignoring unusable MYAPP_TRUSTED_UIDS entries",
+        "count", rejected,
+        "hint", "each entry is one numeric uid above 0, already at least as privileged as this process")
+}
+cfg.TrustedUIDs = uids
+```
+
 ## Assertions, and why one is mandatory
 
 An `Assertion` is a bounded command run against the installed artifact — the full argv after the artifact's path, so the library needs to know nothing about how your package is configured. Required assertions run twice: against the _staged_ artifact before publication, so a candidate they cannot hold on never becomes a version directory, and against the _active_ artifact on every pass, because an assertion's effect usually lives in the package's own mutable configuration and cannot be remembered. A required failure withholds readiness; anything else only warns.
