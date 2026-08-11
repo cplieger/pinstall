@@ -1,3 +1,5 @@
+//go:build linux
+
 package pinstall
 
 import (
@@ -506,8 +508,13 @@ func (m *Manager) EnsureWithRetry(ctx context.Context) error {
 
 // backoff returns the wait before the attempt after n, doubling from
 // [Config.RetryBackoff] up to a ten minute cap.
+//
+// The cap is applied on ENTRY as well as after each doubling, because the first wait is
+// [Config.RetryBackoff] itself and nothing else clamps it: the field is validated only for
+// being positive, so a caller configuring an hour got an hour before the first retry from a
+// function documented to cap at ten minutes.
 func (m *Manager) backoff(n int) time.Duration {
-	wait := m.cfg.RetryBackoff
+	wait := min(m.cfg.RetryBackoff, maxRetryBackoff)
 	for range n - 1 {
 		wait *= 2
 		if wait >= maxRetryBackoff {

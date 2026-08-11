@@ -1,3 +1,5 @@
+//go:build linux
+
 package pinstall
 
 import (
@@ -109,8 +111,12 @@ func (m *Manager) versionDirComplete(version string) bool {
 // unusable directories are met before the cap. This runs wherever pruning does, which is
 // every Ensure and every Rescan that ends with a version active and no install error —
 // not only after an install. With the default want of 1 and a healthy tree it is one.
+//
+// want is at least 1 by construction: [applyConfigDefaults] replaces a Retain of zero or
+// less with defaultRetain, and [Manager.pruneSuperseded] is the only caller, which is why
+// the capacity below is used unclamped.
 func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) (keep, unusable []string) {
-	keep = make([]string, 0, max(want, 0))
+	keep = make([]string, 0, want)
 	for _, version := range predecessorCandidates(complete, active) {
 		if len(keep) >= want {
 			// Enough keepers. Anything further is a victim either way, and asking
@@ -126,31 +132,100 @@ func (m *Manager) usablePredecessors(ctx context.Context, complete []string, act
 	return keep, unusable
 }
 
+// activationStage names the check a version directory failed. It exists so selection and
+// retention can share ONE set of checks while keeping their own severity and their own
+// wording: the same refusal is an exclusion to one caller and a retention decision to the
+// other, and those are not the same sentence.
+type activationStage uint8
+
+const (
+	stageActivatable activationStage = iota // every check passed
+	stageUntrusted
+	stageWideEntry
+	stageProbeFailed
+	stageVersionMismatch
+)
+
+// activation is what [Manager.activatable] answers: the selection when a version directory
+// would be activated, and otherwise the stage that refused it plus what that stage learned.
+type activation struct {
+	sel      selection
+	verdict  error  // the custody verdict, read in the SAME lock acquisition as the trust answer
+	err      error  // the version probe's error, when the probe is what failed
+	dir      string // the version directory, once trust let it be computed
+	bin      string // the primary artifact inside it, once the probe was reached
+	entry    string // wideArtifact's offender: an entry name, or "." for the directory itself
+	reason   string // why that entry is not provably private
+	reported string // the version the probe answered
+	stage    activationStage
+}
+
+// activatable answers the one question selection and retention BOTH ask of a complete
+// version directory: would this be activated?
+//
+// One predicate rather than two, because retention's whole claim is that it agrees with
+// selection. Both used to run the same three checks in the same order with nothing holding
+// the copies together, so a fourth check added to selection would have silently missed
+// retention — which prunes on this answer, and would then delete the fallback selection
+// would have kept, in exactly the situation the fallback exists for.
+//
+// trusted() comes first, and that ordering is not an optimisation. probeVersion EXECUTES
+// the artifact, so asking it about a directory selection has refused would run a binary
+// this manager declined to activate, as the manager's own uid, on a volume it shares with
+// another principal — which is exactly the deployment [Config.Untrusted] describes.
+// Retention is a disk-hygiene decision and must not become an execution path selection
+// would not take, so no caller may reorder these three.
+//
+// It reports and does not log: the callers reach different conclusions from the same
+// refusal, at different severities, so the wording stays with them. The custody verdict
+// travels along because the trust answer and the reason for it come from one acquisition of
+// the state lock (see [Manager.trusted]); nothing here holds that lock across the probe,
+// which runs a subprocess.
+func (m *Manager) activatable(ctx context.Context, version string) activation {
+	mayActivate, verdict := m.trusted(version)
+	if !mayActivate {
+		return activation{stage: stageUntrusted, verdict: verdict}
+	}
+	dir := m.versionDir(version)
+	if entry, why := m.wideArtifact(dir); entry != "" {
+		return activation{stage: stageWideEntry, verdict: verdict, dir: dir, entry: entry, reason: why}
+	}
+	bin := filepath.Join(dir, m.primary)
+	got, err := m.probeVersion(ctx, bin)
+	switch {
+	case err != nil:
+		return activation{stage: stageProbeFailed, verdict: verdict, dir: dir, bin: bin, err: err, reported: got}
+	case got != version:
+		return activation{stage: stageVersionMismatch, verdict: verdict, dir: dir, bin: bin, reported: got}
+	}
+	return activation{
+		stage:   stageActivatable,
+		verdict: verdict,
+		dir:     dir,
+		bin:     bin,
+		sel:     selection{version: version, dir: dir, bin: bin},
+	}
+}
+
 // usableAsFallback reports whether a complete version directory would survive
 // selection, and says why in the log when it would not.
 //
-// trusted() comes first, and that ordering is not an optimisation. probeVersion
-// EXECUTES the artifact, so asking it about a directory selection has refused would run
-// a binary this manager declined to activate, as the manager's own uid, on a volume it
-// shares with another principal — which is exactly the deployment [Config.Untrusted]
-// describes. Retention is a disk-hygiene decision and must not become an execution path
-// selection would not take.
+// It asks [Manager.activatable] rather than repeating selection's checks, which is what
+// makes the doc claim above true rather than merely intended.
 func (m *Manager) usableAsFallback(ctx context.Context, version string) bool {
-	if !m.trusted(version) {
+	a := m.activatable(ctx, version)
+	switch a.stage {
+	case stageUntrusted:
 		slog.Warn("not counting a version directory towards retention: this process may not activate it, so it is not a fallback and must not be executed to find out",
 			"package", m.cfg.Release.Name, "version", version)
 		return false
-	}
-	dir := m.versionDir(version)
-	if wide := m.wideArtifact(dir); wide != "" {
-		slog.Warn("not counting a version directory towards retention: it is writable by another principal",
-			"package", m.cfg.Release.Name, "version", version, "offender", wide)
+	case stageWideEntry:
+		slog.Warn("not counting a version directory towards retention: selection would refuse it because an entry is not provably private to this process",
+			"package", m.cfg.Release.Name, "version", version, "offender", a.entry, "reason", a.reason)
 		return false
-	}
-	got, err := m.probeVersion(ctx, filepath.Join(dir, m.primary))
-	if err != nil || got != version {
+	case stageProbeFailed, stageVersionMismatch:
 		slog.Warn("not counting a version directory towards retention: it would not survive selection's version probe",
-			"package", m.cfg.Release.Name, "version", version, "reported", got, "error", err)
+			"package", m.cfg.Release.Name, "version", version, "reported", a.reported, "error", a.err)
 		return false
 	}
 	return true
@@ -201,7 +276,12 @@ func (m *Manager) completeVersions() []string {
 // README lists that as a deliberate non-goal rather than a missing feature. This is
 // the strongest available claim in a situation the caller has been told about, not a
 // guarantee equivalent to custody.
-func (m *Manager) trusted(version string) bool {
+// The verdict that produced the answer is returned with it, and that is not a
+// convenience: a caller that logs `trusted()`'s decision and then asks
+// [Manager.custodyVerdict] separately takes the state lock twice, and a verdict that
+// changed in between makes the log line describe a decision that was never made. One
+// acquisition answers both halves.
+func (m *Manager) trusted(version string) (mayActivate bool, verdict error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	switch {
@@ -212,14 +292,14 @@ func (m *Manager) trusted(version string) bool {
 		// bytes at this one, and in a writable tree the directory or the artifact can
 		// be renamed between the checks and the exec. Readiness is withheld rather
 		// than granted on a claim the library cannot make.
-		return false
+		return false, m.custodyErr
 	case m.custodyErr != nil, m.cfg.Untrusted:
 		// Either the caller accepted a tree it shares, or it declared the tree
 		// untrustworthy on its own knowledge. Same mitigation: only a version this
 		// process published from a verified archive.
-		return m.installed[version]
+		return m.installed[version], m.custodyErr
 	}
-	return true
+	return true, m.custodyErr
 }
 
 // entryPrivate reports whether a file or directory inside a version tree can be modified
@@ -235,35 +315,69 @@ func (m *Manager) trusted(version string) bool {
 // It asks the same questions [verifyCustody] asks of a path component, for the same
 // reasons and against the same declared writer set: the owner, the mode, and the
 // access-control list. Like everything else here it reads and reports; it never repairs.
-func (m *Manager) entryPrivate(path string, wantDir bool) bool {
+//
+// euid is a parameter rather than read here, for the same reason [checkSymlink] takes one:
+// no unprivileged test can arrange a fixture this process does not own, so an ownership rule
+// that reads its identity from the ambient process is a rule nothing gates where CI runs.
+//
+// The DIAGNOSIS is returned rather than folded into the bool, because the verdicts are not
+// the same news and a caller cannot recover them from a false. An access-control list this
+// process could not EVALUATE is not a finding that somebody else can write —
+// [ErrACLUnreadable] and [ErrACLDialectUnsupported] exist precisely to keep those two
+// apart — so reporting it as "writable by another principal" sends the operator to fix a
+// mode that is already correct while the real obstacle (a dialect, a seccomp filter, an I/O
+// error) goes unmentioned. reason is a predicate whose subject is the entry, so a caller
+// completes the sentence: "<name> is writable by gid 3000".
+func (m *Manager) entryPrivate(path string, wantDir bool, euid int) (reason string, private bool) {
 	fi, err := os.Lstat(path)
 	if err != nil {
-		return false
+		return "could not be examined: " + err.Error(), false
+	}
+	// A symlink is refused AS a symlink, before its mode is consulted. On Linux a link's
+	// own mode is 0777 and grants nothing, so judging it by that mode reports an entry
+	// everyone can write and hands the operator an exclusion they cannot act on: chmod
+	// follows the link to its target. What the link points at is a different object from
+	// the entry in this directory, and [checkSymlink] states the same rule for the path
+	// walk — this is the copy that has to agree with it.
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return "is a symlink, which this package will not execute", false
 	}
 	if fi.Mode().IsDir() != wantDir {
-		return false
+		if wantDir {
+			return "is not a directory", false
+		}
+		return "is a directory rather than a file", false
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return false
+		return "has no ownership information", false
 	}
-	euid := os.Geteuid()
 	if !m.trust.allowsOwner(int(stat.Uid), euid) {
-		return false
+		return fmt.Sprintf("is owned by uid %d", stat.Uid), false
 	}
 	writers, err := writersOf(path, fi, stat)
 	if err != nil {
-		// An unreadable access-control list is not proof there is nothing to find.
-		return false
+		// An unreadable access-control list is not proof there is nothing to find, so this
+		// fails closed like every other unknown here. It is REPORTED as the unknown it is
+		// rather than as a writer somebody found, which is the distinction the two ACL
+		// sentinel errors exist to carry.
+		return "could not be judged: " + err.Error(), false
 	}
-	_, stranger := m.trust.firstStranger(writers, euid)
-	return !stranger
+	if p, stranger := m.trust.firstStranger(writers, euid); stranger {
+		return "is writable by " + p.String(), false
+	}
+	return "", true
 }
 
-// wideArtifact returns the name of the first entry in dir that another principal could
-// rewrite, or "" when the directory and everything in it is private. The directory
-// itself answers as "." — one another principal can write makes the modes of the
-// entries inside it irrelevant, since the entries can simply be replaced.
+// wideArtifact returns the name of the first entry in dir that is not provably private to
+// this process, together with WHY it is not, or "" when the directory and everything in it
+// is private. The directory itself answers as "." — one another principal can write makes
+// the modes of the entries inside it irrelevant, since the entries can simply be replaced.
+//
+// The reason travels with the name because "." and a bare entry name are not an operator
+// sentence, and because the refusals are not interchangeable: an entry somebody else can
+// write is a permissions problem, an entry whose access-control list could not be read is a
+// visibility problem, and only one of the two is fixed with chmod. See [Manager.entryPrivate].
 //
 // EVERY top-level entry, not only the declared artifacts. [Manager.PathEntry] hands the
 // whole version directory to the front of PATH, and a multi-binary release's primary
@@ -277,23 +391,24 @@ func (m *Manager) entryPrivate(path string, wantDir bool) bool {
 // Top level only, because that is what PATH exposes: an executable in a subdirectory
 // is not reachable by bare name. A directory this library assembled holds exactly the
 // declared artifacts and the sentinel, so this is a handful of stats.
-func (m *Manager) wideArtifact(dir string) string {
-	if !m.entryPrivate(dir, true) {
-		return "."
+func (m *Manager) wideArtifact(dir string) (name, reason string) {
+	euid := os.Geteuid()
+	if why, private := m.entryPrivate(dir, true, euid); !private {
+		return ".", why
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "."
+		return ".", "could not be listed: " + err.Error()
 	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if !m.entryPrivate(filepath.Join(dir, e.Name()), false) {
-			return e.Name()
+		if why, private := m.entryPrivate(filepath.Join(dir, e.Name()), false, euid); !private {
+			return e.Name(), why
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // selectActive picks the version to run: the pin when it is activatable, else the
@@ -305,42 +420,41 @@ func (m *Manager) wideArtifact(dir string) string {
 // sentinel stayed intact — excludes that directory, falls through to another
 // complete version if one exists, and leaves the pin unsatisfied so the caller
 // reinstalls.
+// The checks themselves live in [Manager.activatable], which retention asks the same
+// question of. What stays here is the wording and the severity of each exclusion.
 func (m *Manager) selectActive(ctx context.Context) (selection, bool) {
 	for _, version := range preferPin(m.completeVersions(), m.cfg.Version) {
-		if !m.trusted(version) {
+		a := m.activatable(ctx, version)
+		if a.stage == stageUntrusted {
 			slog.Warn("ignoring an existing version directory because this process does not exclusively control the installation tree; only a freshly verified install may be activated",
-				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict(), "untrusted", m.cfg.Untrusted)
+				"package", m.cfg.Release.Name, "version", version, "reason", a.verdict, "untrusted", m.cfg.Untrusted)
 			continue
 		}
 		if m.cfg.Untrusted {
 			slog.Error("activating a version on degraded evidence: Config.Untrusted declares this tree shared, so all that is known is that this process published this version from a verified archive earlier, not that its artifacts are unchanged since",
-				"package", m.cfg.Release.Name, "version", version, "reason", m.custodyVerdict())
+				"package", m.cfg.Release.Name, "version", version, "reason", a.verdict)
 		}
-		dir := m.versionDir(version)
-		if wide := m.wideArtifact(dir); wide != "" {
-			if wide == "." {
-				slog.Error("excluding a version directory: the directory itself is writable by another principal, who can therefore replace any artifact in it whatever the artifacts' own modes say",
-					"package", m.cfg.Release.Name, "version", version, "dir", dir)
+		switch a.stage {
+		case stageWideEntry:
+			if a.entry == "." {
+				slog.Error("excluding a version directory: the directory itself is not provably private to this process, so any artifact in it can be replaced whatever the artifacts' own modes say",
+					"package", m.cfg.Release.Name, "version", version, "dir", a.dir, "reason", a.reason)
 			} else {
-				slog.Error("excluding a version directory: an entry in it is writable by another principal, so it is a file this process may execute and somebody else could rewrite",
-					"package", m.cfg.Release.Name, "version", version, "entry", wide)
+				slog.Error("excluding a version directory: an entry in it is not provably private to this process, so it is a file this process may execute and cannot vouch for",
+					"package", m.cfg.Release.Name, "version", version, "entry", a.entry, "reason", a.reason)
 			}
 			continue
-		}
-		bin := filepath.Join(dir, m.primary)
-		got, err := m.probeVersion(ctx, bin)
-		if err != nil {
+		case stageProbeFailed:
 			slog.Warn("excluding a version directory: its artifact did not answer the version probe",
-				"package", m.cfg.Release.Name, "version", version, "path", bin, "error", err)
+				"package", m.cfg.Release.Name, "version", version, "path", a.bin, "error", a.err)
 			continue
-		}
-		if got != version {
+		case stageVersionMismatch:
 			slog.Error("excluding a version directory: its artifact reports a different version than the directory and sentinel claim, so the install was replaced or tampered with",
-				"package", m.cfg.Release.Name, "version", version, "reported", got,
-				"path", bin, "error", ErrVersionMismatch)
+				"package", m.cfg.Release.Name, "version", version, "reported", a.reported,
+				"path", a.bin, "error", ErrVersionMismatch)
 			continue
 		}
-		return selection{version: version, dir: dir, bin: bin}, true
+		return a.sel, true
 	}
 	return selection{}, false
 }

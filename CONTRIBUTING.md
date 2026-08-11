@@ -185,13 +185,15 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `unpack_test.go`: containment positively and negatively (asserted on the
   filesystem, not on a lexical helper), mode handling, duplicate entry names, and
   the entry-count and size budgets.
-- `custody_test.go`: the precondition — a private tree accepted including its sticky
-  world-writable ancestor, every shape of non-owner write refused at every depth, an
+- `custody_test.go`: the precondition — a private tree accepted including the sticky
+  ancestor others can write, every shape of non-owner write refused at every depth, an
   NFSv4 ACL evaluated and then accepted once its writer is declared, a POSIX ACL whose
-  mask withholds write, the resolved-chain and lexical-chain rules, the sticky ancestor's
-  own limit (an ACL granting `WRITE_OWNER` or `WRITE_ACL` there is refused, an ordinary write
-  grant is not), the publish-side gate on the version directory and its sentinel, and each of
-  the four custody-related Config fields end to end.
+  mask withholds write, the chain rules (the path as written, the path it resolves to, and
+  the directory holding every link in between, plus the refusal of a chain that does not
+  resolve), the sticky ancestor's own limit (an ACL granting `WRITE_OWNER`, `WRITE_ACL` or
+  `DELETE_CHILD` there is refused, an ordinary write grant is not, and the sticky-and-shared
+  answer is read from the list as well as the mode), the publish-side gate on the version
+  directory and its sentinel, and each of the four custody-related Config fields end to end.
 - `acl_golden_test.go`: the wire formats, against real captured lists, plus every shape of
   malformed input and every reason an entry grants nothing.
 - `release_test.go`: the profile and sweep validation tables, the package-name

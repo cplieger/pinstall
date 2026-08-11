@@ -1,3 +1,5 @@
+//go:build linux
+
 package pinstall
 
 import (
@@ -18,7 +20,9 @@ const (
 )
 
 // aclXattrs is the order [writersOf] looks for an ACL. POSIX.1e first because it is the
-// common case on an ordinary Linux volume.
+// common case on an ordinary Linux volume. system.nfs4_acl is consulted although no parser
+// here decodes it: finding it is what turns an undecodable grant into a refusal that names
+// the dialect, rather than a grant nobody looked for. See [ErrACLDialectUnsupported].
 var aclXattrs = []string{xattrPOSIXACL, xattrNFS4ACL, xattrNFS4XDR}
 
 // principalKind distinguishes the three things an ACL entry can name.
@@ -86,6 +90,9 @@ const (
 // NFSv4 ACE types, flags, special principals and access-mask bits (RFC 7530 §6.2.1).
 const (
 	nfs4TypeAllow uint32 = 0
+	nfs4TypeDeny  uint32 = 1
+	nfs4TypeAudit uint32 = 2
+	nfs4TypeAlarm uint32 = 3
 
 	nfs4FlagIdentifierGroup uint32 = 0x0040
 	nfs4FlagInheritOnly     uint32 = 0x0008
@@ -122,39 +129,78 @@ const nfs4WriteMask = nfs4WriteData | nfs4AppendData | nfs4DeleteChild |
 
 // nfs4ControlMask is the subset of nfs4WriteMask that lets a principal dismantle an
 // object's own protection rather than merely write through it: take the ownership that
-// gates chmod and chown, or rewrite the list itself.
+// gates chmod and chown, rewrite the list itself, or remove an entry it does not own.
 //
-// It exists because the sticky exemption is conditional on facts a holder of these two
-// bits can change. See [controllersOf].
-const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner
+// DELETE_CHILD is in the set because it is the sticky rule, not a consequence of it. RFC
+// 7530 makes an explicit grant the access decision and leaves the sticky bit as the
+// fallback for when the list does not decide, so a named identity holding DELETE_CHILD on
+// an ancestor can remove a component this walk has just judged and put its own tree at that
+// name — while the mode, on the 1777 ancestor the exemption exists for, already lets it
+// create the replacement.
+//
+// It exists because the sticky exemption is conditional on facts a holder of these bits can
+// change. See [controllersOf].
+const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner | nfs4DeleteChild
 
 // ErrACLUnreadable reports that an access-control list is present but could not be
 // evaluated. It is deliberately distinct from a refusal on the CONTENT of an ACL: this
 // one says the check does not know, which is why it fails closed.
 var ErrACLUnreadable = errors.New("the access-control list could not be evaluated")
 
+// ErrACLDialectUnsupported reports that an object carries an access-control list in a
+// dialect this package cannot decode, as distinct from one it decoded and refused. It
+// wraps [ErrACLUnreadable], because the consequence is the same one: the check does not
+// know who can write, so it fails closed.
+//
+// system.nfs4_acl is the only dialect in this state, and it is worth stating why rather
+// than dropping it from the list of attributes consulted. It is the attribute
+// nfs4-acl-tools reads and writes, and it carries VARIABLE-LENGTH STRING principals
+// ("root@example.com") rather than the numeric ids of the XDR encoding OpenZFS serves
+// through system.nfs4_acl_xdr, which is where every list this parser has been checked
+// against came from. Decoding the one with the other's fixed-size layout misreads ids
+// wherever the lengths happen to line up and skips entries wherever they do not — a
+// writer set quietly missing a writer. Ignoring the attribute instead would make a grant
+// served over NFS invisible, which is the same failure by omission. So it is named: an
+// operator who knows the identities on that export can declare them in
+// [Config.TrustedUIDs] and [Config.TrustedGIDs], and one who knows the volume needs no
+// checking can say so with [Config.InstallWithoutCustody].
+var ErrACLDialectUnsupported = fmt.Errorf("%w: the dialect is not one this parser can decode", ErrACLUnreadable)
+
 // writersOf returns every principal that can modify path, beyond nothing.
 //
-// The mode is the floor: its group and other write bits name the object's group and
-// everyone. When the object also carries an access-control list, that list is PARSED and
-// its grants are added, because a mode is a lossy projection of one — under NFSv4 a
-// directory reading 0755 can carry an entry giving a named user full write, which is the
-// case that motivated reading the list rather than refusing on its mere presence.
+// The list is read first, because whether the MODE says anything this function should
+// believe depends on which dialect the object carries. Where there is no list, and under
+// NFSv4 where the mode is an independent projection of one, the mode's group and other
+// write bits name the object's group and everyone, and the list's grants are added to
+// them — a directory reading 0755 can carry an NFSv4 entry giving a named user full write,
+// which is the case that motivated reading the list rather than refusing on its mere
+// presence.
+//
+// Under POSIX.1e the mode is NOT a floor, and reading it as one is a fail-CLOSED bug that
+// defeats the whole feature. The mode's group bits are the ACL's MASK there, not the
+// GROUP_OBJ grant: on a directory owned root:3000 carrying {u::rwx, u:1234:rwx, g::r-x,
+// m::rwx, o::---} the kernel stores mode 0770, and a floor read off it names gid 3000 as a
+// writer the list explicitly denies. Nothing the operator can declare clears that, because
+// the group they would have to trust provably cannot write. So for that dialect the answer
+// comes entirely from [parsePOSIXACL], which names GROUP_OBJ (capped by the mask) and OTHER
+// (never capped) in every case, including a list carrying no mask at all.
 //
 // The owner is deliberately NOT included. Every caller checks ownership separately and
 // has more to say about it than this function does.
 func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, error) {
-	var out []principal
-	perm := fi.Mode().Perm()
-	if perm&0o020 != 0 {
-		out = append(out, principal{kind: principalGroup, id: int(stat.Gid)})
-	}
-	if perm&0o002 != 0 {
-		out = append(out, principal{kind: principalEveryone})
-	}
 	name, blob, err := readACL(path)
 	if err != nil {
 		return nil, err
+	}
+	var out []principal
+	if name != xattrPOSIXACL {
+		perm := fi.Mode().Perm()
+		if perm&0o020 != 0 {
+			out = append(out, principal{kind: principalGroup, id: int(stat.Gid)})
+		}
+		if perm&0o002 != 0 {
+			out = append(out, principal{kind: principalEveryone})
+		}
 	}
 	if name == "" {
 		return out, nil
@@ -179,10 +225,17 @@ func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, 
 // syscall -- so it says nothing whatever about the object. Treating it as absence let a
 // sandbox that blocks getxattr produce a clean verdict for a tree an ACL grants a stranger
 // write to, which is the sandbox making the check weaker rather than stricter.
+//
+// A list in a dialect no parser here understands is on that second side too, and refuses
+// by name rather than being decoded with a layout that does not fit it. See
+// [ErrACLDialectUnsupported].
 func readACL(path string) (name string, blob []byte, err error) {
 	for _, candidate := range aclXattrs {
 		found, readErr := getxattrAll(path, candidate)
 		switch {
+		case readErr == nil && candidate == xattrNFS4ACL:
+			return "", nil, fmt.Errorf("%w: %s holds %s, which carries string principals rather than the numeric ids of %s; name the identities allowed to write it in Config.TrustedUIDs or Config.TrustedGIDs, or waive the check with Config.InstallWithoutCustody",
+				ErrACLDialectUnsupported, path, xattrNFS4ACL, xattrNFS4XDR)
 		case readErr == nil:
 			return candidate, found, nil
 		case errors.Is(readErr, syscall.ENODATA), errors.Is(readErr, syscall.ENOTSUP),
@@ -196,19 +249,19 @@ func readACL(path string) (name string, blob []byte, err error) {
 }
 
 // controllersOf returns every principal that can dismantle path's OWN protection -- take
-// the ownership that gates chmod and chown, or rewrite the access-control list -- as
-// opposed to one that can merely write inside it.
+// the ownership that gates chmod and chown, rewrite the access-control list, or remove an
+// entry it does not own -- as opposed to one that can merely write inside it.
 //
-// Only NFSv4 can express either grant. Under POSIX.1e chmod and chown stay with the owner,
-// whom the caller checks separately, and no mode bit confers them, so both answer with
-// nothing rather than with a guess.
+// Only NFSv4 can express any of those grants. Under POSIX.1e chmod and chown stay with the
+// owner, whom the caller checks separately, removal is the kernel's sticky rule with nothing
+// in the list able to override it, and no mode bit confers any of the three, so the answer
+// is nothing rather than a guess.
 func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
 	name, blob, err := readACL(path)
 	if err != nil {
 		return nil, err
 	}
-	switch name {
-	case xattrNFS4ACL, xattrNFS4XDR:
+	if name == xattrNFS4XDR {
 		granted, err := parseNFS4Granted(blob, stat, nfs4ControlMask)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, name, err)
@@ -218,25 +271,49 @@ func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
 	return nil, nil
 }
 
-// getxattrAll reads an attribute whose size it does not know in advance, asking the
-// kernel for the length rather than guessing and silently truncating.
+// getxattrAll reads an access-control list attribute in ONE call, into a buffer sized to
+// the largest list the parser for that dialect would accept.
+//
+// A single getxattr is atomic with respect to the attribute; a size probe followed by a
+// read is not, and the principal who can use the gap between them is exactly the one this
+// check exists to catch. A holder of WRITE_ACL on a path component can shrink or drop its
+// own grant between the two calls, and all three outcomes read as good news: a second call
+// answering ENODATA reaches the ABSENCE branch of [readACL], so a list granting EVERYONE@
+// write yields no writers and no error; a shorter NFSv4 answer is parsed as a COMPLETE
+// list, and an 8-byte header with a zero count is a valid empty one; and POSIX.1e carries
+// no entry count at all, so any answer truncated to a multiple of the entry size is a
+// valid SHORTER list. The check runs on every operation, so that window is available on
+// demand rather than once.
+//
+// ERANGE therefore means "longer than any list this package would parse", which is a
+// refusal rather than a reason to retry with a bigger buffer. A zero-length value is
+// refused for the same reason: the kernel reports an absent attribute as ENODATA, so a
+// present-but-empty one is a shape no parser here can explain. Neither is returned as
+// ENODATA, so both reach [readACL]'s unreadable path instead of its absence path.
 func getxattrAll(path, attr string) ([]byte, error) {
-	size, err := getxattrFn(path, attr, nil)
-	if err != nil {
-		return nil, err
-	}
-	if size <= 0 {
-		return nil, syscall.ENODATA
-	}
-	buf := make([]byte, size)
+	buf := make([]byte, aclCeiling(attr))
 	n, err := getxattrFn(path, attr, buf)
-	if err != nil {
+	switch {
+	case errors.Is(err, syscall.ERANGE):
+		return nil, fmt.Errorf("%s is longer than the %d bytes this parser would accept: %w", attr, len(buf), err)
+	case err != nil:
 		return nil, err
-	}
-	if n > len(buf) {
-		return nil, fmt.Errorf("the attribute grew from %d to %d bytes while being read", size, n)
+	case n <= 0:
+		return nil, fmt.Errorf("%s is present but %d bytes long, which is not a list this parser can read", attr, n)
+	case n > len(buf):
+		return nil, fmt.Errorf("%s answered %d bytes into a %d byte buffer", attr, n, len(buf))
 	}
 	return buf[:n], nil
+}
+
+// aclCeiling returns the largest value the parser for attr would accept, which is the
+// buffer size that makes one getxattr sufficient. Anything longer is over a limit that
+// parser already refuses, so the ERANGE it produces is the same refusal arriving earlier.
+func aclCeiling(attr string) int {
+	if attr == xattrPOSIXACL {
+		return posixACLHeaderSize + posixACLMaxEntries*posixACLEntrySize
+	}
+	return nfs4HeaderSize + nfs4MaxACEs*nfs4ACESize
 }
 
 // getxattrFn is syscall.Getxattr, replaced in tests: no ordinary test process can mount
@@ -245,11 +322,14 @@ func getxattrAll(path, attr string) ([]byte, error) {
 var getxattrFn = syscall.Getxattr
 
 // parseACL dispatches on the attribute name.
+//
+// xattrNFS4ACL is deliberately absent: [readACL] refuses that dialect by name rather than
+// handing it to a decoder whose layout does not fit it, so a blob in it never reaches here.
 func parseACL(name string, blob []byte, stat *syscall.Stat_t) ([]principal, error) {
 	switch name {
 	case xattrPOSIXACL:
 		return parsePOSIXACL(blob, stat)
-	case xattrNFS4ACL, xattrNFS4XDR:
+	case xattrNFS4XDR:
 		return parseNFS4ACL(blob, stat)
 	}
 	return nil, fmt.Errorf("unknown access-control list dialect %q", name)
@@ -363,7 +443,42 @@ func decodePOSIXACL(blob []byte) ([]posixEntry, error) {
 		}
 		out = append(out, e)
 	}
+	if err := requirePOSIXTriple(out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// requirePOSIXTriple refuses a list that does not carry USER_OBJ, GROUP_OBJ and OTHER
+// exactly once each.
+//
+// It is load-bearing rather than pedantic, and it is what makes [writersOf] safe to take no
+// mode floor for this dialect: the mode's group bits are this list's MASK rather than its
+// GROUP_OBJ grant, so the owning group and everyone are named from the LIST or not at all.
+// A blob missing either entry would then answer "nobody" for a principal the object may
+// grant write to, which is the fail-open direction. posix_acl_valid demands the same three
+// on setxattr, so the local kernel will not produce a list without them; a filesystem or a
+// remote server handing over the raw blob can.
+func requirePOSIXTriple(entries []posixEntry) error {
+	for _, required := range []struct {
+		name string
+		tag  uint16
+	}{
+		{"user::", posixTagUserObj},
+		{"group::", posixTagGroupObj},
+		{"other::", posixTagOther},
+	} {
+		n := 0
+		for _, e := range entries {
+			if e.tag == required.tag {
+				n++
+			}
+		}
+		if n != 1 {
+			return fmt.Errorf("the list carries %d %s entries rather than exactly one", n, required.name)
+		}
+	}
+	return nil
 }
 
 // posixEntry is one decoded POSIX.1e access-control entry.
@@ -398,8 +513,8 @@ func parseNFS4Granted(blob []byte, stat *syscall.Stat_t, want uint32) ([]princip
 		return nil, fmt.Errorf("%d entries is over the %d limit", count, nfs4MaxACEs)
 	}
 	body := blob[nfs4HeaderSize:]
-	if want := int(count) * nfs4ACESize; len(body) != want {
-		return nil, fmt.Errorf("%d entries need %d bytes of body, got %d", count, want, len(body))
+	if need := int(count) * nfs4ACESize; len(body) != need {
+		return nil, fmt.Errorf("%d entries need %d bytes of body, got %d", count, need, len(body))
 	}
 
 	var out []principal
@@ -411,7 +526,23 @@ func parseNFS4Granted(blob []byte, stat *syscall.Stat_t, want uint32) ([]princip
 		mask := binary.BigEndian.Uint32(raw[12:16])
 		id := binary.BigEndian.Uint32(raw[16:20])
 
-		if aceType != nfs4TypeAllow || flag&nfs4FlagInheritOnly != 0 || mask&want == 0 {
+		// The four types RFC 7530 defines. ALLOW is the only one that grants, and the
+		// other three are passed over: DENY can only ever subtract, and AUDIT and ALARM
+		// ask the server to log or signal rather than to permit anything.
+		//
+		// An UNRECOGNISED type is refused instead, because "not ALLOW" and "cannot
+		// grant" are not the same claim. A filesystem-extended or future type this
+		// parser silently skipped would drop the writer it names, and a writer set with
+		// a writer missing is a clean verdict no caller can refuse on -- the one
+		// direction this check must never fail in.
+		switch aceType {
+		case nfs4TypeAllow:
+		case nfs4TypeDeny, nfs4TypeAudit, nfs4TypeAlarm:
+			continue
+		default:
+			return nil, fmt.Errorf("entry %d carries unknown type %d", i, aceType)
+		}
+		if flag&nfs4FlagInheritOnly != 0 || mask&want == 0 {
 			continue
 		}
 		switch {
