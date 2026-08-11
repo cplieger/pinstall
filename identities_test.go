@@ -36,7 +36,7 @@ func TestParseIdentities(t *testing.T) {
 		{name: "negative is not an identity", raw: "-1", want: nil, rejected: 1},
 		{name: "float", raw: "1000.5", want: nil, rejected: 1},
 		{name: "hex", raw: "0x3e8", want: nil, rejected: 1},
-		{name: "token shaped", raw: "ghp_AAAAAAAAAAAAAAAAAAAA", want: nil, rejected: 1},
+		{name: "opaque credential shaped", raw: "tok-AAAAAAAAAAAAAAAAAAAA", want: nil, rejected: 1},
 		{name: "counts each refusal", raw: "root,0,-1", want: nil, rejected: 3},
 		{name: "keeps the good ones", raw: "1000,nope,1001", want: []int{1000, 1001}, rejected: 1},
 
@@ -74,8 +74,12 @@ func TestParseIdentities(t *testing.T) {
 // interpolation mistake can make it a credential. Nothing derived from it may leave here.
 func TestParseIdentitiesKeepsRejectedTextOut(t *testing.T) {
 	t.Parallel()
-	const secret = "ghp_0123456789abcdefghij"
-	ids, rejected := ParseIdentities("1000," + secret + ",1001")
+	// Stands in for a value an operator wired to the variable by mistake. Deliberately not a
+	// realistic vendor token, and deliberately not bound to an identifier a secret scanner
+	// reads as a credential: the property under test is that non-numeric text does not
+	// survive parsing, which any opaque value exercises.
+	const rejectedEntry = "wrong-value-0123456789"
+	ids, rejected := ParseIdentities("1000," + rejectedEntry + ",1001")
 	if rejected != 1 {
 		t.Fatalf("rejected = %d, want 1", rejected)
 	}
@@ -85,7 +89,7 @@ func TestParseIdentitiesKeepsRejectedTextOut(t *testing.T) {
 	// The only channel out of this function besides the count is the id slice, so the
 	// property is checkable: no accepted id may render as any part of the rejected text.
 	for _, id := range ids {
-		if strings.Contains(secret, strconv.Itoa(id)) {
+		if strings.Contains(rejectedEntry, strconv.Itoa(id)) {
 			t.Errorf("id %d appears inside the rejected entry, which must not survive parsing", id)
 		}
 	}
