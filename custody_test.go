@@ -389,6 +389,131 @@ func TestVerifyCustodyJudgesTheResolvedChain(t *testing.T) {
 	}
 }
 
+// TestVerifyCustodyJudgesTheDirectoryHoldingAnIntermediateSymlink pins the hops in the
+// MIDDLE of a chain, which had no judge at all while the resolution was delegated whole to
+// filepath.EvalSymlinks: the path as written was walked, the path it fully resolved to was
+// walked, and the directories holding every link in between were visited by EvalSymlinks
+// internally and then forgotten.
+//
+// The shape is an ordinary release layout — /opt/app -> /srv/current -> /mnt/data/app-1 —
+// needs no ACL and reproduces on ext4. Only the directory holding the middle link is
+// widened here, so both endpoints stay private and neither of the two chains the old shape
+// walked contains an offender. That is not the accepted TOCTOU: at the instant of the
+// verdict, anyone who can write that directory repoints the middle link, and the next
+// MkdirTemp, OpenRoot or Rename lands in a tree of their choosing.
+func TestVerifyCustodyJudgesTheDirectoryHoldingAnIntermediateSymlink(t *testing.T) {
+	base := t.TempDir()
+	priv := filepath.Join(base, "priv")
+	mid := filepath.Join(base, "mid")
+	target := filepath.Join(base, "target")
+	for _, dir := range []string{priv, mid, target} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+	}
+	link := filepath.Join(mid, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	entry := filepath.Join(priv, "entry")
+	if err := os.Symlink(link, entry); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if err := verifyCustody(entry, trustedWriters{}); err != nil {
+		t.Fatalf("verifyCustody refused a private two-hop chain: %v", err)
+	}
+
+	if err := os.Chmod(mid, 0o777); err != nil {
+		t.Fatalf("chmod the directory holding the middle link: %v", err)
+	}
+	err := verifyCustody(entry, trustedWriters{})
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: everyone can write %s, which holds the link the chain goes through", err, mid)
+	}
+	if !strings.Contains(err.Error(), mid) {
+		t.Errorf("error %q does not name %s, the directory that can repoint the middle of the chain", err, mid)
+	}
+	if !strings.Contains(err.Error(), "0777") {
+		t.Errorf("error %q does not quote the offending mode", err)
+	}
+
+	// The witness that this is the same directory the walk already knew how to refuse, so
+	// what was missing was the judge and not the rule.
+	if err := verifyCustody(mid, trustedWriters{}); !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody(%s) = %v, want ErrNoCustody when named directly", mid, err)
+	}
+}
+
+// TestVerifyCustodyRefusesASymlinkCycle pins the bound on the resolution. A cycle has no
+// resolved path, so there is nothing to judge and nothing to be told about: an error is the
+// only answer that is not a clean verdict about a tree nobody can reach. Resolving the chain
+// one link at a time is what makes the bound this walk's own responsibility rather than
+// EvalSymlinks's.
+func TestVerifyCustodyRefusesASymlinkCycle(t *testing.T) {
+	base := t.TempDir()
+	a := filepath.Join(base, "a")
+	b := filepath.Join(base, "b")
+	if err := os.Symlink(b, a); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.Symlink(a, b); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	err := verifyCustody(a, trustedWriters{})
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody for a chain that does not resolve", err)
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("error %v does not carry ELOOP, which is what an operator will recognise this as", err)
+	}
+}
+
+// TestVerifyCustodyRefusesAForeignSymlinkInAStickyDirectoryWidenedOnlyByItsACL is the
+// confirmed fail-open pair, whose two halves differ in nothing but the access-control list.
+// A sticky directory at 1777 holding a stranger's symlink is refused; the same directory at
+// 1755, wide only because an EVERYONE@ entry grants write, used to be accepted — because the
+// fact deciding whether the link must be ours was read off the mode alone, on the very
+// filesystems this package parses lists for BECAUSE the mode is lossy.
+func TestVerifyCustodyRefusesAForeignSymlinkInAStickyDirectoryWidenedOnlyByItsACL(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("planting a foreign-owned symlink needs root; sharedSticky's own test is the unprivileged witness for the rule")
+	}
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "pkg-versions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// Sticky, and 0755: the MODE says nobody else can create an entry here.
+	if err := os.Chmod(shared, os.ModeSticky|0o755); err != nil {
+		t.Fatalf("chmod sticky: %v", err)
+	}
+	hop := filepath.Join(shared, "hop")
+	if err := os.Symlink(real, hop); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.Lchown(hop, 12345, 12345); err != nil {
+		t.Skipf("cannot chown a symlink here (%v), so the foreign-link case is untested", err)
+	}
+	// The list is what actually makes the directory shared, and it is the only difference
+	// from the 1777 case the suite already pins.
+	everyone := buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, nfs4WhoEveryone)
+	defer serveACL(t, shared, xattrNFS4XDR, everyone)()
+
+	err := verifyCustody(filepath.Join(hop, "pkg-versions"), trustedWriters{})
+	if !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustody error = %v, want ErrNoCustody: the list lets anyone create entries in %s, so uid 12345's link there can be repointed", err, shared)
+	}
+	if !strings.Contains(err.Error(), "12345") {
+		t.Errorf("error %q does not name the uid that can repoint the link", err)
+	}
+}
+
 // TestEnsureRefusesToInstallWithoutCustody is the integration statement: an install
 // into a tree another principal can write does not happen, nothing is published, and
 // the reason reaches the caller as a typed error rather than as a log line.
@@ -654,7 +779,10 @@ func TestMoveArtifactRefusesToPublishAWritableArtifact(t *testing.T) {
 	if err == nil {
 		t.Fatal("Ensure published an artifact the installer left writable by another principal")
 	}
-	if !strings.Contains(err.Error(), "writable by another principal") {
+	// "writable by" rather than the identity: the writer set enumerates the group first
+	// and gid 0 is trusted, so a root container names everyone where an unprivileged CI
+	// runner names the process's own gid. Both are the same refusal.
+	if !strings.Contains(err.Error(), "writable by") || !strings.Contains(err.Error(), toolName) {
 		t.Errorf("Ensure error = %v, want one naming the writable artifact", err)
 	}
 	if dirs := env.versionDirs(); len(dirs) != 0 {
@@ -899,8 +1027,8 @@ func TestWideArtifactCoversUndeclaredEntries(t *testing.T) {
 	env := newFakeEnv(t)
 	dir := env.placeVersion(pinnedVersion)
 	m := env.manager()
-	if wide := m.wideArtifact(dir); wide != "" {
-		t.Fatalf("wideArtifact = %q on a clean directory, want \"\"", wide)
+	if entry, reason := m.wideArtifact(dir); entry != "" {
+		t.Fatalf("wideArtifact = (%q, %q) on a clean directory, want no offender", entry, reason)
 	}
 
 	stray := filepath.Join(dir, "not-declared-anywhere")
@@ -910,36 +1038,124 @@ func TestWideArtifactCoversUndeclaredEntries(t *testing.T) {
 	if err := os.Chmod(stray, 0o777); err != nil {
 		t.Fatalf("chmod the undeclared entry: %v", err)
 	}
-	if wide := m.wideArtifact(dir); wide != "not-declared-anywhere" {
-		t.Errorf("wideArtifact = %q, want the undeclared entry: it sits on PATH like every other file there", wide)
+	entry, reason := m.wideArtifact(dir)
+	if entry != "not-declared-anywhere" {
+		t.Errorf("wideArtifact = %q, want the undeclared entry: it sits on PATH like every other file there", entry)
+	}
+	if !strings.Contains(reason, "writable by") {
+		t.Errorf("wideArtifact reason = %q, want one naming the identity that can write it", reason)
 	}
 }
 
-// TestWorldWritableStickyFailsClosed pins the direction of the one fact that decides
-// whether a symlink must be owned by us. An unreadable answer must count as sticky: the
-// unknown can then only ADD the ownership demand, where the opposite default let a
-// transient stat failure on the parent retire it silently.
-func TestWorldWritableStickyFailsClosed(t *testing.T) {
-	dir := t.TempDir()
-	if got := worldWritableSticky(dir); got {
-		t.Errorf("worldWritableSticky(%s) = true on a private directory", dir)
+// TestSharedStickyAsksTheListAndFailsClosed pins the one fact that decides whether a
+// symlink must be owned by us, in both of the directions it can be wrong.
+//
+// The mode is not the answer. On the filesystems this package parses lists for, a directory
+// at 1755 carrying an EVERYONE@ write entry is one anybody can create entries in, so a
+// stranger's symlink inside it can be repointed after the verdict — and a mode-only rule
+// reports 0755 and nothing else, which is how the confirmed fail-open pair differed only in
+// its ACL. A grant the caller has DECLARED is not a stranger's, here as everywhere else in
+// the walk.
+//
+// And an answer that could not be obtained must count as shared: the unknown can then only
+// ADD the ownership demand, where the opposite default let a transient stat failure on the
+// parent retire it silently.
+func TestSharedStickyAsksTheListAndFailsClosed(t *testing.T) {
+	const stranger = 4242
+	euid := os.Geteuid()
+
+	// A directory of its own inside the temp root, so its mode is the fixture's rather
+	// than whatever t.TempDir chose.
+	newDir := func(t *testing.T, mode os.FileMode) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "d")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		return dir
 	}
-	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	if got := worldWritableSticky(dir); !got {
-		t.Errorf("worldWritableSticky(%s) = false on a world-writable sticky directory", dir)
-	}
-	if got := worldWritableSticky(filepath.Join(dir, "does-not-exist")); !got {
-		t.Error("worldWritableSticky = false for a path it could not stat, which retires the ownership demand instead of adding it")
-	}
-	file := filepath.Join(dir, "a-file")
-	if err := os.WriteFile(file, nil, 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	if got := worldWritableSticky(file); got {
-		t.Error("worldWritableSticky = true for a regular file, which is not a directory anything can be created in")
-	}
+
+	t.Run("a private directory", func(t *testing.T) {
+		dir := newDir(t, 0o755)
+		if sharedSticky(dir, euid, trustedWriters{}) {
+			t.Errorf("sharedSticky(%s) = true on a private directory", dir)
+		}
+	})
+
+	t.Run("sticky and world-writable by mode", func(t *testing.T) {
+		dir := newDir(t, os.ModeSticky|0o777)
+		if !sharedSticky(dir, euid, trustedWriters{}) {
+			t.Errorf("sharedSticky(%s) = false on a sticky directory everyone can write", dir)
+		}
+	})
+
+	t.Run("sticky at 1755, wide only by its access-control list", func(t *testing.T) {
+		dir := newDir(t, os.ModeSticky|0o755)
+		defer serveACL(t, dir, xattrNFS4XDR, buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, stranger))()
+
+		if !sharedSticky(dir, euid, trustedWriters{}) {
+			t.Errorf("sharedSticky(%s) = false although its list lets uid %d write: the mode is a lossy projection of the list, and the loss runs the unsafe way",
+				dir, stranger)
+		}
+		if sharedSticky(dir, euid, trustedWriters{uids: []int{stranger}}) {
+			t.Errorf("sharedSticky(%s) = true although the caller declared uid %d, which is not a stranger anywhere else in this walk",
+				dir, stranger)
+		}
+	})
+
+	t.Run("sticky at 1755, with a list that grants no write", func(t *testing.T) {
+		dir := newDir(t, os.ModeSticky|0o755)
+		const readData uint32 = 0x00000001
+		defer serveACL(t, dir, xattrNFS4XDR, buildNFS4ACL(nfs4TypeAllow, 0, 0, readData, stranger))()
+
+		if sharedSticky(dir, euid, trustedWriters{}) {
+			t.Errorf("sharedSticky(%s) = true although the list grants uid %d nothing but read", dir, stranger)
+		}
+	})
+
+	t.Run("a list that could not be read", func(t *testing.T) {
+		dir := newDir(t, os.ModeSticky|0o755)
+		old := getxattrFn
+		getxattrFn = func(string, string, []byte) (int, error) { return 0, syscall.EIO }
+		defer func() { getxattrFn = old }()
+
+		if !sharedSticky(dir, euid, trustedWriters{}) {
+			t.Error("sharedSticky = false for a sticky directory whose list it could not read, which retires the ownership demand instead of adding it")
+		}
+	})
+
+	t.Run("a path it could not stat", func(t *testing.T) {
+		dir := newDir(t, 0o755)
+		if !sharedSticky(filepath.Join(dir, "does-not-exist"), euid, trustedWriters{}) {
+			t.Error("sharedSticky = false for a path it could not stat, which retires the ownership demand instead of adding it")
+		}
+	})
+
+	t.Run("a wide list on a directory that is not sticky", func(t *testing.T) {
+		// Outside the scope of this fact: without the sticky bit the walk refuses such a
+		// component outright, and this answer only decides whether a symlink INSIDE it
+		// must be ours.
+		dir := newDir(t, 0o755)
+		defer serveACL(t, dir, xattrNFS4XDR, buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, stranger))()
+
+		if sharedSticky(dir, euid, trustedWriters{}) {
+			t.Errorf("sharedSticky(%s) = true on a directory with no sticky bit", dir)
+		}
+	})
+
+	t.Run("a regular file", func(t *testing.T) {
+		dir := newDir(t, 0o755)
+		file := filepath.Join(dir, "a-file")
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if sharedSticky(file, euid, trustedWriters{}) {
+			t.Error("sharedSticky = true for a regular file, which is not a directory anything can be created in")
+		}
+	})
 }
 
 // TestRetentionNeverExecutesAVersionSelectionRefuses pins the ordering inside
@@ -953,7 +1169,7 @@ func TestRetentionNeverExecutesAVersionSelectionRefuses(t *testing.T) {
 	m := env.manager(func(c *Config) { c.Untrusted = true })
 	m.checkCustody()
 
-	if m.trusted("9.9.9") {
+	if mayActivate, _ := m.trusted("9.9.9"); mayActivate {
 		t.Fatal("the fixture is wrong: the planted version must be untrusted for this test to mean anything")
 	}
 	if m.usableAsFallback(context.Background(), "9.9.9") {
@@ -1167,11 +1383,13 @@ func TestNewWiresTheDeclaredIdentities(t *testing.T) {
 // cannot rename ours away, which is what makes /tmp a usable place to root an install. But
 // it is an argument about a mode and an ownership that a sufficiently privileged ACE can
 // change. WRITE_OWNER lets its holder take the directory, after which chmod is theirs and
-// the sticky bit goes; WRITE_ACL lets them grant themselves the rest. The kernel enforcing
-// check_sticky() today says nothing about a bit the attacker can clear tomorrow.
+// the sticky bit goes; WRITE_ACL lets them grant themselves the rest; DELETE_CHILD is the
+// sticky rule itself written into the list, which RFC 7530 lets the list decide. The kernel
+// enforcing check_sticky() today says nothing about a rule the attacker can rewrite tomorrow.
 //
-// So the sticky branch reads those two grants and nothing else: an ordinary write grant on
-// a sticky ancestor stays exempt, which is the whole point of the exemption.
+// So the sticky branch reads the grants that would retire the sticky rule itself and nothing
+// else: an ordinary write grant on a sticky ancestor stays exempt, which is the whole point
+// of the exemption.
 func TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway(t *testing.T) {
 	const stranger = 4242
 
@@ -1181,9 +1399,15 @@ func TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway(t *testing.T) {
 	}{
 		"write access, which sticky genuinely contains": {mask: nfs4WriteData},
 		"append, likewise": {mask: nfs4AppendData},
-		"delete child, which sticky is exactly what limits": {mask: nfs4DeleteChild},
-		"take ownership, which removes the sticky bit":      {mask: nfs4WriteOwner, wantRefus: true},
-		"rewrite the list, which grants the rest":           {mask: nfs4WriteACL, wantRefus: true},
+		// DELETE_CHILD is not something sticky contains, it is the sticky rule stated in
+		// the list -- and RFC 7530 makes the list the access decision, leaving sticky as
+		// the fallback for when it does not decide. On the 1777 ancestor this exemption
+		// exists for, the mode already lets its holder create the replacement, so being
+		// able to remove a component this walk has just judged is a complete substitution
+		// of the tree probeVersion then executes as root.
+		"delete child, which the list is entitled to grant over sticky": {mask: nfs4DeleteChild, wantRefus: true},
+		"take ownership, which removes the sticky bit":                  {mask: nfs4WriteOwner, wantRefus: true},
+		"rewrite the list, which grants the rest":                       {mask: nfs4WriteACL, wantRefus: true},
 	}
 
 	for name, tc := range tests {
@@ -1343,13 +1567,15 @@ func TestVerifyCustodyWalksThroughASymlinkToTheResolvedTree(t *testing.T) {
 }
 
 // TestCheckSymlinkJudgesWhoOwnsTheLink is checkSymlink's only witness, and it has to be a
-// unit test: the guard fires on a symlink OWNED BY A STRANGER inside a world-writable
-// sticky directory, and handing a link to another uid needs CAP_CHOWN. So the end-to-end
+// unit test: the guard fires on a symlink OWNED BY A STRANGER inside a sticky directory
+// others can write, and handing a link to another uid needs CAP_CHOWN. So the end-to-end
 // coverage all skips on the unprivileged runner CI uses, and the whole function body could
 // be replaced with `return nil` while the suite stayed green -- the same shape that hid the
 // disconnected trusted-writer knobs.
 //
-// Both identities are parameters, so the predicate itself gates at any privilege.
+// Both identities are parameters, so the predicate itself gates at any privilege. Whether the
+// parent IS such a directory is [sharedSticky]'s question, and its own test covers the mode
+// and the access-control list that answer it.
 //
 // The rule is narrow on purpose. A stranger-owned symlink only matters where that stranger
 // could have PLANTED it, which is a directory they can create in; anywhere else the link is
@@ -1359,27 +1585,27 @@ func TestCheckSymlinkJudgesWhoOwnsTheLink(t *testing.T) {
 
 	tests := map[string]struct {
 		owner        int
-		parentSticky bool
+		parentShared bool
 		trust        trustedWriters
 		wantRefusal  bool
 	}{
-		"a stranger's link in a world-writable sticky directory": {owner: stranger, parentSticky: true, wantRefusal: true},
-		"the same link where the parent is not sticky":           {owner: stranger},
-		"our own link, sticky parent":                            {owner: euid, parentSticky: true},
-		"root's link, sticky parent":                             {owner: 0, parentSticky: true},
-		"a declared identity's link, sticky parent":              {owner: admin, parentSticky: true, trust: trustedWriters{uids: []int{admin}}},
-		"an undeclared stranger beside a declared one":           {owner: stranger, parentSticky: true, trust: trustedWriters{uids: []int{admin}}, wantRefusal: true},
+		"a stranger's link in a sticky directory others can write": {owner: stranger, parentShared: true, wantRefusal: true},
+		"the same link where the parent is not shared":             {owner: stranger},
+		"our own link, shared parent":                              {owner: euid, parentShared: true},
+		"root's link, shared parent":                               {owner: 0, parentShared: true},
+		"a declared identity's link, shared parent":                {owner: admin, parentShared: true, trust: trustedWriters{uids: []int{admin}}},
+		"an undeclared stranger beside a declared one":             {owner: stranger, parentShared: true, trust: trustedWriters{uids: []int{admin}}, wantRefusal: true},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			err := checkSymlink("/some/link", tc.owner, euid, tc.parentSticky, tc.trust)
+			err := checkSymlink("/some/link", tc.owner, euid, tc.parentShared, tc.trust)
 			switch {
 			case tc.wantRefusal && !errors.Is(err, ErrNoCustody):
-				t.Errorf("checkSymlink(owner=%d, sticky=%v) = %v, want ErrNoCustody: that user can repoint the link",
-					tc.owner, tc.parentSticky, err)
+				t.Errorf("checkSymlink(owner=%d, shared=%v) = %v, want ErrNoCustody: that user can repoint the link",
+					tc.owner, tc.parentShared, err)
 			case !tc.wantRefusal && err != nil:
-				t.Errorf("checkSymlink(owner=%d, sticky=%v) = %v, want nil", tc.owner, tc.parentSticky, err)
+				t.Errorf("checkSymlink(owner=%d, shared=%v) = %v, want nil", tc.owner, tc.parentShared, err)
 			}
 		})
 	}
@@ -1444,5 +1670,60 @@ func TestAllowsTrustsGroupZeroWithoutPrivilege(t *testing.T) {
 	}
 	if trust.allows(principal{kind: principalEveryone}, euid) {
 		t.Error("everyone is trusted, which nothing may ever make true")
+	}
+}
+
+// TestFirstStartOnAStickySharedParentRunsTheOneShotPurge pins the judgement the walk
+// cannot read off a component's POSITION, and the start it used to cost.
+//
+// checkCustody judges the nearest EXISTING directory when the installation root does not
+// exist yet, so on the first start that directory is the last component of the chain while
+// being an ANCESTOR of the tree. Deciding leaf-ness positionally therefore held it to the
+// installation-root rule and withheld the sticky exemption it is entitled to — and a
+// /tmp-shaped (1777) shared parent is exactly the shape that exemption exists for. The
+// consequence is not cosmetic: mayMutateTree was false on the one start where the one-shot
+// legacy purge can still run, and a later start, once the versions directory existed,
+// passed the very same directory.
+//
+// No privilege is needed and none is assumed: 1777 grants EVERYONE write, so the strict
+// judgement refuses it whatever gid the runner has.
+func TestFirstStartOnAStickySharedParentRunsTheOneShotPurge(t *testing.T) {
+	env := newFakeEnv(t)
+	legacyFixture(t, env.root)
+	legacyArtifact := filepath.Join(env.root, ".toolkit-installed")
+	// The /tmp shape. Sticky is what makes such a directory usable as an ancestor at all.
+	if err := os.Chmod(env.root, os.ModeSticky|0o777); err != nil {
+		t.Fatalf("chmod the shared parent: %v", err)
+	}
+	if exists(env.versionsRoot()) {
+		t.Fatal("the installation root already exists, so this fixture is not a first start and the test proves nothing")
+	}
+
+	// The two rules, on the same directory, distinguished only by which question is being
+	// asked of it. This is the whole of the fix, and it fails in both directions if the
+	// strictness goes back to being positional.
+	if err := verifyCustodyChain(env.root, trustedWriters{}, true); !errors.Is(err, ErrNoCustody) {
+		t.Fatalf("verifyCustodyChain(judgeLeafStrictly=true) = %v, want ErrNoCustody: the installation root is never exempted, sticky or not", err)
+	}
+	if err := verifyCustodyChain(env.root, trustedWriters{}, false); err != nil {
+		t.Fatalf("verifyCustodyChain(judgeLeafStrictly=false) = %v, want nil: a sticky ancestor others can write is exempt from the write question", err)
+	}
+
+	m := env.manager(func(c *Config) { c.Purge = testPurge() })
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	if err := m.custodyVerdict(); err != nil {
+		t.Errorf("custodyVerdict = %v, want nil: the first start judged its sticky ancestor by the installation-root rule", err)
+	}
+	if !m.mayMutateTree() {
+		t.Error("mayMutateTree is false, so the one-shot purge is skipped on the only start that can run it")
+	}
+	if exists(legacyArtifact) {
+		t.Error("the legacy artifact survived the first start, so the one-shot purge did not run")
+	}
+	if !exists(filepath.Join(env.root, legacyMarker)) {
+		t.Error("the purge completion marker was not recorded, so the sweep never completed on the first start")
 	}
 }

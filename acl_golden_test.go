@@ -1,9 +1,14 @@
 package pinstall
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -596,4 +601,636 @@ func serveOne(attr string, blob []byte) func(string, string, []byte) (int, error
 		}
 		return copy(dest, blob), nil
 	}
+}
+
+// TestReadACLReadsTheListInOneCall pins the removal of the window between a size probe and
+// a read. The attribute is not stable across two syscalls, and the principal who can change
+// it in between is the one this whole check exists to catch: a holder of WRITE_ACL on a path
+// component can add a grant, let the probe see it, and drop it before the read.
+//
+// Each of the three outcomes read as good news. A second call answering ENODATA reached the
+// ABSENCE branch of readACL, so a list granting EVERYONE@ write produced no writers and no
+// error. A shorter NFSv4 answer was parsed as a COMPLETE list, and an 8-byte header with a
+// zero count is a valid empty one. POSIX.1e carries no entry count at all, so any answer
+// truncated to a multiple of the entry size is a valid shorter list. The fix is one call
+// into a buffer sized to what the parser would accept, which is what this asserts: no call
+// arrives without a destination, and no attribute is read twice.
+func TestReadACLReadsTheListInOneCall(t *testing.T) {
+	blob := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, 4242)
+	reads, probes := 0, 0
+	old := getxattrFn
+	getxattrFn = func(_, name string, dest []byte) (int, error) {
+		if name != xattrNFS4XDR {
+			return 0, syscall.ENODATA
+		}
+		if dest == nil {
+			probes++
+			return len(blob), nil
+		}
+		reads++
+		if reads > 1 {
+			// The grant the first call saw is gone, which is the shape a principal
+			// holding WRITE_ACL produces by removing its own entry.
+			return 0, syscall.ENODATA
+		}
+		if len(dest) < len(blob) {
+			return 0, syscall.ERANGE
+		}
+		return copy(dest, blob), nil
+	}
+	defer func() { getxattrFn = old }()
+
+	name, got, err := readACL("/irrelevant")
+	if err != nil {
+		t.Fatalf("readACL: %v", err)
+	}
+	if name != xattrNFS4XDR {
+		t.Errorf("readACL named %q, want %q", name, xattrNFS4XDR)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Errorf("readACL returned %x, want the whole list %x", got, blob)
+	}
+	if probes != 0 {
+		t.Errorf("readACL made %d size probes; the read must be a single call, because the attribute can change between two", probes)
+	}
+	if reads != 1 {
+		t.Errorf("readACL read %s %d times, want exactly once", xattrNFS4XDR, reads)
+	}
+}
+
+// TestReadACLRefusesWhatItCannotSize pins the two answers that must not reach the absence
+// branch. Neither is an attribute that is not there: one is longer than any list this
+// package would parse, the other is present and empty. Reading either as absence is the
+// fail-open direction, because a clean verdict carries no error for a caller to refuse on.
+func TestReadACLRefusesWhatItCannotSize(t *testing.T) {
+	tests := map[string]struct {
+		fn func(string, string, []byte) (int, error)
+	}{
+		"a list longer than the parser's ceiling": {
+			fn: func(_, name string, _ []byte) (int, error) {
+				if name != xattrNFS4XDR {
+					return 0, syscall.ENODATA
+				}
+				return 0, syscall.ERANGE
+			},
+		},
+		"a present but zero-length value": {
+			fn: func(_, name string, _ []byte) (int, error) {
+				if name != xattrNFS4XDR {
+					return 0, syscall.ENODATA
+				}
+				return 0, nil
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			old := getxattrFn
+			getxattrFn = tc.fn
+			defer func() { getxattrFn = old }()
+
+			gotName, _, err := readACL("/irrelevant")
+			if err == nil {
+				t.Fatalf("readACL = %q, nil; want a refusal rather than the absence of a list", gotName)
+			}
+			if !errors.Is(err, ErrACLUnreadable) {
+				t.Errorf("readACL error = %v, want it to wrap ErrACLUnreadable", err)
+			}
+		})
+	}
+}
+
+// TestReadACLRefusesTheStringPrincipalDialect pins the refusal that replaced a silent
+// misread. system.nfs4_acl is the attribute nfs4-acl-tools manipulates, and it carries
+// VARIABLE-LENGTH STRING principals rather than the numeric ids of system.nfs4_acl_xdr,
+// which is where every list this parser was built against came from. Decoding one with the
+// other's fixed-size layout misreads ids where the lengths line up and skips entries where
+// they do not, so the answer is a writer set quietly missing a writer.
+//
+// Ignoring the attribute would be the same failure by omission, so it is named instead, and
+// the message has to carry the two knobs an operator can act on.
+func TestReadACLRefusesTheStringPrincipalDialect(t *testing.T) {
+	// A plausible string-principal list: one ACE naming "root@example.com".
+	blob := append(binary.BigEndian.AppendUint32(nil, 0), binary.BigEndian.AppendUint32(nil, 1)...)
+	blob = append(blob, []byte("\x00\x00\x00\x00root@example.com")...)
+
+	t.Run("readACL names the dialect and the knobs", func(t *testing.T) {
+		old := getxattrFn
+		getxattrFn = serveOne(xattrNFS4ACL, blob)
+		defer func() { getxattrFn = old }()
+
+		name, _, err := readACL("/irrelevant")
+		if err == nil {
+			t.Fatalf("readACL = %q, nil; want a refusal naming the dialect it cannot decode", name)
+		}
+		if !errors.Is(err, ErrACLDialectUnsupported) {
+			t.Errorf("readACL error = %v, want it to wrap ErrACLDialectUnsupported", err)
+		}
+		if !errors.Is(err, ErrACLUnreadable) {
+			t.Errorf("readACL error = %v, want it to wrap ErrACLUnreadable so existing matchers keep working", err)
+		}
+		for _, want := range []string{xattrNFS4ACL, "TrustedUIDs", "InstallWithoutCustody"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("readACL error %q does not mention %s", err, want)
+			}
+		}
+	})
+
+	t.Run("the whole check refuses rather than reporting a clean tree", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "pkg-versions")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		defer serveACL(t, root, xattrNFS4ACL, blob)()
+
+		err := verifyCustody(root, trustedWriters{})
+		if !errors.Is(err, ErrNoCustody) || !errors.Is(err, ErrACLDialectUnsupported) {
+			t.Fatalf("verifyCustody error = %v, want ErrNoCustody wrapping ErrACLDialectUnsupported", err)
+		}
+	})
+}
+
+// TestWritersOfTakesNoModeFloorUnderPOSIXACL pins which half of the mode this function may
+// believe, per dialect. It is the one direction in this file that fails CLOSED, and it
+// breaks the feature rather than the guarantee.
+//
+// Under POSIX.1e the mode's group bits are the ACL's MASK, not the GROUP_OBJ grant, so a
+// floor read off them names the owning group as a writer on a list that denies it: a
+// directory owned root:3000 carrying {u::rwx, u:1234:rwx, g::r-x, m::rwx, o::---} stores
+// mode 0770, and the refusal then names gid 3000. Nothing the operator declares clears it,
+// because that group provably cannot write -- and hint() is suppressed once TrustedUIDs is
+// set, so the message names a group and offers nothing. The other bits are the OTHER entry
+// for the same reason, and parsePOSIXACL reads both from the list.
+//
+// Under NFSv4, and with no list at all, the mode IS an independent projection, so the floor
+// stays. Dropping it there would be the fail-open mirror of this bug.
+func TestWritersOfTakesNoModeFloorUnderPOSIXACL(t *testing.T) {
+	const owningGid = 8888
+	const rwx, rx = 7, 5
+	owningGroup := principal{kind: principalGroup, id: owningGid}
+	everyone := principal{kind: principalEveryone}
+	namedUser := principal{kind: principalUser, id: 1234}
+
+	// The measured shape: the mask is rwx, which is what raises the stored mode to 0770,
+	// while the owning group's own entry grants r-x.
+	maskedGroupObj := []posixACLEntry{
+		{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagUser, perm: rwx, id: 1234},
+		{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+		{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagOther, perm: 0, id: aclUndefinedID},
+	}
+
+	tests := map[string]struct {
+		attr    string
+		blob    []byte
+		mode    os.FileMode
+		want    []principal
+		wantErr bool
+	}{
+		"a POSIX.1e mask does not grant the owning group anything": {
+			attr: xattrPOSIXACL, blob: encodePOSIXACL(maskedGroupObj),
+			mode: 0o770, want: []principal{namedUser},
+		},
+		"the POSIX.1e OTHER entry, not the mode's other bits, names everyone": {
+			attr: xattrPOSIXACL,
+			blob: encodePOSIXACL([]posixACLEntry{
+				{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+				{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+				{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+			}),
+			mode: 0o777, want: nil,
+		},
+		"under NFSv4 the mode is an independent projection, so it is still a floor": {
+			attr: xattrNFS4XDR, blob: buildNFS4ACL(nfs4TypeAllow, 0, 0, 0, 0),
+			mode: 0o770, want: []principal{owningGroup},
+		},
+		"with no list at all the mode is the whole answer": {
+			attr: "system.nothing.served", blob: nil,
+			mode: 0o777, want: []principal{owningGroup, everyone},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "component")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			// chmod rather than Mkdir's argument, because the umask would mask it.
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatalf("Chmod: %v", err)
+			}
+			fi, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatalf("Lstat: %v", err)
+			}
+			old := getxattrFn
+			getxattrFn = serveOne(tc.attr, tc.blob)
+			defer func() { getxattrFn = old }()
+
+			got, err := writersOf(dir, fi, &syscall.Stat_t{Gid: owningGid})
+			if err != nil {
+				t.Fatalf("writersOf: %v", err)
+			}
+			if !samePrincipals(got, tc.want) {
+				t.Errorf("writersOf(mode %#o) = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseNFS4ACLRefusesAnUnknownACEType pins the difference between "not ALLOW" and
+// "cannot grant". The three other types RFC 7530 defines are genuinely non-granting -- DENY
+// only ever subtracts, AUDIT and ALARM ask the server to log or signal -- so passing over
+// them is correct. A type this parser does not know is not in that set: a filesystem
+// extension or a future type, silently skipped, drops the writer the entry names, and a
+// writer set missing a writer is a clean verdict no caller can refuse on.
+func TestParseNFS4ACLRefusesAnUnknownACEType(t *testing.T) {
+	const grantedID = 4242
+	tests := map[string]struct {
+		aceType    uint32
+		wantErr    bool
+		wantWriter bool
+	}{
+		"allow, the only type that grants":          {aceType: nfs4TypeAllow, wantWriter: true},
+		"deny, which can only ever subtract":        {aceType: nfs4TypeDeny},
+		"audit, which asks the server to log":       {aceType: nfs4TypeAudit},
+		"alarm, which asks the server to signal":    {aceType: nfs4TypeAlarm},
+		"four, which RFC 7530 does not define":      {aceType: 4, wantErr: true},
+		"a high bit, as a filesystem extension may": {aceType: 0x40000000, wantErr: true},
+		"every bit set": {aceType: 0xFFFFFFFF, wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			blob := buildNFS4ACL(tc.aceType, 0, 0, nfs4WriteData, grantedID)
+			writers, err := parseNFS4ACL(blob, &syscall.Stat_t{Gid: 9})
+			switch {
+			case tc.wantErr && err == nil:
+				t.Fatalf("parseNFS4ACL(type=%d) = %v, nil; want a refusal rather than a writer set that may be missing the granted identity",
+					tc.aceType, writers)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("parseNFS4ACL(type=%d) = %v on a type it is meant to understand", tc.aceType, err)
+			}
+			if err != nil {
+				return
+			}
+			got := slices.Contains(writers, principal{kind: principalUser, id: grantedID})
+			if got != tc.wantWriter {
+				t.Errorf("parseNFS4ACL(type=%d) named uid %d = %v, want %v (writers=%v)",
+					tc.aceType, grantedID, got, tc.wantWriter, writers)
+			}
+		})
+	}
+}
+
+// TestParseNFS4ACLRefusesAnUnknownSpecialPrincipal pins the branch beside the discriminator
+// one. Once whoIsSpecial says the id is a special-principal number, only three numbers are
+// defined; a fourth cannot be resolved to an identity, and guessing it away would drop
+// whatever it names from the writer set.
+func TestParseNFS4ACLRefusesAnUnknownSpecialPrincipal(t *testing.T) {
+	tests := map[string]struct {
+		id      uint32
+		wantErr bool
+	}{
+		"OWNER@, which the caller checks itself":    {id: nfs4WhoOwner},
+		"GROUP@, resolved to the object's gid":      {id: nfs4WhoGroup},
+		"EVERYONE@":                                 {id: nfs4WhoEveryone},
+		"zero, which names no special principal":    {id: 0, wantErr: true},
+		"four, one past the three RFC 7530 defines": {id: 4, wantErr: true},
+		"every bit set":                             {id: 0xFFFFFFFF, wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			blob := buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, tc.id)
+			writers, err := parseNFS4ACL(blob, &syscall.Stat_t{Gid: 9})
+			switch {
+			case tc.wantErr && err == nil:
+				t.Errorf("parseNFS4ACL(special id=%d) = %v, nil; want a refusal rather than a set that may omit the identity it grants",
+					tc.id, writers)
+			case !tc.wantErr && err != nil:
+				t.Errorf("parseNFS4ACL(special id=%d) = %v on a principal RFC 7530 defines", tc.id, err)
+			}
+		})
+	}
+}
+
+// TestParsePOSIXACLRefusesMalformedInput is the POSIX half of the boundary
+// TestParseNFS4ACLRefusesMalformedInput pins for NFSv4. Every refusal in decodePOSIXACL was
+// unwitnessed: the one malformed-ACL test in the suite feeds its blob to the NFSv4 xattr, so
+// this decoder had never seen a bad one.
+//
+// It is the dialect where a short read is most dangerous, because the encoding carries no
+// entry count -- the count is derived from the length, so any truncation to a multiple of the
+// entry size is a well-formed SHORTER list, and a shorter list is a smaller writer set.
+func TestParsePOSIXACLRefusesMalformedInput(t *testing.T) {
+	const rwx, rx = 7, 5
+	valid := encodePOSIXACL([]posixACLEntry{
+		{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagUser, perm: rwx, id: 1234},
+		{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+		{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+	})
+	overCap := append(binary.LittleEndian.AppendUint32(nil, posixACLVersion),
+		make([]byte, (posixACLMaxEntries+1)*posixACLEntrySize)...)
+
+	tests := map[string][]byte{
+		"empty":                          {},
+		"a truncated header":             valid[:posixACLHeaderSize-1],
+		"an unsupported version":         append(binary.LittleEndian.AppendUint32(nil, posixACLVersion+1), valid[posixACLHeaderSize:]...),
+		"one byte short of a whole list": valid[:len(valid)-1],
+		"one byte long":                  append(slices.Clone(valid), 0),
+		"over the entry cap":             overCap,
+		"an unknown entry tag": encodePOSIXACL([]posixACLEntry{
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: 0x40, perm: rwx, id: 1234},
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+		// The three entries every access ACL carries. writersOf takes no mode floor for
+		// this dialect, so a list missing one of them would answer "nobody" for a
+		// principal the object may grant write to.
+		"no owning-group entry": encodePOSIXACL([]posixACLEntry{
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+		"no other entry": encodePOSIXACL([]posixACLEntry{
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+		}),
+		"no owner entry": encodePOSIXACL([]posixACLEntry{
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+		"two owning-group entries": encodePOSIXACL([]posixACLEntry{
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+			{tag: posixTagGroupObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+	}
+	for name, blob := range tests {
+		t.Run(name, func(t *testing.T) {
+			if writers, err := parsePOSIXACL(blob, &syscall.Stat_t{Gid: 8888}); err == nil {
+				t.Errorf("parsePOSIXACL accepted a malformed list and reported %v", writers)
+			}
+		})
+	}
+}
+
+// TestControllersOfWrapsAParseError pins the last unwitnessed path in the sticky exemption.
+// An unreadable list already propagates; a list that reads fine and does not PARSE went
+// through a different return, and a nil error there would exempt a world-writable sticky
+// ancestor on the strength of a list nobody decoded.
+func TestControllersOfWrapsAParseError(t *testing.T) {
+	old := getxattrFn
+	getxattrFn = serveOne(xattrNFS4XDR, []byte("not an acl"))
+	defer func() { getxattrFn = old }()
+
+	got, err := controllersOf("/irrelevant", &syscall.Stat_t{Gid: 9})
+	if err == nil {
+		t.Fatalf("controllersOf = %v, nil; want the parse error, because a list nobody decoded is not a list granting nothing", got)
+	}
+	if !errors.Is(err, ErrACLUnreadable) {
+		t.Errorf("controllersOf error = %v, want it to wrap ErrACLUnreadable", err)
+	}
+}
+
+// nfs4FuzzSeeds are the shapes the NFSv4 parser has to have an answer for: the real captured
+// lists, one entry of every kind, and the boundaries of the encoding itself.
+func nfs4FuzzSeeds(f *testing.F) [][]byte {
+	f.Helper()
+	valid, err := base64.StdEncoding.DecodeString(
+		nfs4Samples["dataset root, owned by apps, mode 0770 with a named admin and a group grant"].b64)
+	if err != nil {
+		f.Fatalf("decoding the fixture: %v", err)
+	}
+	seeds := [][]byte{
+		{},
+		valid,
+		valid[:nfs4HeaderSize],         // a header with no entries
+		valid[:nfs4HeaderSize-1],       // a truncated header
+		valid[:len(valid)-1],           // one byte short of an entry
+		append(slices.Clone(valid), 0), // one byte long
+		binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), 0xFFFFFFFF),    // count larger than body
+		binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), nfs4MaxACEs+1), // over the entry cap
+		buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, 4242),                              // a named user
+		buildNFS4ACL(nfs4TypeAllow, nfs4FlagIdentifierGroup, 0, nfs4WriteData, 77),          // a named group
+		buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, nfs4WhoEveryone),    // EVERYONE@
+		buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, nfs4WhoGroup),       // GROUP@
+		buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, nfs4WhoOwner),       // OWNER@
+		buildNFS4ACL(nfs4TypeAllow, 0, nfs4WhoIsSpecial, nfs4WriteData, 4),                  // an unknown special principal
+		buildNFS4ACL(nfs4TypeAllow, nfs4FlagInheritOnly, 0, nfs4WriteData, 4242),            // inherit-only
+		buildNFS4ACL(nfs4TypeDeny, 0, 0, nfs4WriteData, 4242),                               // a deny entry
+		buildNFS4ACL(9, 0, 0, nfs4WriteData, 4242),                                          // an unknown ace type
+		buildNFS4ACL(nfs4TypeAllow, 0, 7, nfs4WriteData, 4242),                              // an unknown discriminator
+		buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteOwner, 4242),                             // a control grant only
+		buildNFS4ACL(nfs4TypeAllow, 0, 0, 0xFFFFFFFF, 4242),                                 // every access bit
+	}
+	return seeds
+}
+
+// FuzzParseNFS4ACL pins the invariant the whole custody check rests on, against arbitrary
+// bytes: a parse that reports no error must not report a writer set missing a principal the
+// list grants write to. This parser reads untrusted binary input off a filesystem, and its
+// answer decides whether a tree whose binary the consumer executes as root is trusted, so an
+// under-report is not a smaller answer -- it is a clean verdict no call site can refuse on.
+//
+// The oracle is an implication rather than a second decoder: for every entry that plainly
+// grants (ALLOW, applying to this object, carrying a write bit, naming a numeric id or
+// EVERYONE@), the principal must be present. Over-reporting is allowed, because it costs a
+// refusal the operator can answer with TrustedUIDs. The second invariant is cross-function:
+// the control question is asked over a SUBSET of the write bits, so its answer must be a
+// subset of this one -- otherwise the sticky exemption would be judged by a set the write
+// question never saw.
+func FuzzParseNFS4ACL(f *testing.F) {
+	for _, seed := range nfs4FuzzSeeds(f) {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, blob []byte) {
+		const owningGid = 8888
+		stat := &syscall.Stat_t{Gid: owningGid}
+
+		writers, err := parseNFS4ACL(blob, stat)
+		if err != nil {
+			if len(writers) != 0 {
+				t.Fatalf("parseNFS4ACL refused %x and still reported %v; a refusal must carry no writer set", blob, writers)
+			}
+			return
+		}
+		// The parser accepted the list, so its length claims agree with its header. Those
+		// are what make the walk below safe, and a parser that accepted anything else
+		// would be reading entries out of bytes that are not entries.
+		if len(blob) < nfs4HeaderSize {
+			t.Fatalf("parseNFS4ACL accepted %d bytes, which is shorter than the header", len(blob))
+		}
+		count := int(binary.BigEndian.Uint32(blob[4:8]))
+		body := blob[nfs4HeaderSize:]
+		if count > nfs4MaxACEs || len(body) != count*nfs4ACESize {
+			t.Fatalf("parseNFS4ACL accepted a header claiming %d entries with %d bytes of body", count, len(body))
+		}
+
+		for i := range count {
+			ace := body[i*nfs4ACESize : (i+1)*nfs4ACESize]
+			aceType := binary.BigEndian.Uint32(ace[0:4])
+			flag := binary.BigEndian.Uint32(ace[4:8])
+			special := binary.BigEndian.Uint32(ace[8:12])
+			mask := binary.BigEndian.Uint32(ace[12:16])
+			id := binary.BigEndian.Uint32(ace[16:20])
+			if aceType != nfs4TypeAllow || flag&nfs4FlagInheritOnly != 0 || mask&nfs4WriteMask == 0 {
+				continue
+			}
+			var want principal
+			switch {
+			case special == 0 && flag&nfs4FlagIdentifierGroup != 0:
+				want = principal{kind: principalGroup, id: int(id)}
+			case special == 0:
+				want = principal{kind: principalUser, id: int(id)}
+			case id == nfs4WhoGroup:
+				want = principal{kind: principalGroup, id: owningGid}
+			case id == nfs4WhoEveryone:
+				want = principal{kind: principalEveryone}
+			default:
+				// OWNER@, whose ownership the caller checks itself. Every other
+				// discriminator and special number is refused above, so nothing else
+				// reaches here.
+				continue
+			}
+			if !slices.Contains(writers, want) {
+				t.Fatalf("parseNFS4ACL(%x) = %v with no error, but entry %d grants write to %v", blob, writers, i, want)
+			}
+		}
+
+		controllers, ctlErr := parseNFS4Granted(blob, stat, nfs4ControlMask)
+		if ctlErr != nil {
+			return
+		}
+		for _, c := range controllers {
+			if !slices.Contains(writers, c) {
+				t.Fatalf("parseNFS4Granted(%x, control) named %v, which the write question did not report in %v", blob, c, writers)
+			}
+		}
+	})
+}
+
+// posixFuzzSeeds are the shapes the POSIX.1e parser has to have an answer for. The encoding
+// carries no entry count, so the truncation cases matter more here than anywhere else: every
+// length that is a multiple of the entry size is a well-formed SHORTER list.
+func posixFuzzSeeds() [][]byte {
+	const rwx, rw, rx = 7, 6, 5
+	valid := encodePOSIXACL([]posixACLEntry{
+		{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagUser, perm: rwx, id: 1234},
+		{tag: posixTagGroupObj, perm: rw, id: aclUndefinedID},
+		{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+	})
+	return [][]byte{
+		{},
+		valid,
+		encodePOSIXACL(posixACLNamedUserUnderMask),
+		valid[:posixACLHeaderSize],           // a header with no entries
+		valid[:posixACLHeaderSize-1],         // a truncated header
+		valid[:len(valid)-1],                 // one byte short of a whole entry
+		append(slices.Clone(valid), 0),       // one byte long
+		valid[:len(valid)-posixACLEntrySize], // a list truncated to whole entries
+		append(binary.LittleEndian.AppendUint32(nil, posixACLVersion+1), valid[posixACLHeaderSize:]...), // an unsupported version
+		append(binary.LittleEndian.AppendUint32(nil, posixACLVersion),
+			make([]byte, (posixACLMaxEntries+1)*posixACLEntrySize)...), // over the entry cap
+		encodePOSIXACL([]posixACLEntry{ // an unknown tag
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: 0x40, perm: rwx, id: 1234},
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+		encodePOSIXACL([]posixACLEntry{ // two masks, which hide every named writer
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagMask, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagUser, perm: rwx, id: 1234},
+			{tag: posixTagMask, perm: rx, id: aclUndefinedID},
+			{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+		encodePOSIXACL([]posixACLEntry{ // no mask at all, so nothing is capped
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagGroupObj, perm: rw, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rw, id: aclUndefinedID},
+		}),
+		encodePOSIXACL([]posixACLEntry{ // no owning-group entry
+			{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+			{tag: posixTagOther, perm: rx, id: aclUndefinedID},
+		}),
+	}
+}
+
+// FuzzParsePOSIXACL pins the same invariant for the dialect an ordinary Linux volume carries:
+// a parse reporting no error must not omit a principal the list grants write to. It is the
+// stronger of the two targets in one respect, because writersOf takes no mode floor for this
+// dialect -- the mode's group bits are this list's mask -- so the writer set is the whole
+// answer and an omission is invisible.
+//
+// The oracle states the two rules that make the dialect different: the mask is a ceiling on
+// every named entry and on the owning group, and OTHER is not subject to it at all.
+func FuzzParsePOSIXACL(f *testing.F) {
+	for _, seed := range posixFuzzSeeds() {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, blob []byte) {
+		const owningGid = 8888
+
+		writers, err := parsePOSIXACL(blob, &syscall.Stat_t{Gid: owningGid})
+		if err != nil {
+			if len(writers) != 0 {
+				t.Fatalf("parsePOSIXACL refused %x and still reported %v; a refusal must carry no writer set", blob, writers)
+			}
+			return
+		}
+		if len(blob) < posixACLHeaderSize || (len(blob)-posixACLHeaderSize)%posixACLEntrySize != 0 {
+			t.Fatalf("parsePOSIXACL accepted %d bytes, which is not a header followed by whole entries", len(blob))
+		}
+		if v := binary.LittleEndian.Uint32(blob[:posixACLHeaderSize]); v != posixACLVersion {
+			t.Fatalf("parsePOSIXACL accepted version %d", v)
+		}
+		body := blob[posixACLHeaderSize:]
+
+		// At most one mask, because a second one silently retires the first; absent, there
+		// is no ceiling at all.
+		mask, masks := uint16(0xFFFF), 0
+		for i := 0; i < len(body); i += posixACLEntrySize {
+			if binary.LittleEndian.Uint16(body[i:i+2]) == posixTagMask {
+				mask, masks = binary.LittleEndian.Uint16(body[i+2:i+4]), masks+1
+			}
+		}
+		if masks > 1 {
+			t.Fatalf("parsePOSIXACL accepted %d mask entries, so the last one hid every writer under it", masks)
+		}
+
+		for i := 0; i < len(body); i += posixACLEntrySize {
+			tag := binary.LittleEndian.Uint16(body[i : i+2])
+			perm := binary.LittleEndian.Uint16(body[i+2 : i+4])
+			id := binary.LittleEndian.Uint32(body[i+4 : i+8])
+			var want principal
+			switch {
+			case tag == posixTagOther && perm&posixPermWrite != 0:
+				// OTHER is outside the mask in POSIX.1e, however restrictive it is.
+				want = principal{kind: principalEveryone}
+			case perm&mask&posixPermWrite == 0:
+				continue
+			case tag == posixTagUser:
+				want = principal{kind: principalUser, id: int(id)}
+			case tag == posixTagGroup:
+				want = principal{kind: principalGroup, id: int(id)}
+			case tag == posixTagGroupObj:
+				// The owning group, whose id the entry does not carry.
+				want = principal{kind: principalGroup, id: owningGid}
+			default:
+				// USER_OBJ and MASK name no writer of their own.
+				continue
+			}
+			if !slices.Contains(writers, want) {
+				t.Fatalf("parsePOSIXACL(%x) = %v with no error, but the entry at %d grants write to %v", blob, writers, i, want)
+			}
+		}
+	})
 }

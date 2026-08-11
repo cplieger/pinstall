@@ -897,3 +897,51 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 		}
 	})
 }
+
+// TestPublishClearsASymlinkedDestinationThroughTheRoot pins the confinement of the one
+// delete in this package that used to bypass it.
+//
+// publish clears the pinned version directory before renaming the staged tree into place,
+// and that entry is the one entry there another principal may have replaced — it is
+// reachable precisely when the probe rejected what was sitting under an intact sentinel. So
+// the delete goes through an [os.Root] on the installation root, like every other removal
+// inside the tree, and a symlink at that name is unlinked rather than followed: what it
+// points at is outside the tree and is not this package's to delete.
+func TestPublishClearsASymlinkedDestinationThroughTheRoot(t *testing.T) {
+	env := newFakeEnv(t)
+	// A tree outside the installation root, with something in it that must survive.
+	outside := t.TempDir()
+	foreign := filepath.Join(outside, "not-ours")
+	if err := os.WriteFile(foreign, []byte("somebody else's data\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(env.versionsRoot(), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	dst := env.versionDir(pinnedVersion)
+	if err := os.Symlink(outside, dst); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	m := env.manager()
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	if !exists(foreign) {
+		t.Error("clearing the previous version directory deleted through the symlink and escaped the installation tree")
+	}
+	if !exists(outside) {
+		t.Error("clearing the previous version directory removed the tree the symlink pointed at")
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("Lstat the published version directory: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("the published version directory is still the planted symlink, so publish wrote through a foreign pointer")
+	}
+	if !exists(filepath.Join(dst, toolName)) {
+		t.Error("the published version directory does not hold the primary artifact")
+	}
+}

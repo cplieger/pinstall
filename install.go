@@ -1,3 +1,5 @@
+//go:build linux
+
 package pinstall
 
 import (
@@ -518,17 +520,19 @@ func (m *Manager) assemble(stage *stageTree, src string) error {
 	// reports ErrNoVersion with the complete directory sitting right there. Config.
 	// MaxAttempts exists to prevent exactly that loop, and cannot, because each attempt
 	// succeeds.
-	if wide := m.wideArtifact(stage.versionDir); wide != "" {
+	if wide, reason := m.wideArtifact(stage.versionDir); wide != "" {
 		// Same wording discipline as selectActive's refusal twenty lines away, because
 		// this is the same verdict reached one step earlier: name what is wrong in terms
 		// the operator can act on rather than echoing wideArtifact's "." marker, and wrap
-		// ErrNoCustody so a caller can tell a custody refusal from a fetch failure.
-		what := fmt.Sprintf("an entry in it (%s) is", wide)
+		// ErrNoCustody so a caller can tell a custody refusal from a fetch failure. The
+		// reason travels with the name so the operator is not told an entry is writable
+		// when what actually happened is that its access-control list could not be read.
+		what := fmt.Sprintf("an entry in it (%s)", wide)
 		if wide == "." {
-			what = "the directory itself is"
+			what = "the directory itself"
 		}
-		return fmt.Errorf("%w: refusing to publish the version directory %s because %s writable by another principal, and selection would therefore never activate it%s",
-			ErrNoCustody, stage.versionDir, what, m.trust.hint())
+		return fmt.Errorf("%w: refusing to publish the version directory %s because %s %s, and selection would therefore never activate it%s",
+			ErrNoCustody, stage.versionDir, what, reason, m.trust.hint())
 	}
 	if err := m.fsync(stage.versionDir); err != nil {
 		return fmt.Errorf("syncing the staged version directory: %w", err)
@@ -550,9 +554,11 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 	// in a published version directory is a binary this package executes and
 	// another principal can rewrite, which is the integrity gate the pin exists to
 	// provide. It is refused rather than repaired, for the same reason nothing else
-	// here is repaired.
-	if !m.entryPrivate(from, false) {
-		return "", errors.New("writable by another principal, and this package will not publish an artifact it executes that somebody else can rewrite")
+	// here is repaired. The predicate's own diagnosis is carried through, because
+	// "writable" and "its access-control list could not be read" send the operator
+	// to two different places.
+	if reason, private := m.entryPrivate(from, false, os.Geteuid()); !private {
+		return "", fmt.Errorf("%s, and this package will not publish an artifact it executes that it cannot prove is private", reason)
 	}
 	to := filepath.Join(dst, name)
 	if err := m.rename(from, to); err != nil {
@@ -589,7 +595,20 @@ func (m *Manager) publish(stage *stageTree) error {
 	// intact sentinel) and is being replaced. It is untrusted, so removing it is
 	// correct, and the retained predecessor is what covers the crash window
 	// between the remove and the rename.
-	if err := os.RemoveAll(dst); err != nil {
+	//
+	// Untrusted is also why the delete goes through an [os.Root] on the installation root
+	// rather than through the absolute path, which is the rule the rest of this package's
+	// removals already follow (see [Manager.removeUnderRoot]). The entry being cleared is
+	// the one entry here that another principal may have replaced, and the pin is a single
+	// validated path component, so the root handle resolves the tree once and confines the
+	// delete to it: a redirected component cannot turn "clear the rejected version
+	// directory" into a delete somewhere else on the volume.
+	root, err := os.OpenRoot(m.versionsDir)
+	if err != nil {
+		return fmt.Errorf("opening the installation root to clear the previous %s directory: %w", m.cfg.Version, err)
+	}
+	defer root.Close()
+	if err := root.RemoveAll(m.cfg.Version); err != nil {
 		return fmt.Errorf("clearing the previous %s directory: %w", m.cfg.Version, err)
 	}
 	if err := m.rename(stage.versionDir, dst); err != nil {

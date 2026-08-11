@@ -3,10 +3,12 @@ package pinstall
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -603,6 +605,266 @@ func TestRemoveUnderRootCannotEscapeTheInstallationRoot(t *testing.T) {
 
 	if !exists(victim) {
 		t.Error("a delete followed a symlink out of the installation root")
+	}
+}
+
+// TestEntryPrivateRefusesAnEntryOwnedByAnotherIdentity is the only coverage the ownership
+// half of the artifact rule has, and entryPrivate gates activation of every version
+// directory: dropping this check let a binary owned by a stranger be executed as root,
+// because its owner may rewrite it whatever the mode says.
+//
+// The identity doing the asking is a parameter, as it is on [checkSymlink], so the rule gates
+// at any privilege: no fixture an unprivileged process can create belongs to anybody else,
+// and a rule that read its identity from the ambient process would be pinned only where
+// privilege exists — the root-only-green shape that once left the trusted-writer knobs
+// disconnected with CI green.
+func TestEntryPrivateRefusesAnEntryOwnedByAnotherIdentity(t *testing.T) {
+	const stranger = 4242
+
+	env := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "artifact")
+	if err := os.WriteFile(path, []byte("x"), 0o700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if os.Geteuid() == 0 {
+		// Root's own files are trusted whatever euid is asked about, so as root the
+		// fixture has to belong to somebody else — which root is the one identity able to
+		// arrange.
+		if err := os.Chown(path, stranger, -1); err != nil {
+			t.Fatalf("chown the fixture to uid %d: %v", stranger, err)
+		}
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("the filesystem reported no ownership information for the fixture")
+	}
+	owner := int(stat.Uid)
+	if owner == 0 {
+		t.Fatalf("the fixture is owned by root, which is trusted whoever asks, so this test would prove nothing")
+	}
+	// Neither the owner nor root: an identity for which the fixture is somebody else's.
+	other := owner + 1
+
+	m := env.manager()
+	if _, private := m.entryPrivate(path, false, owner); !private {
+		t.Fatalf("entryPrivate refused an entry owned by the identity running the check, so the fixture is wrong")
+	}
+	if reason, private := m.entryPrivate(path, false, other); private {
+		t.Errorf("entryPrivate accepted an entry owned by uid %d when asked as uid %d; that user can rewrite a binary this package executes", owner, other)
+	} else if want := fmt.Sprintf("is owned by uid %d", owner); reason != want {
+		t.Errorf("entryPrivate reason = %q, want %q: the operator has to be told which identity owns it", reason, want)
+	}
+	declared := env.manager(func(c *Config) { c.TrustedUIDs = []int{owner} })
+	if _, private := declared.entryPrivate(path, false, other); !private {
+		t.Errorf("entryPrivate refused uid %d after the caller declared it, which is the whole point of the declaration", owner)
+	}
+}
+
+// TestEntryPrivateFailsClosedWhenTheListCannotBeRead pins the direction of the one error
+// entryPrivate cannot resolve, AND the words it reports it in. An access-control list it
+// could not evaluate is not proof there is nothing to find, and this predicate's answer
+// decides whether a version directory is activated, so "I could not look" must never come
+// back as "there was nothing there".
+//
+// The wording half is the operator's half, and it is the reason this predicate returns a
+// diagnosis rather than a bool. ErrACLUnreadable and ErrACLDialectUnsupported exist to
+// separate "could not be evaluated" from "a stranger can write", so a refusal that reports
+// the second for the first sends the operator to chmod a mode that is already correct while
+// the real obstacle — a dialect, a seccomp filter denying getxattr, an I/O error — goes
+// unmentioned.
+func TestEntryPrivateFailsClosedWhenTheListCannotBeRead(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+	euid := os.Geteuid()
+	path := filepath.Join(t.TempDir(), "artifact")
+	if err := os.WriteFile(path, []byte("x"), 0o700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, private := m.entryPrivate(path, false, euid); !private {
+		t.Fatalf("entryPrivate refused a private fixture, so this test would prove nothing")
+	}
+
+	old := getxattrFn
+	getxattrFn = func(string, string, []byte) (int, error) { return 0, syscall.EIO }
+	defer func() { getxattrFn = old }()
+
+	reason, private := m.entryPrivate(path, false, euid)
+	if private {
+		t.Fatal("entryPrivate accepted an entry whose access-control list it could not read")
+	}
+	if !strings.Contains(reason, "could not be evaluated") {
+		t.Errorf("entryPrivate reason = %q, want one saying the list could not be evaluated", reason)
+	}
+	if strings.Contains(reason, "writable") {
+		t.Errorf("entryPrivate reason = %q: nobody was found writable here, and reporting one sends the operator to fix a mode that is already correct", reason)
+	}
+}
+
+// TestEntryPrivateRefusesASymlinkAsASymlink pins the one refusal whose diagnosis the
+// operator cannot act on if it is reported by mode.
+//
+// A symlink's own mode is 0777 on every Linux system and grants nothing. Judged by that
+// mode it reports an entry everyone can write, and chmod cannot fix it: chmod follows the
+// link to its target, so the operator changes a different object and the exclusion stays.
+// checkSymlink states this rule for the path walk; this is the copy that has to agree, and
+// it also closes a fail-OPEN window — Getxattr follows the link, so a link whose TARGET
+// carries a POSIX.1e list was judged by the target's list under the link's own stat.
+func TestEntryPrivateRefusesASymlinkAsASymlink(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "artifact")
+	if err := os.WriteFile(target, []byte("x"), 0o700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	reason, private := m.entryPrivate(link, false, os.Geteuid())
+	if private {
+		t.Fatal("entryPrivate accepted a symlink; this package executes what is in a version directory, and a link is not that file")
+	}
+	if !strings.Contains(reason, "symlink") {
+		t.Errorf("entryPrivate reason = %q, want one naming it a symlink: reported by mode the operator is told everyone can write it, and chmod on a link follows to its target", reason)
+	}
+	if strings.Contains(reason, "writable") {
+		t.Errorf("entryPrivate reason = %q: a link's 0777 mode is not a grant, and reporting it as one is an exclusion nobody can clear", reason)
+	}
+}
+
+// TestWideArtifactNamesTheSymlinkItRefuses is the same rule one level up, where selection
+// and publication actually ask it: a symlink planted in a version directory is a top-level
+// entry PathEntry exposes, so it is refused by name with a reason the operator can read.
+func TestWideArtifactNamesTheSymlinkItRefuses(t *testing.T) {
+	env := newFakeEnv(t)
+	dir := env.placeVersion(pinnedVersion)
+	m := env.manager()
+	if entry, reason := m.wideArtifact(dir); entry != "" {
+		t.Fatalf("wideArtifact = (%q, %q) on a clean directory, want no offender", entry, reason)
+	}
+
+	if err := os.Symlink(filepath.Join(dir, toolName), filepath.Join(dir, "planted")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	entry, reason := m.wideArtifact(dir)
+	if entry != "planted" {
+		t.Errorf("wideArtifact = %q, want the planted link: it sits on PATH like every other entry there", entry)
+	}
+	if !strings.Contains(reason, "symlink") {
+		t.Errorf("wideArtifact reason = %q, want one naming the symlink", reason)
+	}
+}
+
+// TestSelectionAndRetentionAgreeOnEveryRefusal is the coupling test for the shared
+// predicate, and it is the whole reason there is one.
+//
+// Retention's claim about itself is that it counts a version towards the retained set only
+// when selection would activate it. Nothing enforced that claim while the two ran their own
+// copies of the same three checks: a fourth check added to selection would have silently
+// missed retention, which prunes on this answer and would then have deleted the fallback
+// selection would have kept — in exactly the situation the fallback exists for. The
+// property is agreement, so the test asserts agreement rather than either answer.
+func TestSelectionAndRetentionAgreeOnEveryRefusal(t *testing.T) {
+	tests := map[string]struct {
+		setup       func(t *testing.T, env *fakeEnv, dir string)
+		mutate      func(c *Config)
+		activatable bool
+	}{
+		"a clean directory": {
+			setup:       func(*testing.T, *fakeEnv, string) {},
+			activatable: true,
+		},
+		"an entry another principal can write": {
+			setup: func(t *testing.T, _ *fakeEnv, dir string) {
+				t.Helper()
+				if err := os.Chmod(filepath.Join(dir, toolName), 0o777); err != nil {
+					t.Fatalf("chmod the artifact: %v", err)
+				}
+			},
+		},
+		"a symlink planted in the directory": {
+			setup: func(t *testing.T, _ *fakeEnv, dir string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(dir, toolName), filepath.Join(dir, "planted")); err != nil {
+					t.Fatalf("Symlink: %v", err)
+				}
+			},
+		},
+		"an artifact reporting another version": {
+			setup: func(t *testing.T, _ *fakeEnv, dir string) {
+				t.Helper()
+				if err := writeFakeBinary(filepath.Join(dir, toolName), "1.0.0"); err != nil {
+					t.Fatalf("writeFakeBinary: %v", err)
+				}
+			},
+		},
+		"a tree the caller declared untrusted": {
+			setup:  func(*testing.T, *fakeEnv, string) {},
+			mutate: func(c *Config) { c.Untrusted = true },
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := newFakeEnv(t)
+			dir := env.placeVersion(pinnedVersion)
+			tc.setup(t, env, dir)
+			mutate := []func(*Config){}
+			if tc.mutate != nil {
+				mutate = append(mutate, tc.mutate)
+			}
+			m := env.manager(mutate...)
+			m.checkCustody()
+
+			sel, selected := m.selectActive(context.Background())
+			retained := m.usableAsFallback(context.Background(), pinnedVersion)
+			if selected != retained {
+				t.Errorf("selectActive = %v but usableAsFallback = %v for the same directory; retention promises the answers agree, and a retained version selection refuses is not a fallback",
+					selected, retained)
+			}
+			if selected != tc.activatable {
+				t.Errorf("selectActive selected %q (%v), want activatable = %v", sel.version, selected, tc.activatable)
+			}
+		})
+	}
+}
+
+// TestTrustedAnswersWithTheVerdictThatProducedIt pins that the decision and the reason for
+// it come from ONE acquisition of the state lock.
+//
+// selectActive reports both in a single log record. Asking twice — the predicate, then the
+// verdict — meant a verdict that changed between the two acquisitions produced a record
+// whose reason belonged to a decision nothing had made, which is the worst kind of
+// diagnostic: authoritative and wrong.
+func TestTrustedAnswersWithTheVerdictThatProducedIt(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion(pinnedVersion)
+	clean := env.manager()
+	clean.checkCustody()
+	if mayActivate, verdict := clean.trusted(pinnedVersion); !mayActivate || verdict != nil {
+		t.Errorf("trusted on a private tree = (%v, %v), want (true, nil)", mayActivate, verdict)
+	}
+
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatalf("chmod the install root: %v", err)
+	}
+	m := env.manager()
+	m.checkCustody()
+
+	mayActivate, verdict := m.trusted(pinnedVersion)
+	if mayActivate {
+		t.Fatal("trusted accepted a planted version in a tree this process does not control")
+	}
+	if !errors.Is(verdict, ErrNoCustody) {
+		t.Errorf("trusted verdict = %v, want the custody verdict that refused it", verdict)
+	}
+	if verdict != m.custodyVerdict() {
+		t.Errorf("trusted verdict = %v, custodyVerdict = %v: the answer and its reason must be the same read", verdict, m.custodyVerdict())
 	}
 }
 

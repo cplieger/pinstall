@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package pinstall installs, activates and maintains a digest-pinned upstream
 // release.
 //

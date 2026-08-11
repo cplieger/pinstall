@@ -548,6 +548,25 @@ func TestBackoffDoublesAndCaps(t *testing.T) {
 	}
 }
 
+// TestBackoffCapsTheFirstWaitToo pins the cap on the one wait the doubling loop never
+// reaches. n == 1 runs the loop zero times, so a RetryBackoff above the cap was returned
+// verbatim: a caller configuring an hour waited an hour before the first retry, from a
+// function documented to cap at ten minutes. Config validation does not cover it either —
+// it only replaces a non-positive value with the default.
+func TestBackoffCapsTheFirstWaitToo(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager(func(c *Config) { c.RetryBackoff = time.Hour })
+
+	if got := m.backoff(1); got != maxRetryBackoff {
+		t.Errorf("backoff(1) = %v, want the %v cap", got, maxRetryBackoff)
+	}
+	// And the doubling path from an already-capped start stays capped rather than
+	// overflowing past it.
+	if got := m.backoff(2); got != maxRetryBackoff {
+		t.Errorf("backoff(2) = %v, want the %v cap", got, maxRetryBackoff)
+	}
+}
+
 // TestSleepCtxHonoursCancellation pins that the backoff wait is cancellable, so a
 // shutdown during a retry window does not block on a timer.
 func TestSleepCtxHonoursCancellation(t *testing.T) {
