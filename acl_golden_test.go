@@ -640,12 +640,12 @@ func TestReadACLReadsTheListInOneCall(t *testing.T) {
 	}
 	defer func() { getxattrFn = old }()
 
-	name, got, err := readACL("/irrelevant")
+	dialect, got, err := readACL("/irrelevant")
 	if err != nil {
 		t.Fatalf("readACL: %v", err)
 	}
-	if name != xattrNFS4XDR {
-		t.Errorf("readACL named %q, want %q", name, xattrNFS4XDR)
+	if dialect == nil || dialect.xattr != xattrNFS4XDR {
+		t.Errorf("readACL named %v, want %q", dialect, xattrNFS4XDR)
 	}
 	if !bytes.Equal(got, blob) {
 		t.Errorf("readACL returned %x, want the whole list %x", got, blob)
@@ -689,9 +689,9 @@ func TestReadACLRefusesWhatItCannotSize(t *testing.T) {
 			getxattrFn = tc.fn
 			defer func() { getxattrFn = old }()
 
-			gotName, _, err := readACL("/irrelevant")
+			gotDialect, _, err := readACL("/irrelevant")
 			if err == nil {
-				t.Fatalf("readACL = %q, nil; want a refusal rather than the absence of a list", gotName)
+				t.Fatalf("readACL = %v, nil; want a refusal rather than the absence of a list", gotDialect)
 			}
 			if !errors.Is(err, ErrACLUnreadable) {
 				t.Errorf("readACL error = %v, want it to wrap ErrACLUnreadable", err)
@@ -719,9 +719,9 @@ func TestReadACLRefusesTheStringPrincipalDialect(t *testing.T) {
 		getxattrFn = serveOne(xattrNFS4ACL, blob)
 		defer func() { getxattrFn = old }()
 
-		name, _, err := readACL("/irrelevant")
+		dialect, _, err := readACL("/irrelevant")
 		if err == nil {
-			t.Fatalf("readACL = %q, nil; want a refusal naming the dialect it cannot decode", name)
+			t.Fatalf("readACL = %v, nil; want a refusal naming the dialect it cannot decode", dialect)
 		}
 		if !errors.Is(err, ErrACLDialectUnsupported) {
 			t.Errorf("readACL error = %v, want it to wrap ErrACLDialectUnsupported", err)

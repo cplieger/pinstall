@@ -19,11 +19,114 @@ const (
 	xattrNFS4XDR  = "system.nfs4_acl_xdr" // OpenZFS on Linux
 )
 
-// aclXattrs is the order [writersOf] looks for an ACL. POSIX.1e first because it is the
-// common case on an ordinary Linux volume. system.nfs4_acl is consulted although no parser
-// here decodes it: finding it is what turns an undecodable grant into a refusal that names
-// the dialect, rather than a grant nobody looked for. See [ErrACLDialectUnsupported].
-var aclXattrs = []string{xattrPOSIXACL, xattrNFS4ACL, xattrNFS4XDR}
+// aclDialect is everything this package knows about ONE access-control-list encoding:
+// which attribute carries it, how large such a list may get, how to decode it, whether the
+// mode names principals independently of it, and whether it can express control grants.
+//
+// One row per dialect, because the alternative is what this replaced: six functions each
+// re-deriving "which dialect is this?" from a string comparison against the same three
+// constants, with nothing holding their answers together. A dialect whose row said it could
+// not be decoded could still be handed to a parser by a switch that had not been updated,
+// and the only thing standing behind that was an unreachable default case. Adding a dialect
+// is now adding a row.
+type aclDialect struct {
+	// parse names the principals this dialect's list grants write to. NIL means an encoding
+	// this package deliberately does not decode, which is a refusal that names the dialect
+	// rather than a grant nobody looked for; see undecodable and [ErrACLDialectUnsupported].
+	parse func(blob []byte, stat *syscall.Stat_t) ([]principal, error)
+	// controls names the principals that can dismantle the object's own protection rather
+	// than merely write through it. Nil means the dialect cannot express any such grant, so
+	// the answer is nothing rather than a guess; see [controllersOf].
+	controls func(blob []byte, stat *syscall.Stat_t) ([]principal, error)
+	// xattr is the extended attribute carrying a list in this dialect.
+	xattr string
+	// undecodable is the clause explaining a nil parse to an operator. Required when parse
+	// is nil, and forbidden otherwise.
+	undecodable string
+	// ceiling is the largest list of this shape the parser would accept, and therefore the
+	// buffer size that makes ONE getxattr sufficient. It MUST be positive, and that is not
+	// a style rule: getxattr with a zero-length buffer is the SIZE-PROBE form, which
+	// answers the attribute's full length with a NIL error (measured by
+	// TestGetxattrZeroBufferIsASizeProbe, not assumed). A row that forgot this field would
+	// silently turn the read into a probe whose length then indexes past the buffer.
+	// [getxattrAll] refuses that rather than slicing, and [validateACLDialects] rejects the
+	// row at startup so it cannot ship.
+	ceiling int
+	// modeFloor says the mode's group and other write bits name the object's group and
+	// everyone INDEPENDENTLY of the list, so they are added to whatever it grants. False
+	// for POSIX.1e, where the mode's group bits are the list's MASK rather than a grant —
+	// reading them as a floor is the fail-CLOSED bug documented on [writersOf], so this
+	// field is the one place that distinction is recorded.
+	//
+	// Field order here is govet fieldalignment's, not a reading order: the pointer-bearing
+	// fields lead so the garbage collector scans 40 bytes rather than 64.
+	modeFloor bool
+}
+
+// aclDialects is every dialect this package recognises, in the ORDER an object is probed.
+// POSIX.1e first because it is the common case on an ordinary Linux volume. system.nfs4_acl
+// is probed although nothing decodes it, because finding it is what turns an undecodable
+// grant into a named refusal instead of a grant nobody looked for.
+//
+// The parsers referenced here are defined further down this file.
+var aclDialects = []aclDialect{{
+	xattr:     xattrPOSIXACL,
+	ceiling:   posixACLHeaderSize + posixACLMaxEntries*posixACLEntrySize,
+	parse:     parsePOSIXACL,
+	modeFloor: false,
+	// POSIX.1e cannot grant WRITE_ACL, WRITE_OWNER or DELETE_CHILD: chmod and chown stay
+	// with the owner, whom every caller checks separately, and removal is the kernel's
+	// sticky rule with nothing in the list able to override it.
+	controls: nil,
+}, {
+	xattr:   xattrNFS4ACL,
+	ceiling: nfs4HeaderSize + nfs4MaxACEs*nfs4ACESize,
+	// Deliberately undecodable. This attribute carries VARIABLE-LENGTH STRING principals
+	// ("root@example.com"), not the numeric ids of the XDR encoding below, so the
+	// fixed-size layout would misread ids wherever the lengths happen to line up and skip
+	// entries wherever they do not — a writer set quietly missing a writer.
+	parse:       nil,
+	undecodable: "which carries string principals rather than the numeric ids of " + xattrNFS4XDR,
+}, {
+	xattr:     xattrNFS4XDR,
+	ceiling:   nfs4HeaderSize + nfs4MaxACEs*nfs4ACESize,
+	parse:     parseNFS4ACL,
+	modeFloor: true,
+	controls: func(blob []byte, stat *syscall.Stat_t) ([]principal, error) {
+		return parseNFS4Granted(blob, stat, nfs4ControlMask)
+	},
+}}
+
+func init() { validateACLDialects(aclDialects) }
+
+// validateACLDialects panics on a malformed table at startup. Panicking is right here and
+// nowhere else in this package: the table is a compile-time constant of the program, so a
+// bad row is a build defect rather than anything an operator did, and every alternative
+// degrades a custody decision at runtime instead. A zero ceiling in particular would make
+// the read a size probe (see [aclDialect.ceiling]).
+//
+// It takes the table as a parameter rather than reading the global, so a test can hand it a
+// malformed row: a validator nothing can drive with bad input is a validator nothing gates.
+func validateACLDialects(dialects []aclDialect) {
+	seen := make(map[string]bool, len(dialects))
+	for _, d := range dialects {
+		switch {
+		case d.xattr == "":
+			panic("pinstall: an ACL dialect has no attribute name")
+		case seen[d.xattr]:
+			panic("pinstall: duplicate ACL dialect " + d.xattr)
+		case d.ceiling <= 0:
+			panic("pinstall: ACL dialect " + d.xattr + " has no ceiling, which would make getxattr a size probe")
+		case d.parse == nil && d.undecodable == "":
+			panic("pinstall: undecodable ACL dialect " + d.xattr + " does not say why")
+		case d.parse != nil && d.undecodable != "":
+			panic("pinstall: decodable ACL dialect " + d.xattr + " carries an undecodable reason")
+		case d.parse == nil && d.controls != nil:
+			panic("pinstall: undecodable ACL dialect " + d.xattr + " claims to report control grants")
+		}
+		seen[d.xattr] = true
+	}
+}
 
 // principalKind distinguishes the three things an ACL entry can name.
 type principalKind uint8
@@ -188,12 +291,14 @@ var ErrACLDialectUnsupported = fmt.Errorf("%w: the dialect is not one this parse
 // The owner is deliberately NOT included. Every caller checks ownership separately and
 // has more to say about it than this function does.
 func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, error) {
-	name, blob, err := readACL(path)
+	dialect, blob, err := readACL(path)
 	if err != nil {
 		return nil, err
 	}
 	var out []principal
-	if name != xattrPOSIXACL {
+	// No list at all is the mode-floor case too: with nothing to read, the mode is the only
+	// statement about who can write.
+	if dialect == nil || dialect.modeFloor {
 		perm := fi.Mode().Perm()
 		if perm&0o020 != 0 {
 			out = append(out, principal{kind: principalGroup, id: int(stat.Gid)})
@@ -202,18 +307,23 @@ func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, 
 			out = append(out, principal{kind: principalEveryone})
 		}
 	}
-	if name == "" {
+	if dialect == nil {
 		return out, nil
 	}
-	granted, err := parseACL(name, blob, stat)
+	granted, err := dialect.parse(blob, stat)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, name, err)
+		return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, dialect.xattr, err)
 	}
 	return append(out, granted...), nil
 }
 
-// readACL returns the name and contents of the first access-control list attribute path
-// carries, or "" when it carries none.
+// readACL returns the dialect and contents of the first access-control list attribute path
+// carries, or a nil dialect when it carries none.
+//
+// It returns the DIALECT rather than an attribute name so its callers cannot disagree with
+// it about what that name implies. Every property they need — whether the mode is a floor,
+// which parser decodes the blob, whether control grants are expressible — travels with the
+// answer instead of being re-derived from a string.
 //
 // A filesystem without extended-attribute support answers ENOTSUP or ENODATA, which
 // genuinely means there is no list to read. Every other error is returned: reading the
@@ -227,48 +337,51 @@ func writersOf(path string, fi os.FileInfo, stat *syscall.Stat_t) ([]principal, 
 // write to, which is the sandbox making the check weaker rather than stricter.
 //
 // A list in a dialect no parser here understands is on that second side too, and refuses
-// by name rather than being decoded with a layout that does not fit it. See
-// [ErrACLDialectUnsupported].
-func readACL(path string) (name string, blob []byte, err error) {
-	for _, candidate := range aclXattrs {
-		found, readErr := getxattrAll(path, candidate)
+// by name rather than being decoded with a layout that does not fit it. That is now a
+// property of the dialect's own row (a nil parse) rather than a name this function
+// special-cases. See [ErrACLDialectUnsupported].
+func readACL(path string) (*aclDialect, []byte, error) {
+	for i := range aclDialects {
+		dialect := &aclDialects[i]
+		found, readErr := getxattrAll(path, dialect)
 		switch {
-		case readErr == nil && candidate == xattrNFS4ACL:
-			return "", nil, fmt.Errorf("%w: %s holds %s, which carries string principals rather than the numeric ids of %s; name the identities allowed to write it in Config.TrustedUIDs or Config.TrustedGIDs, or waive the check with Config.InstallWithoutCustody",
-				ErrACLDialectUnsupported, path, xattrNFS4ACL, xattrNFS4XDR)
+		case readErr == nil && dialect.parse == nil:
+			return nil, nil, fmt.Errorf("%w: %s holds %s, %s; name the identities allowed to write it in Config.TrustedUIDs or Config.TrustedGIDs, or waive the check with Config.InstallWithoutCustody",
+				ErrACLDialectUnsupported, path, dialect.xattr, dialect.undecodable)
 		case readErr == nil:
-			return candidate, found, nil
+			return dialect, found, nil
 		case errors.Is(readErr, syscall.ENODATA), errors.Is(readErr, syscall.ENOTSUP),
 			errors.Is(readErr, syscall.EOPNOTSUPP):
 			continue
 		default:
-			return "", nil, fmt.Errorf("%w: reading %s of %s: %w", ErrACLUnreadable, candidate, path, readErr)
+			return nil, nil, fmt.Errorf("%w: reading %s of %s: %w", ErrACLUnreadable, dialect.xattr, path, readErr)
 		}
 	}
-	return "", nil, nil
+	return nil, nil, nil
 }
 
 // controllersOf returns every principal that can dismantle path's OWN protection -- take
 // the ownership that gates chmod and chown, rewrite the access-control list, or remove an
 // entry it does not own -- as opposed to one that can merely write inside it.
 //
-// Only NFSv4 can express any of those grants. Under POSIX.1e chmod and chown stay with the
-// owner, whom the caller checks separately, removal is the kernel's sticky rule with nothing
-// in the list able to override it, and no mode bit confers any of the three, so the answer
-// is nothing rather than a guess.
+// Only NFSv4 can express any of those grants, which is recorded as a nil controls on every
+// other dialect's row rather than as a name compared here. Under POSIX.1e chmod and chown
+// stay with the owner, whom the caller checks separately, removal is the kernel's sticky
+// rule with nothing in the list able to override it, and no mode bit confers any of the
+// three, so the answer is nothing rather than a guess.
 func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
-	name, blob, err := readACL(path)
+	dialect, blob, err := readACL(path)
 	if err != nil {
 		return nil, err
 	}
-	if name == xattrNFS4XDR {
-		granted, err := parseNFS4Granted(blob, stat, nfs4ControlMask)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, name, err)
-		}
-		return granted, nil
+	if dialect == nil || dialect.controls == nil {
+		return nil, nil
 	}
-	return nil, nil
+	granted, err := dialect.controls(blob, stat)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s holds %s: %w", ErrACLUnreadable, path, dialect.xattr, err)
+	}
+	return granted, nil
 }
 
 // getxattrAll reads an access-control list attribute in ONE call, into a buffer sized to
@@ -290,8 +403,18 @@ func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
 // refused for the same reason: the kernel reports an absent attribute as ENODATA, so a
 // present-but-empty one is a shape no parser here can explain. Neither is returned as
 // ENODATA, so both reach [readACL]'s unreadable path instead of its absence path.
-func getxattrAll(path, attr string) ([]byte, error) {
-	buf := make([]byte, aclCeiling(attr))
+//
+// The final guard is the one that looks unreachable and is not. getxattr with a
+// ZERO-LENGTH buffer is the size-probe form: it answers the attribute's full length with a
+// nil error rather than ERANGE (measured on Linux, and pinned by
+// TestGetxattrAllRefusesASizeProbe). So a dialect row with no ceiling would turn this read
+// into a probe, and the length it returned would then index past a buffer of length zero —
+// a panic in the middle of a custody decision. [validateACLDialects] makes that row
+// unshippable and this branch refuses it anyway, because a bounds check standing between an
+// arithmetic mistake and a panic is worth two lines whatever the table says.
+func getxattrAll(path string, dialect *aclDialect) ([]byte, error) {
+	attr := dialect.xattr
+	buf := make([]byte, dialect.ceiling)
 	n, err := getxattrFn(path, attr, buf)
 	switch {
 	case errors.Is(err, syscall.ERANGE):
@@ -301,39 +424,15 @@ func getxattrAll(path, attr string) ([]byte, error) {
 	case n <= 0:
 		return nil, fmt.Errorf("%s is present but %d bytes long, which is not a list this parser can read", attr, n)
 	case n > len(buf):
-		return nil, fmt.Errorf("%s answered %d bytes into a %d byte buffer", attr, n, len(buf))
+		return nil, fmt.Errorf("%s answered %d bytes into a %d byte buffer, which is the size-probe reply rather than a list", attr, n, len(buf))
 	}
 	return buf[:n], nil
-}
-
-// aclCeiling returns the largest value the parser for attr would accept, which is the
-// buffer size that makes one getxattr sufficient. Anything longer is over a limit that
-// parser already refuses, so the ERANGE it produces is the same refusal arriving earlier.
-func aclCeiling(attr string) int {
-	if attr == xattrPOSIXACL {
-		return posixACLHeaderSize + posixACLMaxEntries*posixACLEntrySize
-	}
-	return nfs4HeaderSize + nfs4MaxACEs*nfs4ACESize
 }
 
 // getxattrFn is syscall.Getxattr, replaced in tests: no ordinary test process can mount
 // a filesystem that serves an NFSv4 ACL, and that dialect drives the branch this
 // package most needs covered.
 var getxattrFn = syscall.Getxattr
-
-// parseACL dispatches on the attribute name.
-//
-// xattrNFS4ACL is deliberately absent: [readACL] refuses that dialect by name rather than
-// handing it to a decoder whose layout does not fit it, so a blob in it never reaches here.
-func parseACL(name string, blob []byte, stat *syscall.Stat_t) ([]principal, error) {
-	switch name {
-	case xattrPOSIXACL:
-		return parsePOSIXACL(blob, stat)
-	case xattrNFS4XDR:
-		return parseNFS4ACL(blob, stat)
-	}
-	return nil, fmt.Errorf("unknown access-control list dialect %q", name)
-}
 
 // parsePOSIXACL returns the principals a POSIX.1e access ACL grants write to, other than
 // the owner.
