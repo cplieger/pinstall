@@ -2,7 +2,7 @@ module github.com/cplieger/pinstall/v2
 
 go 1.26.6
 
-require github.com/cplieger/pathinside v1.0.0
+require github.com/cplieger/pathinside v1.0.1
 
 // v2.0.1 is the SAME TREE as v2.1.0 — both tag ef37c2f. It is the patch number the
 // changelog tool computed for a span of `sec:` commits, published as a lightweight tag;
