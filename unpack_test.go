@@ -38,7 +38,7 @@ func TestUnpackZipRefusesEscapingEntries(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			base, out := nestedExtractionDir(t)
 			archive := zipReader(t, map[string]zipEntry{entry: {body: "pwned", mode: 0o644}})
-			if err := UnpackZip(context.Background(), archive, openRoot(t, out)); err == nil {
+			if err := UnpackZip(t.Context(), archive, openRoot(t, out)); err == nil {
 				t.Errorf("UnpackZip accepted an archive holding %q", entry)
 			}
 			// The extraction directory is nested deep enough that every relative
@@ -111,7 +111,7 @@ func TestUnpackZipAcceptsTheEntriesALegitimateArchiveCarries(t *testing.T) {
 		"pkg/lib/README.md": {body: "docs\n", mode: 0o644},
 	}
 	out := t.TempDir()
-	if err := UnpackZip(context.Background(), zipReader(t, entries), openRoot(t, out)); err != nil {
+	if err := UnpackZip(t.Context(), zipReader(t, entries), openRoot(t, out)); err != nil {
 		t.Fatalf("UnpackZip refused a legitimate archive: %v", err)
 	}
 	for _, want := range []string{"tool", "pkg/bin/tool", ".config/x", "pkg/tool", "pkg/lib/README.md"} {
@@ -130,7 +130,7 @@ func TestUnpackZipUnpacksARealArchive(t *testing.T) {
 		"pkg/install.sh":    {body: "#!/bin/sh\n", mode: 0o777},
 		"pkg/lib/README.md": {body: "docs\n", mode: 0o644},
 	})
-	if err := UnpackZip(context.Background(), archive, openRoot(t, out)); err != nil {
+	if err := UnpackZip(t.Context(), archive, openRoot(t, out)); err != nil {
 		t.Fatalf("UnpackZip: %v", err)
 	}
 	fi, err := os.Stat(filepath.Join(out, "pkg", "install.sh"))
@@ -159,7 +159,7 @@ func TestUnpackZipRefusesADuplicateEntryName(t *testing.T) {
 		{name: "pkg/tool", zipEntry: zipEntry{body: "second\n", mode: 0o666}},
 	})
 	out := t.TempDir()
-	err := UnpackZip(context.Background(), bytesReader(raw), openRoot(t, out))
+	err := UnpackZip(t.Context(), bytesReader(raw), openRoot(t, out))
 	if err == nil {
 		t.Fatal("UnpackZip accepted an archive carrying the same entry name twice")
 	}
@@ -192,7 +192,7 @@ func TestUnpackZipHonoursCancellation(t *testing.T) {
 // TestUnpackZipRefusesAnUnreadableArchive pins the cheapest failure: bytes that
 // are not a zip at all are reported, not treated as an empty archive.
 func TestUnpackZipRefusesAnUnreadableArchive(t *testing.T) {
-	if err := UnpackZip(context.Background(), bytesReader([]byte("PK-ish but not really")), openRoot(t, t.TempDir())); err == nil {
+	if err := UnpackZip(t.Context(), bytesReader([]byte("PK-ish but not really")), openRoot(t, t.TempDir())); err == nil {
 		t.Error("UnpackZip accepted bytes that are not a zip archive")
 	}
 }
@@ -208,7 +208,7 @@ func TestUnpackZipRefusesTooManyEntries(t *testing.T) {
 	}
 	raw := buildZipOrdered(t, entries)
 	out := t.TempDir()
-	err := UnpackZip(context.Background(), bytesReader(raw), openRoot(t, out))
+	err := UnpackZip(t.Context(), bytesReader(raw), openRoot(t, out))
 	if err == nil || !strings.Contains(err.Error(), "over the") {
 		t.Fatalf("UnpackZip error = %v, want an entry-count refusal", err)
 	}
@@ -323,7 +323,7 @@ func FuzzUnpackZipEntryNames(f *testing.F) {
 			t.Fatalf("OpenRoot: %v", rootErr)
 		}
 		defer root.Close()
-		unpackErr := UnpackZip(context.Background(), bytesReader(raw), root)
+		unpackErr := UnpackZip(t.Context(), bytesReader(raw), root)
 
 		// Two oracles, because neither is sufficient alone. The filesystem one is
 		// exact but bounded by how deep the extraction directory is nested, and a

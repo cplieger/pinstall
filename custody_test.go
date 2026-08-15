@@ -1,7 +1,6 @@
 package pinstall
 
 import (
-	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -524,7 +523,7 @@ func TestEnsureRefusesToInstallWithoutCustody(t *testing.T) {
 	}
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
 	}
@@ -549,7 +548,7 @@ func TestEnsureInstallsWithoutCustodyWhenTheCallerWaivesIt(t *testing.T) {
 	}
 	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure with Untrusted set: %v", err)
 	}
 	if ready, why := m.Ready(); !ready {
@@ -573,7 +572,7 @@ func TestEnsureWithoutCustodyIgnoresAVersionItDidNotInstall(t *testing.T) {
 	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 	env.onFetch = func(dst io.Writer) error { return errors.New("network is down") }
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil {
 		t.Fatal("Ensure accepted a planted version directory in a tree without custody")
 	}
@@ -639,7 +638,7 @@ func TestVerifyCustodyRefusesAStickyInstallationRoot(t *testing.T) {
 	}
 
 	m := env.manager()
-	_ = m.Ensure(context.Background())
+	_ = m.Ensure(t.Context())
 	if ready, _ := m.Ready(); ready && env.fetchCount() == 0 {
 		t.Error("Ensure activated a planted version through a sticky world-writable root without downloading anything")
 	}
@@ -703,7 +702,7 @@ func TestEnsureDeletesNothingInATreeItRefuses(t *testing.T) {
 		}
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+		if err := m.Ensure(t.Context()); !errors.Is(err, ErrNoCustody) {
 			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
 		}
 		if !exists(partial) {
@@ -731,7 +730,7 @@ func TestEnsureDeletesNothingInATreeItRefuses(t *testing.T) {
 			c.Purge = &Purge{Names: []string{toolName}}
 		})
 
-		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+		if err := m.Ensure(t.Context()); !errors.Is(err, ErrNoCustody) {
 			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
 		}
 		if !exists(legacy) {
@@ -760,7 +759,7 @@ func TestSelectActiveExcludesAVersionWithAWritableArtifact(t *testing.T) {
 	m := env.manager()
 	m.checkCustody()
 
-	if _, ok := m.selectActive(context.Background()); ok {
+	if _, ok := m.selectActive(t.Context()); ok {
 		t.Fatal("selectActive accepted a version whose primary artifact is writable by another principal")
 	}
 }
@@ -775,7 +774,7 @@ func TestMoveArtifactRefusesToPublishAWritableArtifact(t *testing.T) {
 	env.wideArtifacts = []string{toolName}
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil {
 		t.Fatal("Ensure published an artifact the installer left writable by another principal")
 	}
@@ -807,11 +806,11 @@ func TestUntrustedAloneForcesDistrustOnACleanTree(t *testing.T) {
 	if verdict := m.custodyVerdict(); verdict != nil {
 		t.Fatalf("the fixture tree does not have custody (%v), so this test would not isolate the flag", verdict)
 	}
-	if _, ok := m.selectActive(context.Background()); ok {
+	if _, ok := m.selectActive(t.Context()); ok {
 		t.Fatal("selectActive accepted a pre-existing version directory although Untrusted is set on a tree WITH custody")
 	}
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
@@ -841,7 +840,7 @@ func TestSelectActiveExcludesAVersionWithAWritableOptionalArtifact(t *testing.T)
 	m := env.manager()
 	m.checkCustody()
 
-	if _, ok := m.selectActive(context.Background()); ok {
+	if _, ok := m.selectActive(t.Context()); ok {
 		t.Fatal("selectActive accepted a version whose optional artifact is writable by another principal")
 	}
 }
@@ -860,7 +859,7 @@ func TestPruneKeepsAUsablePredecessorWhenANewerVersionIsUnactivatable(t *testing
 	}
 	m := env.manager(func(c *Config) { c.Retain = 1 })
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if !exists(env.versionDir("1.0.0")) {
@@ -961,7 +960,7 @@ func TestFinishDoesNotMutateATreeWhoseVerdictFlippedMidOperation(t *testing.T) {
 	}
 	m := env.manager(func(c *Config) { c.LinkDir = "bin" })
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if !errors.Is(err, ErrNoCustody) {
 		t.Fatalf("Ensure error = %v, want ErrNoCustody: the install must refuse once the verdict flips", err)
 	}
@@ -992,7 +991,7 @@ func TestSelectActiveRefusesEvenItsOwnInstallWithoutCustodyOrAWaiver(t *testing.
 	m := env.manager()
 
 	// A clean install first, so the installed set holds the pin.
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("first Ensure: %v", err)
 	}
 	if ready, why := m.Ready(); !ready {
@@ -1008,10 +1007,10 @@ func TestSelectActiveRefusesEvenItsOwnInstallWithoutCustodyOrAWaiver(t *testing.
 		t.Fatal("the fixture did not degrade custody, so this test proves nothing")
 	}
 
-	if sel, ok := m.selectActive(context.Background()); ok {
+	if sel, ok := m.selectActive(t.Context()); ok {
 		t.Errorf("selectActive accepted %q on the strength of the installed set alone, with no custody and no waiver", sel.version)
 	}
-	if _, err := m.Rescan(context.Background()); !errors.Is(err, ErrNoCustody) {
+	if _, err := m.Rescan(t.Context()); !errors.Is(err, ErrNoCustody) {
 		t.Errorf("Rescan error = %v, want ErrNoCustody so the operator is pointed at the volume", err)
 	}
 	if ready, why := m.Ready(); ready || why != ReasonUnavailable {
@@ -1172,7 +1171,7 @@ func TestRetentionNeverExecutesAVersionSelectionRefuses(t *testing.T) {
 	if mayActivate, _ := m.trusted("9.9.9"); mayActivate {
 		t.Fatal("the fixture is wrong: the planted version must be untrusted for this test to mean anything")
 	}
-	if m.usableAsFallback(context.Background(), "9.9.9") {
+	if m.usableAsFallback(t.Context(), "9.9.9") {
 		t.Error("usableAsFallback accepted a version selection refuses")
 	}
 	if got := env.countCalls("probe " + filepath.Join(planted, toolName)); got != 0 {
@@ -1193,7 +1192,7 @@ func TestUnavailableReportsTheWaiverCauseNotTheWaivedVerdict(t *testing.T) {
 	env.onFetch = func(io.Writer) error { return errors.New("network is down") }
 	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil {
 		t.Fatal("Ensure succeeded although the planted version is untrusted and the fetch fails")
 	}
@@ -1233,7 +1232,7 @@ func TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall(t *testing.T) {
 	t.Run("refused when nothing is declared", func(t *testing.T) {
 		env := setup(t)
 		m := env.manager()
-		if err := m.Ensure(context.Background()); !errors.Is(err, ErrNoCustody) {
+		if err := m.Ensure(t.Context()); !errors.Is(err, ErrNoCustody) {
 			t.Fatalf("Ensure error = %v, want ErrNoCustody", err)
 		}
 		if !strings.Contains(m.custodyVerdict().Error(), "gid 65500") {
@@ -1246,7 +1245,7 @@ func TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall(t *testing.T) {
 		trust := func(c *Config) { c.TrustedGIDs = []int{65500}; c.TrustedUIDs = []int{adminUID} }
 
 		m := env.manager(trust)
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure with the writer declared: %v", err)
 		}
 		if m.custodyVerdict() != nil {
@@ -1259,7 +1258,7 @@ func TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall(t *testing.T) {
 
 		// A fresh Manager over the same on-disk tree: a container restart.
 		m2 := env.manager(trust)
-		if err := m2.Ensure(context.Background()); err != nil {
+		if err := m2.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure after a restart: %v", err)
 		}
 		if got := env.fetchCount(); got != first {
@@ -1272,13 +1271,13 @@ func TestDeclaringTheAdminKeepsCustodyAndAvoidsAReinstall(t *testing.T) {
 		waive := func(c *Config) { c.InstallWithoutCustody = true }
 
 		m := env.manager(waive)
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure with the waiver: %v", err)
 		}
 		first := env.fetchCount()
 
 		m2 := env.manager(waive)
-		if err := m2.Ensure(context.Background()); err != nil {
+		if err := m2.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure after a restart: %v", err)
 		}
 		if got := env.fetchCount(); got == first {
@@ -1300,10 +1299,10 @@ func TestInstallWithoutCustodyStillRefusesAPlantedVersion(t *testing.T) {
 	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 	m.checkCustody()
 
-	if _, ok := m.selectActive(context.Background()); ok {
+	if _, ok := m.selectActive(t.Context()); ok {
 		t.Error("selectActive accepted a planted version under InstallWithoutCustody")
 	}
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
@@ -1519,7 +1518,7 @@ func TestPublishRefusesAVersionDirectoryTheFilesystemWidened(t *testing.T) {
 	wide := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, stranger)
 	defer serveACLWhere(t, func(path string) bool { return filepath.Base(path) == "v" }, xattrNFS4XDR, wide)()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil {
 		t.Fatal("Ensure published a version directory another principal can modify, which selection will refuse for the life of the volume")
 	}
@@ -1633,7 +1632,7 @@ func TestPublishRefusesAWidenedSentinel(t *testing.T) {
 		return filepath.Base(path) == sentinelName
 	}, xattrNFS4XDR, wide)()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil {
 		t.Fatal("Ensure published a version directory whose completion sentinel another principal can rewrite")
 	}
@@ -1710,7 +1709,7 @@ func TestFirstStartOnAStickySharedParentRunsTheOneShotPurge(t *testing.T) {
 	}
 
 	m := env.manager(func(c *Config) { c.Purge = testPurge() })
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 

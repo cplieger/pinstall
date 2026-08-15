@@ -25,7 +25,7 @@ func TestEnsureInstallsPinnedVersion(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
@@ -101,7 +101,7 @@ func TestEnsureDigestMismatchPlacesNothing(t *testing.T) {
 	}
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("Ensure error = %v, want ErrDigestMismatch", err)
 	}
@@ -208,7 +208,7 @@ func TestEnsureSyncFailureAtEveryProtocolPointRetainsPreviousVersion(t *testing.
 			}
 			m := env.manager()
 
-			err := m.Ensure(context.Background())
+			err := m.Ensure(t.Context())
 			if !errors.Is(err, injected) {
 				t.Fatalf("Ensure error = %v, want the injected sync failure", err)
 			}
@@ -249,7 +249,7 @@ func TestEnsurePublishRenameFailureKeepsPreviousActive(t *testing.T) {
 	env.onRename = failRenameTo(target)
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "publishing the version directory") {
 		t.Fatalf("Ensure error = %v, want the injected publish-rename failure", err)
 	}
@@ -276,7 +276,7 @@ func TestEnsureFailedInstallWithNoPreviousVersionIsUnready(t *testing.T) {
 	env.installerFails = true
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err == nil {
+	if err := m.Ensure(t.Context()); err == nil {
 		t.Fatal("Ensure returned nil although the installer produced nothing")
 	}
 	if ready, why := m.Ready(); ready || why != ReasonInstalling {
@@ -299,7 +299,7 @@ func TestEnsureRefusesAStagedArtifactAtTheWrongVersion(t *testing.T) {
 	env.produces[toolName] = "9.9.9"
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "9.9.9") {
 		t.Fatalf("Ensure error = %v, want a refusal naming the staged version", err)
 	}
@@ -316,7 +316,7 @@ func TestEnsureRefusesToPublishWhenARequiredAssertionFails(t *testing.T) {
 	env.onAssert = failAssertion(mandatoryName)
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil || !strings.Contains(err.Error(), mandatoryName) {
 		t.Fatalf("Ensure error = %v, want a refusal naming %s", err, mandatoryName)
 	}
@@ -335,7 +335,7 @@ func TestEnsureRefusesAnArchiveWithNoInstaller(t *testing.T) {
 	env.digest = digestOf(env.archive)
 	m := env.manager()
 
-	err := m.Ensure(context.Background())
+	err := m.Ensure(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "no executable installer") {
 		t.Fatalf("Ensure error = %v, want a refusal naming the missing installer", err)
 	}
@@ -360,7 +360,7 @@ func TestEnsureInstallsFromAnArchiveThatAlreadyHoldsTheArtifacts(t *testing.T) {
 	env.digest = digestOf(env.archive)
 	m := env.manager(func(c *Config) { c.Optional = nil })
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if got := env.countCalls("installer"); got != 0 {
@@ -423,7 +423,7 @@ func TestArtifactDirHasTwoMeanings(t *testing.T) {
 				// so plant an executable at the profile's installer path.
 				plantExecutable(t, filepath.Join(stage.extract, filepath.FromSlash(toolInstaller)))
 			}
-			got, err := m.runInstaller(context.Background(), stage)
+			got, err := m.runInstaller(t.Context(), stage)
 			if err != nil {
 				t.Fatalf("runInstaller: %v", err)
 			}
@@ -467,7 +467,7 @@ func TestInstallerEnvAndArgsComeFromTheProfile(t *testing.T) {
 		return baseRun(ctx, c)
 	}
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if want := []string{"--quiet", "--prefix", "/opt"}; !slices.Equal(gotArgs, want) {
@@ -498,7 +498,7 @@ func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T
 		return out, err
 	}
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure error = %v, want nil: the staged gates decide, not the installer's exit code", err)
 	}
 	if ready, why := m.Ready(); !ready {
@@ -526,7 +526,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 
 		// The install fails later (nothing was extracted, so no installer runs),
 		// which is fine: the assertion is on what the seam was handed.
-		_ = m.Ensure(context.Background())
+		_ = m.Ensure(t.Context())
 		if string(gotArchive) != string(env.archive) {
 			t.Errorf("unpacker got %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
 		}
@@ -549,7 +549,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 		}
 		m := env.manager()
 
-		_ = m.Ensure(context.Background())
+		_ = m.Ensure(t.Context())
 		if escapeErr == nil {
 			t.Fatal("the destination root accepted a traversing name")
 		}
@@ -571,7 +571,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 		}
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); !errors.Is(err, ErrDigestMismatch) {
+		if err := m.Ensure(t.Context()); !errors.Is(err, ErrDigestMismatch) {
 			t.Fatalf("Ensure error = %v, want ErrDigestMismatch", err)
 		}
 		if called {
@@ -585,7 +585,7 @@ func TestUnpackSeamIsHandedTheVerifiedArchiveAndItsErrorAborts(t *testing.T) {
 		env.release.Unpack = func(context.Context, *io.SectionReader, *os.Root) error { return injected }
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); !errors.Is(err, injected) {
+		if err := m.Ensure(t.Context()); !errors.Is(err, injected) {
 			t.Fatalf("Ensure error = %v, want the unpacker's error", err)
 		}
 		if dirs := env.versionDirs(); len(dirs) != 0 {
@@ -617,7 +617,7 @@ func TestDownloadedArchiveHasNoNameWhileItIsBeingUsed(t *testing.T) {
 	}
 	m := env.manager()
 
-	_ = m.Ensure(context.Background())
+	_ = m.Ensure(t.Context())
 	if !bytes.Equal(gotArchive, env.archive) {
 		t.Errorf("unpacker read %d bytes, want the %d verified archive bytes", len(gotArchive), len(env.archive))
 	}
@@ -665,7 +665,7 @@ func TestHTTPFetchRefusesEmptyAndNonOK(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
-			err := httpFetch(context.Background(), srv.URL, io.Discard)
+			err := httpFetch(t.Context(), srv.URL, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("httpFetch error = %v, want one mentioning %q", err, tc.want)
 			}
@@ -682,7 +682,7 @@ func TestHTTPFetchStreamsABodyThrough(t *testing.T) {
 	}))
 	defer srv.Close()
 	var got strings.Builder
-	if err := httpFetch(context.Background(), srv.URL, &got); err != nil {
+	if err := httpFetch(t.Context(), srv.URL, &got); err != nil {
 		t.Fatalf("httpFetch: %v", err)
 	}
 	if got.String() != body {
@@ -798,7 +798,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 	t.Cleanup(func() { waitDelay = restore })
 
 	t.Run("returns stdout and passes argv unsplit", func(t *testing.T) {
-		out, err := execRunner(context.Background(), &command{
+		out, err := execRunner(t.Context(), &command{
 			Path:    sh,
 			Args:    []string{"-c", `printf '%s\n' "$1"`, "sh", "one two; three"},
 			Timeout: 10 * time.Second,
@@ -814,7 +814,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 	})
 
 	t.Run("appends the extra environment to the process environment", func(t *testing.T) {
-		out, err := execRunner(context.Background(), &command{
+		out, err := execRunner(t.Context(), &command{
 			Path:    sh,
 			Args:    []string{"-c", `printf '%s|%s\n' "$PINSTALL_TEST_HOME" "${PATH:+set}"`},
 			Env:     []string{"PINSTALL_TEST_HOME=/private/home"},
@@ -830,14 +830,14 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 
 	t.Run("stderr is folded in only when asked", func(t *testing.T) {
 		args := []string{"-c", `printf 'to-err\n' >&2; printf 'to-out\n'`}
-		quiet, err := execRunner(context.Background(), &command{Path: sh, Args: args, Timeout: 10 * time.Second})
+		quiet, err := execRunner(t.Context(), &command{Path: sh, Args: args, Timeout: 10 * time.Second})
 		if err != nil {
 			t.Fatalf("execRunner: %v", err)
 		}
 		if strings.Contains(string(quiet), "to-err") {
 			t.Errorf("output = %q, want stderr excluded without CaptureStderr", quiet)
 		}
-		loud, err := execRunner(context.Background(), &command{Path: sh, Args: args, Timeout: 10 * time.Second, CaptureStderr: true})
+		loud, err := execRunner(t.Context(), &command{Path: sh, Args: args, Timeout: 10 * time.Second, CaptureStderr: true})
 		if err != nil {
 			t.Fatalf("execRunner: %v", err)
 		}
@@ -849,7 +849,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 	})
 
 	t.Run("a non-zero exit is an error", func(t *testing.T) {
-		if _, err := execRunner(context.Background(), &command{
+		if _, err := execRunner(t.Context(), &command{
 			Path: sh, Args: []string{"-c", "exit 3"}, Timeout: 10 * time.Second,
 		}); err == nil {
 			t.Error("execRunner returned nil for a command that exited non-zero")
@@ -858,7 +858,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 
 	t.Run("the timeout bounds a command that never returns", func(t *testing.T) {
 		start := time.Now()
-		_, err := execRunner(context.Background(), &command{
+		_, err := execRunner(t.Context(), &command{
 			Path: sh, Args: []string{"-c", "sleep 30"}, Timeout: 50 * time.Millisecond,
 		})
 		if err == nil {
@@ -875,7 +875,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 	// it. Without cmd.WaitDelay this case runs for the grandchild's full lifetime.
 	t.Run("a backgrounded grandchild holding the output pipe cannot outlast the bound", func(t *testing.T) {
 		start := time.Now()
-		_, err := execRunner(context.Background(), &command{
+		_, err := execRunner(t.Context(), &command{
 			Path:    sh,
 			Args:    []string{"-c", "sleep 30 & printf 'started\\n'; sleep 30"},
 			Timeout: 50 * time.Millisecond,
@@ -890,7 +890,7 @@ func TestExecRunnerBoundsAndIsolatesASubprocess(t *testing.T) {
 	})
 
 	t.Run("an absent program is an error, not a panic", func(t *testing.T) {
-		if _, err := execRunner(context.Background(), &command{
+		if _, err := execRunner(t.Context(), &command{
 			Path: filepath.Join(t.TempDir(), "nope"), Timeout: time.Second,
 		}); err == nil {
 			t.Error("execRunner returned nil for a program that does not exist")
@@ -924,7 +924,7 @@ func TestPublishClearsASymlinkedDestinationThroughTheRoot(t *testing.T) {
 	}
 
 	m := env.manager()
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 

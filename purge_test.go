@@ -1,7 +1,6 @@
 package pinstall
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,7 +317,7 @@ func TestNilPurgeSweepsNothing(t *testing.T) {
 	files := legacyFixture(t, env.root)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	for _, rel := range files {
@@ -344,14 +343,14 @@ func TestPurgeRunsOncePerProcess(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager(func(c *Config) { c.Purge = testPurge() })
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	link := filepath.Join(env.root, testLinkDir, toolName)
 	if !exists(link) {
 		t.Fatal("the convenience symlink was not published")
 	}
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
 	if !exists(link) {
@@ -366,7 +365,7 @@ func TestConvenienceLinkPointsAtTheActiveArtifact(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	link := filepath.Join(env.root, testLinkDir, toolName)
@@ -397,7 +396,7 @@ func TestEmptyLinkDirPublishesNoLink(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager(func(c *Config) { c.LinkDir = "" })
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if ready, why := m.Ready(); !ready {
@@ -424,7 +423,7 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 		env.onRename = failRenameTo(link)
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure error = %v, want nil: a convenience-link failure must not fail the install", err)
 		}
 		if ready, why := m.Ready(); !ready {
@@ -438,7 +437,7 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 	t.Run("a sabotaged link does not affect a rescan", func(t *testing.T) {
 		env := newFakeEnv(t)
 		m := env.manager()
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
 		want := m.Path()
@@ -450,7 +449,7 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 			t.Fatalf("Symlink: %v", err)
 		}
 
-		ok, err := m.Rescan(context.Background())
+		ok, err := m.Rescan(t.Context())
 		if !ok || err != nil {
 			t.Fatalf("Rescan = (%v, %v), want (true, nil)", ok, err)
 		}
