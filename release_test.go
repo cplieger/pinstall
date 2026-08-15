@@ -1,7 +1,6 @@
 package pinstall
 
 import (
-	"context"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -115,7 +114,7 @@ func TestPackageNameAndArtifactNameAreIndependent(t *testing.T) {
 		c.Optional = nil
 	})
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -203,7 +202,7 @@ func TestNilSeamsFallBackToTheShippedDefaults(t *testing.T) {
 	}
 	// The real zip unpacker is what ran the install, so a successful Ensure over a
 	// genuine zip is the assertion that the default is wired.
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure with the default seams: %v", err)
 	}
 	if ready, why := m.Ready(); !ready {

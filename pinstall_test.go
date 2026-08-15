@@ -209,7 +209,7 @@ func TestEnsureReassertsRequiredAssertionsOnAStartThatSkipsTheInstall(t *testing
 			c.Assert = []Assertion{{Name: "telemetry.enabled", Args: []string{"settings", "telemetry.enabled", "false"}}}
 		})
 
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
 		if env.fetchCount() != 0 {
@@ -233,7 +233,7 @@ func TestEnsureReassertsRequiredAssertionsOnAStartThatSkipsTheInstall(t *testing
 		env.onAssert = failAssertion(mandatoryName)
 		m := env.manager()
 
-		err := m.Ensure(context.Background())
+		err := m.Ensure(t.Context())
 		if err == nil || !strings.Contains(err.Error(), mandatoryName) {
 			t.Fatalf("Ensure error = %v, want one naming %s", err, mandatoryName)
 		}
@@ -255,7 +255,7 @@ func TestEnsureReassertsRequiredAssertionsOnAStartThatSkipsTheInstall(t *testing
 			c.Assert = []Assertion{{Name: "chat.notificationMethod", Args: []string{"settings", "chat.notificationMethod", "osc9"}}}
 		})
 
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
 		if ready, why := m.Ready(); !ready {
@@ -297,7 +297,7 @@ func TestPersistedAssertionsOKNeverGatesReadiness(t *testing.T) {
 	env.onAssert = failAssertion(mandatoryName)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err == nil {
+	if err := m.Ensure(t.Context()); err == nil {
 		t.Fatal("Ensure returned nil although a required assertion failed")
 	}
 	if ready, why := m.Ready(); ready || why != ReasonAssertion {
@@ -318,7 +318,7 @@ func TestStateSaveFailureDoesNotAffectReadiness(t *testing.T) {
 	env.onRename = failRenameTo(env.statePath())
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure error = %v, want nil despite the state save failure", err)
 	}
 	if ready, why := m.Ready(); !ready {
@@ -349,7 +349,7 @@ func TestEnsureWithRetryIsBoundedAndReportsTerminalFailure(t *testing.T) {
 		c.RetryBackoff = time.Second
 	})
 
-	err := m.EnsureWithRetry(context.Background())
+	err := m.EnsureWithRetry(t.Context())
 	if err == nil {
 		t.Fatal("EnsureWithRetry returned nil although every attempt failed")
 	}
@@ -393,7 +393,7 @@ func TestEnsureWithRetryStopsEarlyOnShutdown(t *testing.T) {
 		m := env.manager(func(c *Config) { c.MaxAttempts = 4 })
 		m.sleep = func(context.Context, time.Duration) error { return context.Canceled }
 
-		err := m.EnsureWithRetry(context.Background())
+		err := m.EnsureWithRetry(t.Context())
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("EnsureWithRetry error = %v, want context.Canceled", err)
 		}
@@ -453,7 +453,7 @@ func TestRescanMakesAnInPlaceRepairVisible(t *testing.T) {
 	env.installerFails = true
 	m := env.manager(func(c *Config) { c.MaxAttempts = 2 })
 
-	if err := m.EnsureWithRetry(context.Background()); err == nil {
+	if err := m.EnsureWithRetry(t.Context()); err == nil {
 		t.Fatal("EnsureWithRetry returned nil although every attempt failed")
 	}
 	if ready, why := m.Ready(); ready || why != ReasonUnavailable {
@@ -464,7 +464,7 @@ func TestRescanMakesAnInPlaceRepairVisible(t *testing.T) {
 	// The repair: an operator restores a complete version directory by hand.
 	dir := env.placeVersion(pinnedVersion)
 
-	ok, err := m.Rescan(context.Background())
+	ok, err := m.Rescan(t.Context())
 	if err != nil || !ok {
 		t.Fatalf("Rescan = (%v, %v), want (true, nil)", ok, err)
 	}
@@ -490,7 +490,7 @@ func TestRescanReportsUnreadyWhenTheRepairIsIncomplete(t *testing.T) {
 	env.placePartial(pinnedVersion)
 	m := env.manager()
 
-	ok, err := m.Rescan(context.Background())
+	ok, err := m.Rescan(t.Context())
 	if ok {
 		t.Fatal("Rescan accepted a directory with no completion sentinel")
 	}
@@ -508,13 +508,13 @@ func TestEnsureIsIdempotent(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("first Ensure: %v", err)
 	}
 	first := m.Path()
 	afterFirst := env.countCalls("assert settings " + mandatoryName)
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
 	if got := env.fetchCount(); got != 1 {
@@ -575,7 +575,7 @@ func TestSleepCtxHonoursCancellation(t *testing.T) {
 	if err := sleepCtx(ctx, time.Hour); !errors.Is(err, context.Canceled) {
 		t.Errorf("sleepCtx error = %v, want context.Canceled", err)
 	}
-	if err := sleepCtx(context.Background(), time.Millisecond); err != nil {
+	if err := sleepCtx(t.Context(), time.Millisecond); err != nil {
 		t.Errorf("sleepCtx error = %v, want nil", err)
 	}
 }
@@ -603,7 +603,7 @@ func TestProbeAndAssertionsLeadPATHWithTheBinaryDir(t *testing.T) {
 		return inner(ctx, c)
 	}
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -696,7 +696,7 @@ func TestPathEnvAndTheProbeOverlayCannotDrift(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -781,12 +781,12 @@ func TestOperationWaitIsCancellable(t *testing.T) {
 	m := env.manager()
 
 	// Occupy the slot exactly as a running operation would.
-	if err := m.acquireOp(context.Background()); err != nil {
+	if err := m.acquireOp(t.Context()); err != nil {
 		t.Fatalf("acquireOp: %v", err)
 	}
 	defer m.releaseOp()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- m.acquireOp(ctx) }()
 
@@ -814,12 +814,12 @@ func TestRescanQueuedCallerCanAbandon(t *testing.T) {
 	env := newFakeEnv(t)
 	env.placeVersion(pinnedVersion)
 	m := env.manager()
-	if _, err := m.Rescan(context.Background()); err != nil {
+	if _, err := m.Rescan(t.Context()); err != nil {
 		t.Fatalf("priming Rescan: %v", err)
 	}
 	readyBefore, _ := m.Ready()
 
-	if err := m.acquireOp(context.Background()); err != nil {
+	if err := m.acquireOp(t.Context()); err != nil {
 		t.Fatalf("acquireOp: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

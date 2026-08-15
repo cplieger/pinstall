@@ -1,7 +1,6 @@
 package pinstall
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -119,7 +118,7 @@ func TestSelectActiveIgnoresPartialDirectories(t *testing.T) {
 	env.placeVersion(prevVersion)
 	m := env.manager()
 
-	sel, ok := m.selectActive(context.Background())
+	sel, ok := m.selectActive(t.Context())
 	if !ok {
 		t.Fatal("selectActive found nothing, want the complete predecessor")
 	}
@@ -140,7 +139,7 @@ func TestEnsurePrunesPartialsBeforeSelecting(t *testing.T) {
 	}
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if exists(env.versionDir(oldVersion)) {
@@ -168,7 +167,7 @@ func TestSelectActiveExcludesAReplacedArtifactUnderAnIntactSentinel(t *testing.T
 		env.installerFails = true
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); err == nil {
+		if err := m.Ensure(t.Context()); err == nil {
 			t.Fatal("Ensure returned nil although the pin was replaced and reinstall failed")
 		}
 		if got := m.PathEntry(); got != env.versionDir(prevVersion) {
@@ -187,7 +186,7 @@ func TestSelectActiveExcludesAReplacedArtifactUnderAnIntactSentinel(t *testing.T
 		}
 		m := env.manager()
 
-		if err := m.Ensure(context.Background()); err != nil {
+		if err := m.Ensure(t.Context()); err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
 		if env.fetchCount() != 1 {
@@ -225,10 +224,10 @@ func TestSelectActiveIgnoresExistingDirectoriesWithoutCustody(t *testing.T) {
 	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
 	m.checkCustody()
 
-	if _, ok := m.selectActive(context.Background()); ok {
+	if _, ok := m.selectActive(t.Context()); ok {
 		t.Fatal("selectActive accepted a pre-existing directory in a tree without custody")
 	}
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if env.fetchCount() != 1 {
@@ -385,7 +384,7 @@ func TestEnsurePrunesToTheConfiguredRetention(t *testing.T) {
 			}
 			m := env.manager(func(c *Config) { c.Retain = tc.retain })
 
-			if err := m.Ensure(context.Background()); err != nil {
+			if err := m.Ensure(t.Context()); err != nil {
 				t.Fatalf("Ensure: %v", err)
 			}
 			got := slices.Sorted(slices.Values(env.versionDirs()))
@@ -407,7 +406,7 @@ func TestEnsureFailedInstallPrunesNothing(t *testing.T) {
 	env.installerFails = true
 	m := env.manager()
 
-	if err := m.Ensure(context.Background()); err == nil {
+	if err := m.Ensure(t.Context()); err == nil {
 		t.Fatal("Ensure returned nil although the installer produced nothing")
 	}
 	got := slices.Sorted(slices.Values(env.versionDirs()))
@@ -534,7 +533,7 @@ func TestSelectActiveExcludesAnUnparseableVersionAnswer(t *testing.T) {
 			env.onProbe = func(string) ([]byte, error) { return []byte(tc.out), tc.err }
 			m := env.manager()
 
-			if sel, ok := m.selectActive(context.Background()); ok {
+			if sel, ok := m.selectActive(t.Context()); ok {
 				t.Errorf("selectActive accepted %q (selected %q)", tc.out, sel.version)
 			}
 		})
@@ -821,8 +820,8 @@ func TestSelectionAndRetentionAgreeOnEveryRefusal(t *testing.T) {
 			m := env.manager(mutate...)
 			m.checkCustody()
 
-			sel, selected := m.selectActive(context.Background())
-			retained := m.usableAsFallback(context.Background(), pinnedVersion)
+			sel, selected := m.selectActive(t.Context())
+			retained := m.usableAsFallback(t.Context(), pinnedVersion)
 			if selected != retained {
 				t.Errorf("selectActive = %v but usableAsFallback = %v for the same directory; retention promises the answers agree, and a retained version selection refuses is not a fallback",
 					selected, retained)

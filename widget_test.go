@@ -1,7 +1,6 @@
 package pinstall
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,7 +106,7 @@ func TestWidgetProfileInstallsEndToEnd(t *testing.T) {
 	env := newWidgetEnv(t)
 	m := widgetManager(env)
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -160,7 +159,7 @@ func TestWidgetProfileInstallsEndToEnd(t *testing.T) {
 func TestWidgetProfileUsesItsOwnVersionParser(t *testing.T) {
 	env := newWidgetEnv(t)
 	m := widgetManager(env)
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -176,7 +175,7 @@ func TestWidgetProfileUsesItsOwnVersionParser(t *testing.T) {
 		env := newWidgetEnv(t)
 		env.onProbe = func(string) ([]byte, error) { return []byte("widget " + pinnedVersion + "\n"), nil }
 		m := widgetManager(env)
-		if _, ok := m.selectActive(context.Background()); ok {
+		if _, ok := m.selectActive(t.Context()); ok {
 			t.Error("selectActive accepted output the profile's parser cannot read")
 		}
 	})
@@ -186,7 +185,7 @@ func TestWidgetProfileUsesItsOwnVersionParser(t *testing.T) {
 		env.placeVersion(pinnedVersion, widgetBinary, widgetHelper)
 		env.onProbe = func(string) ([]byte, error) { return []byte(`{"version":"0.0.1"}`), nil }
 		m := widgetManager(env)
-		if _, ok := m.selectActive(context.Background()); ok {
+		if _, ok := m.selectActive(t.Context()); ok {
 			t.Error("selectActive accepted an artifact reporting a version its directory does not claim")
 		}
 	})
@@ -219,7 +218,7 @@ func TestWidgetProfileRequiredSetIsBothArtifacts(t *testing.T) {
 			env.digest = digestOf(env.archive)
 			m := widgetManager(env)
 
-			if err := m.Ensure(context.Background()); err == nil {
+			if err := m.Ensure(t.Context()); err == nil {
 				t.Fatal("Ensure returned nil although a required artifact is absent")
 			}
 			if exists(filepath.Join(env.root, widgetName+versionsSuffix, pinnedVersion)) {
@@ -242,7 +241,7 @@ func TestWidgetProfileRetainsTwoPredecessors(t *testing.T) {
 	}
 	m := widgetManager(env)
 
-	if err := m.Ensure(context.Background()); err != nil {
+	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	root := filepath.Join(env.root, widgetName+versionsSuffix)
@@ -262,7 +261,7 @@ func TestWidgetProfileFallsBackToAPredecessor(t *testing.T) {
 	env.onFetch = func(io.Writer) error { return errors.New("network unreachable") }
 	m := widgetManager(env)
 
-	if err := m.Ensure(context.Background()); err == nil {
+	if err := m.Ensure(t.Context()); err == nil {
 		t.Fatal("Ensure returned nil although the download failed")
 	}
 	if ready, why := m.Ready(); !ready {
@@ -287,10 +286,10 @@ func TestTwoProfilesShareOneRootWithoutColliding(t *testing.T) {
 	first := primary.manager()
 	second := widgetManager(widget)
 
-	if err := first.Ensure(context.Background()); err != nil {
+	if err := first.Ensure(t.Context()); err != nil {
 		t.Fatalf("primary Ensure: %v", err)
 	}
-	if err := second.Ensure(context.Background()); err != nil {
+	if err := second.Ensure(t.Context()); err != nil {
 		t.Fatalf("widget Ensure: %v", err)
 	}
 
