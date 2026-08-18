@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/pathinside"
+	"github.com/cplieger/pathinside/v2"
 )
 
 // Release is everything true of the PACKAGE, independent of any deployment: the
