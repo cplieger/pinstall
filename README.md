@@ -1,6 +1,6 @@
 # pinstall
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/pinstall/v2.svg)](https://pkg.go.dev/github.com/cplieger/pinstall/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/pinstall/v3.svg)](https://pkg.go.dev/github.com/cplieger/pinstall/v3)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/pinstall)](https://github.com/cplieger/pinstall/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/pinstall/badges/coverage.json)](https://github.com/cplieger/pinstall/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/pinstall/badges/mutation.json)](https://github.com/cplieger/pinstall/issues?q=label%3Agremlins-tracker)
@@ -28,7 +28,7 @@ Six decisions drive everything else:
 
 ## Install
 
-`go get github.com/cplieger/pinstall/v2@latest`
+`go get github.com/cplieger/pinstall/v3@latest`
 
 ## Usage
 
@@ -42,7 +42,7 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pinstall/v3"
 )
 
 // The pinned digests. Whatever bumps your version literal bumps these with it.

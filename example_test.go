@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pinstall/v3"
 )
 
 // widgetRelease is the profile a consumer of a fictional "widget" release writes

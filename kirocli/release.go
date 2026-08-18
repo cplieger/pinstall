@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pinstall/v3"
 )
 
 // Name is the package identity and the name of its primary artifact.
@@ -72,19 +72,27 @@ func Release() pinstall.Release {
 	}
 }
 
+// SettingKey names a kiro-cli setting (the dotted form: "app.disableAutoupdates",
+// "chat.notificationMethod"). It is a distinct type so the key and a string
+// VALUE cannot be transposed in a SettingRaw call — a swapped call wrote the
+// wrong setting under the wrong key, silently, since both sides are strings on
+// the wire. An untyped string constant still converts implicitly at a call
+// site; the type guards every site that passes variables.
+type SettingKey string
+
 // Setting returns the assertion that sets a boolean kiro-cli setting.
 //
 // The `settings <key> <value>` grammar is package knowledge, which is why it
 // lives here rather than as a hook in pinstall: the library takes a full argv and
 // needs to know nothing about how kiro-cli is configured.
-func Setting(key string, value bool) pinstall.Assertion {
+func Setting(key SettingKey, value bool) pinstall.Assertion {
 	return SettingRaw(key, strconv.FormatBool(value))
 }
 
 // SettingRaw returns the assertion that sets a kiro-cli setting to a verbatim
 // string value, for the settings whose value is not a boolean.
-func SettingRaw(key, value string) pinstall.Assertion {
-	return pinstall.Assertion{Name: key, Args: []string{"settings", key, value}}
+func SettingRaw(key SettingKey, value string) pinstall.Assertion {
+	return pinstall.Assertion{Name: string(key), Args: []string{"settings", string(key), value}}
 }
 
 // ShellEraDispatchers returns the dispatcher names a shell-era kiro-cli installer
