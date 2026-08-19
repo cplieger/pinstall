@@ -1,6 +1,6 @@
 module github.com/cplieger/pinstall/v2
 
-go 1.26.7
+go 1.27.0
 
 require github.com/cplieger/pathinside v1.0.1
 
