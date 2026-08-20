@@ -1002,7 +1002,8 @@ func TestControllersOfWrapsAParseError(t *testing.T) {
 func nfs4FuzzSeeds(f *testing.F) [][]byte {
 	f.Helper()
 	valid, err := base64.StdEncoding.DecodeString(
-		nfs4Samples["dataset root, owned by apps, mode 0770 with a named admin and a group grant"].b64)
+		nfs4Samples["dataset root, owned by apps, mode 0770 with a named admin and a group grant"].b64,
+	)
 	if err != nil {
 		f.Fatalf("decoding the fixture: %v", err)
 	}

@@ -155,8 +155,8 @@ func TestUnpackZipUnpacksARealArchive(t *testing.T) {
 // and a rewritten artifact is exactly what the pin exists to prevent.
 func TestUnpackZipRefusesADuplicateEntryName(t *testing.T) {
 	raw := buildZipOrdered(t, []namedEntry{
-		{name: "pkg/tool", zipEntry: zipEntry{body: "first\n", mode: 0o755}},
-		{name: "pkg/tool", zipEntry: zipEntry{body: "second\n", mode: 0o666}},
+		{name: "pkg/tool", body: "first\n", mode: 0o755},
+		{name: "pkg/tool", body: "second\n", mode: 0o666},
 	})
 	out := t.TempDir()
 	err := UnpackZip(t.Context(), bytesReader(raw), openRoot(t, out))
@@ -204,7 +204,7 @@ func TestUnpackZipRefusesAnUnreadableArchive(t *testing.T) {
 func TestUnpackZipRefusesTooManyEntries(t *testing.T) {
 	entries := make([]namedEntry, 0, maxExtractEntries+1)
 	for i := range maxExtractEntries + 1 {
-		entries = append(entries, namedEntry{name: fmt.Sprintf("e%d", i), zipEntry: zipEntry{mode: 0o644}})
+		entries = append(entries, namedEntry{name: fmt.Sprintf("e%d", i), mode: 0o644})
 	}
 	raw := buildZipOrdered(t, entries)
 	out := t.TempDir()
