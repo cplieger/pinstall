@@ -11,11 +11,11 @@ directory, activates it, and reports whether the result is usable. Its only
 dependency outside the standard library is `cplieger/pathinside` (the lexical
 path-containment predicate, itself standard-library-only), and it is Linux-only:
 the publish protocol relies on a same-filesystem rename plus `fsync` of a
-directory, the extraction and every delete inside the tree are confined by `os.Root`, and the
+directory, the extraction and every write, rename and delete inside the tree are confined by `os.Root`, and the
 custody check reads Unix ownership plus the extended attributes a filesystem uses
 to expose an access-control list.
 
-Six invariants are load-bearing. A change that weakens one is a breaking change
+Seven invariants are load-bearing. A change that weakens one is a breaking change
 even if the API is untouched.
 
 - **The durability protocol, in order.** Write each artifact, `fsync` each one,
@@ -101,19 +101,20 @@ empty set is indistinguishable from a forgetful profile author.
 
 Flat, one concept per file:
 
-| File          | Owns                                                                      |
-| ------------- | ------------------------------------------------------------------------- |
-| `doc.go`      | the package documentation                                                 |
-| `pinstall.go` | `Config`, `Manager`, `New`, the lifecycle, `Reason`, `State`, validation  |
-| `release.go`  | `Release`, `ArchiveInstaller`, `Assertion`, `Purge`, and their validation |
-| `install.go`  | fetch, digest verification, staging, assembly, the publish protocol       |
-| `unpack.go`   | `Unpacker`, `UnpackZip`, entry normalisation                              |
-| `custody.go`  | the custody precondition: `verifyCustody`, the chain walk                 |
-| `acl.go`      | ACL decoding for both dialects, and the trusted-writer set                |
-| `versions.go` | completeness, the version probe, selection, ordering, retention, pruning  |
-| `purge.go`    | the one-shot sweep and the convenience link                               |
-| `errors.go`   | the sentinel errors                                                       |
-| `kirocli/`    | one shipped profile; the core must never import it                        |
+| File | Owns |
+| --- | --- |
+| `doc.go` | the package documentation |
+| `pinstall.go` | `Manager`, `New`, the lifecycle, `Reason`, `State`, deployment validation |
+| `release.go` | `Release`, `Config`, `ArchiveInstaller`, `Assertion`, `Purge`, and their validation |
+| `install.go` | fetch, digest verification, staging, assembly, the publish protocol |
+| `unpack.go` | `Unpacker`, `UnpackZip`, entry normalisation |
+| `custody.go` | the custody precondition: `verifyCustody`, the chain walk |
+| `acl.go` | ACL decoding for both dialects, and the trusted-writer set |
+| `identities.go` | `ParseIdentities`, the trusted-identity list parser |
+| `versions.go` | completeness, the version probe, selection, ordering, retention, pruning |
+| `purge.go` | the one-shot sweep and the convenience link |
+| `errors.go` | the sentinel errors |
+| `kirocli/` | one shipped profile; the core must never import it |
 
 Every boundary the manager crosses — the archive fetch, subprocess execution,
 `fsync`, `rename`, the clock, the sleep — is an unexported struct field on
@@ -196,6 +197,10 @@ exercise the surface a consumer sees. Match the file to the unit:
   directory and its sentinel, and each of the four custody-related Config fields end to end.
 - `acl_golden_test.go`: the wire formats, against real captured lists, plus every shape of
   malformed input and every reason an entry grants nothing.
+- `acl_dialect_test.go`: the `getxattr` seam, the dialect table's own well-formedness, and
+  that an undecodable dialect never reaches a parser.
+- `identities_test.go`: `ParseIdentities` across every accepted and refused entry, that no
+  rejected text is echoed, and both trust fields end to end.
 - `release_test.go`: the profile and sweep validation tables, the package-name
   versus artifact-name separation, and the pin validator.
 - `widget_test.go`: the synthetic second profile, end to end.
@@ -213,8 +218,10 @@ Conventions that matter here:
   accepts lands strictly inside the destination, asserted against the filesystem
   rather than a lexical helper), `FuzzValidateVersion` (an accepted pin is one benign
   path component and carries no URL metacharacter), and `FuzzLastFieldOfFirstLine`
-  (the result is always a whitespace-free field of the first line). Add one for any
-  new parsing or validation you introduce.
+  (the result is always a whitespace-free field of the first line). `FuzzParseNFS4ACL`,
+  `FuzzParsePOSIXACL` (a refusal carries no writer set) and `FuzzParseIdentities` (an
+  accepted identity is positive, unique, and spelled by some field of the input) cover
+  the other three boundaries. Add one for any new parsing or validation you introduce.
 - **Run the suite as a non-root user before you push.** A test whose assertion depends
   on the uid or gid it runs as will pass in a root container and fail in CI, which runs
   unprivileged, and this has cost two rounds of red CI here. Both directions need care:
