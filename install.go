@@ -180,12 +180,25 @@ func (m *Manager) archiveURL() string {
 	return strings.ReplaceAll(url, archPlaceholder, m.archToken)
 }
 
+// The staging tree's fixed layout under its own root. Named so the absolute paths
+// below and the root-relative names [Manager.assemble] and [Manager.publish] hand
+// to an [os.Root] have one source rather than two spellings that can drift.
+const (
+	stageExtractDir = "x"
+	stageHomeDir    = "home"
+	stageVersionDir = "v"
+)
+
 // stageTree is one in-progress installation: the extracted archive, a private
 // home for an in-archive installer, and the version directory that will be
 // renamed into place. All three live under the installation root, so the publish
 // stays a same-filesystem rename rather than a copy.
 type stageTree struct {
-	root       string
+	root string
+	// rel is root's own name relative to the installation root, which is what
+	// [Manager.publish] needs to name the staged version directory to an [os.Root]
+	// on that root.
+	rel        string
 	extract    string
 	home       string
 	versionDir string
@@ -382,9 +395,10 @@ func (m *Manager) newStage() (*stageTree, error) {
 	}
 	stage := &stageTree{
 		root:       root,
-		extract:    filepath.Join(root, "x"),
-		home:       filepath.Join(root, "home"),
-		versionDir: filepath.Join(root, "v"),
+		rel:        filepath.Base(root),
+		extract:    filepath.Join(root, stageExtractDir),
+		home:       filepath.Join(root, stageHomeDir),
+		versionDir: filepath.Join(root, stageVersionDir),
 	}
 	for _, dir := range []string{stage.extract, stage.home} {
 		if err := os.MkdirAll(dir, dirMode); err != nil {
@@ -479,26 +493,34 @@ func (m *Manager) gateStaged(ctx context.Context, staged string) error {
 // directory entry or the file data reached stable storage. Any sync failure —
 // ENOSPC included — fails the install, which leaves every complete version
 // already on the volume untouched.
+//
+// The moves go through an [os.Root] on the staging tree because src is territory
+// something ELSE wrote: an in-archive installer chose what it dropped there, and
+// with no installer it is the extracted archive. [os.Root] permits CREATING a
+// symlink whose target leaves the root (measured: it validates the name being
+// created, not the text the link carries) and refuses to FOLLOW one, so a custom
+// [Unpacker] reproducing an archive symlink can legitimately leave one at
+// ArtifactDir — and the plain filepath.Join this used to do followed it. Measured
+// on the unconfined form: a file outside the staging tree was renamed INTO the
+// published version directory, which makes the one claim this package reduces to
+// (the artifact came out of the digest-verified archive) false, and destroys the
+// file at its original location.
 func (m *Manager) assemble(stage *stageTree, src string) error {
-	if err := os.MkdirAll(stage.versionDir, dirMode); err != nil {
-		return fmt.Errorf("creating the staged version directory: %w", err)
+	root, err := os.OpenRoot(stage.root)
+	if err != nil {
+		return fmt.Errorf("opening the staging tree: %w", err)
 	}
-	moved := make([]string, 0, len(m.cfg.Require)+len(m.cfg.Optional))
-	for _, name := range m.cfg.Require {
-		dst, err := m.moveArtifact(src, stage.versionDir, name)
-		if err != nil {
-			return fmt.Errorf("required artifact %s: %w", name, err)
-		}
-		moved = append(moved, dst)
+	defer root.Close()
+	srcRel, err := filepath.Rel(stage.root, src)
+	if err != nil {
+		return fmt.Errorf("locating the artifact directory inside the staging tree: %w", err)
 	}
-	for _, name := range m.cfg.Optional {
-		dst, err := m.moveArtifact(src, stage.versionDir, name)
-		if err != nil {
-			slog.Warn("optional artifact not installed",
-				"package", m.cfg.Release.Name, "artifact", name, "error", err)
-			continue
-		}
-		moved = append(moved, dst)
+	if mkErr := root.MkdirAll(stageVersionDir, dirMode); mkErr != nil {
+		return fmt.Errorf("creating the staged version directory: %w", mkErr)
+	}
+	moved, err := m.moveArtifacts(root, srcRel)
+	if err != nil {
+		return err
 	}
 	for _, path := range moved {
 		if err := m.fsync(path); err != nil {
@@ -540,11 +562,54 @@ func (m *Manager) assemble(stage *stageTree, src string) error {
 	return nil
 }
 
-// moveArtifact moves one artifact from src into dst, refusing anything that is
-// not a self-contained executable: a symlink would pass an existence and
-// executability check and then dangle the moment the staging tree is removed.
-func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
-	from := filepath.Join(src, name)
+// moveArtifacts moves every declared artifact out of srcRel into the staged version
+// directory and returns their absolute paths, in the order they were moved.
+//
+// The asymmetry between the two sets is the whole reason they are one function
+// rather than one loop: a required artifact that will not move fails the install,
+// while an optional one only warns, because "installed when the archive provides it"
+// is the contract Optional's own doc states.
+func (m *Manager) moveArtifacts(root *os.Root, srcRel string) ([]string, error) {
+	moved := make([]string, 0, len(m.cfg.Require)+len(m.cfg.Optional))
+	for _, name := range m.cfg.Require {
+		dst, err := m.moveArtifact(root, srcRel, name)
+		if err != nil {
+			return nil, fmt.Errorf("required artifact %s: %w", name, err)
+		}
+		moved = append(moved, dst)
+	}
+	for _, name := range m.cfg.Optional {
+		dst, err := m.moveArtifact(root, srcRel, name)
+		if err != nil {
+			slog.Warn("optional artifact not installed",
+				"package", m.cfg.Release.Name, "artifact", name, "error", err)
+			continue
+		}
+		moved = append(moved, dst)
+	}
+	return moved, nil
+}
+
+// moveArtifact moves one artifact out of srcRel and into the staged version
+// directory, both resolved inside root, refusing anything that is not a
+// self-contained executable: a symlink would pass an existence and executability
+// check and then dangle the moment the staging tree is removed. It returns the
+// artifact's absolute path.
+//
+// Containment is proved FIRST, with root.Lstat, and that ordering is load-bearing
+// rather than tidy. The two predicates below have to read an absolute path — the
+// ownership question needs the raw stat and the access-control question needs a
+// getxattr, neither of which an [os.Root] offers — so on a source directory that
+// resolves out of the tree they would judge some file elsewhere on the volume and
+// then hand a name the rename refuses. Asking the root first means the predicates
+// only ever see an object inside the staging tree, and the diagnosis names the real
+// obstacle instead of a rename failure two lines later.
+func (m *Manager) moveArtifact(root *os.Root, srcRel, name string) (string, error) {
+	fromRel := filepath.Join(srcRel, name)
+	if _, err := root.Lstat(fromRel); err != nil {
+		return "", fmt.Errorf("is not reachable inside the staging tree: %w", err)
+	}
+	from := filepath.Join(root.Name(), fromRel)
 	if !selfContained(from) {
 		return "", errors.New("absent, not executable, or a symlink into the staging tree")
 	}
@@ -560,11 +625,11 @@ func (m *Manager) moveArtifact(src, dst, name string) (string, error) {
 	if reason, private := m.entryPrivate(from, false, os.Geteuid()); !private {
 		return "", fmt.Errorf("%s, and this package will not publish an artifact it executes that it cannot prove is private", reason)
 	}
-	to := filepath.Join(dst, name)
-	if err := m.rename(from, to); err != nil {
+	toRel := filepath.Join(stageVersionDir, name)
+	if err := m.rename(root, fromRel, toRel); err != nil {
 		return "", err
 	}
-	return to, nil
+	return filepath.Join(root.Name(), toRel), nil
 }
 
 // writeSentinel writes the ".complete" marker LAST, holding the version whose
@@ -588,8 +653,12 @@ func (m *Manager) writeSentinel(dir string) error {
 // publish renames the staged version directory to its final name and syncs the
 // parent, completing the durability protocol. Pruning may only run after this
 // returns nil.
+//
+// Both halves now go through the same [os.Root]: the delete always did, and the
+// rename that follows it lands at the same name in the same untrusted directory, so
+// leaving it on an absolute path was the delete's own reasoning applied to one of
+// the two operations.
 func (m *Manager) publish(stage *stageTree) error {
-	dst := m.versionDir(m.cfg.Version)
 	// The destination can exist here for exactly one reason: the pinned
 	// directory was rejected by the version probe (a replaced artifact under an
 	// intact sentinel) and is being replaced. It is untrusted, so removing it is
@@ -611,7 +680,7 @@ func (m *Manager) publish(stage *stageTree) error {
 	if err := root.RemoveAll(m.cfg.Version); err != nil {
 		return fmt.Errorf("clearing the previous %s directory: %w", m.cfg.Version, err)
 	}
-	if err := m.rename(stage.versionDir, dst); err != nil {
+	if err := m.rename(root, filepath.Join(stage.rel, stageVersionDir), m.cfg.Version); err != nil {
 		return fmt.Errorf("publishing the version directory: %w", err)
 	}
 	if err := m.fsync(m.versionsDir); err != nil {
@@ -620,26 +689,63 @@ func (m *Manager) publish(stage *stageTree) error {
 	return nil
 }
 
-// writeFileDurably writes data to path through a temp file in the same
-// directory: write, sync, rename, sync the parent.
-func (m *Manager) writeFileDurably(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, dirMode); err != nil {
-		return fmt.Errorf("creating %s: %w", dir, err)
+// writeFileDurably writes data to the single path component name directly under
+// [Config.Root], through a temp file in the same directory: write, sync, rename,
+// sync the parent.
+//
+// name is root-RELATIVE and every step goes through an [os.Root] on Root, which is
+// not decoration. Root is judged by the custody walk as an ANCESTOR of the
+// installation root, so a sticky one — the 1777 shape that makes /tmp usable as a
+// root, and the shape [checkComponent] deliberately exempts from the write question
+// — passes the check while still letting another principal CREATE entries in it.
+// Sticky stops them replacing the state record; it does not stop them planting the
+// temp NAME first. os.WriteFile on that name follows the symlink, so the write left
+// the tree: measured, an arbitrary file outside Root truncated and overwritten with
+// the state record, and the state path left as a symlink pointing at it. The same
+// reachability comes free with [Config.InstallWithoutCustody], which re-authorises
+// this write into a tree the check has already refused.
+//
+// The two reads stay on absolute paths, and only because the confined create is
+// what makes them safe: an entry this process just created inside a sticky
+// directory is one sticky itself forbids another principal from replacing, so by
+// the time the syncs run the names resolve to this process's own files.
+func (m *Manager) writeFileDurably(name string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(m.cfg.Root, dirMode); err != nil {
+		return fmt.Errorf("creating %s: %w", m.cfg.Root, err)
 	}
-	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp")
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	root, err := os.OpenRoot(m.cfg.Root)
+	if err != nil {
+		return fmt.Errorf("opening %s to write %s: %w", m.cfg.Root, name, err)
+	}
+	defer root.Close()
+	tmp := "." + name + ".tmp"
+	if err := root.WriteFile(tmp, data, mode); err != nil {
 		return err
 	}
-	if err := m.fsync(tmp); err != nil {
-		_ = os.Remove(tmp)
+	if err := m.fsync(filepath.Join(m.cfg.Root, tmp)); err != nil {
+		_ = root.Remove(tmp)
 		return err
 	}
-	if err := m.rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := m.rename(root, tmp, name); err != nil {
+		_ = root.Remove(tmp)
 		return err
 	}
-	return m.fsync(dir)
+	return m.fsync(m.cfg.Root)
+}
+
+// renameIn is the production rename: root-relative, so the kernel resolves both
+// names inside root and refuses either one that leaves it.
+//
+// The seam is shaped this way rather than as [os.Rename] over two absolute paths
+// because three of this package's four renames land in territory something else
+// wrote — the directory holding the convenience link, the directory holding the
+// state record, and the artifact tree an in-archive installer populated — and a
+// symlink at any component of those made the rename land outside Root. An
+// [os.Root] answers that in the kernel, on every component, which is the same
+// answer [UnpackZip] already gets for an archive entry and [Manager.publish]
+// already gets for the one delete it makes into untrusted territory.
+func renameIn(root *os.Root, oldname, newname string) error {
+	return root.Rename(oldname, newname)
 }
 
 // fsyncPath commits the file or directory at path to stable storage. fsync on a

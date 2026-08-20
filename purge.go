@@ -223,7 +223,7 @@ func (m *Manager) recordPurge() {
 	}
 	path := filepath.Join(m.cfg.Root, m.cfg.Purge.Marker)
 	stamp := m.now().UTC().Format("2006-01-02T15:04:05Z") + "\n"
-	if err := m.writeFileDurably(path, []byte(stamp), fileMode); err != nil {
+	if err := m.writeFileDurably(m.cfg.Purge.Marker, []byte(stamp), fileMode); err != nil {
 		slog.Warn("failed to record that the purge completed; the sweep repeats on the next start, which is a no-op on a swept volume",
 			"package", m.cfg.Release.Name, "path", path, "error", err)
 		return
@@ -241,6 +241,17 @@ func (m *Manager) recordPurge() {
 // (write a temp name, rename over the old one) with the parent synced and the
 // target validated, and every failure is a warning — a missing convenience
 // pointer must never withhold readiness from a correctly installed release.
+//
+// Every step goes through an [os.Root] on Root, for the reason the sweep at the top
+// of this file already states about the same directory: a directory holding a
+// convenience link is commonly CO-OWNED, so LinkDir is the one tree this package
+// writes into that nothing has proved anything about. The custody walk cannot
+// cover it — it judges the installation root and the ancestors above it, and
+// LinkDir is a SIBLING of that root, never on the chain. Measured on the
+// unconfined form: with LinkDir a symlink out of Root, the link was published
+// outside Root entirely, contradicting this package's own claim that Root is the
+// only tree it writes. Deleting from here was already confined; publishing was not,
+// and one rule for one directory is the point.
 func (m *Manager) publishConvenienceLink(target string) {
 	if m.cfg.LinkDir == "" {
 		return
@@ -250,24 +261,34 @@ func (m *Manager) publishConvenienceLink(target string) {
 			"package", m.cfg.Release.Name, "target", target)
 		return
 	}
+	root, err := os.OpenRoot(m.cfg.Root)
+	if err != nil {
+		slog.Warn("failed to open the root to publish the convenience symlink",
+			"package", m.cfg.Release.Name, "root", m.cfg.Root, "error", err)
+		return
+	}
+	defer root.Close()
 	linkDir := filepath.Join(m.cfg.Root, m.cfg.LinkDir)
-	if err := os.MkdirAll(linkDir, dirMode); err != nil {
+	if err := root.MkdirAll(m.cfg.LinkDir, dirMode); err != nil {
 		slog.Warn("failed to create the link dir for the convenience symlink",
 			"package", m.cfg.Release.Name, "path", linkDir, "error", err)
 		return
 	}
-	link := filepath.Join(linkDir, m.primary)
-	tmp := filepath.Join(linkDir, "."+m.primary+".newlink")
-	_ = os.Remove(tmp)
-	if err := os.Symlink(target, tmp); err != nil {
+	link := filepath.Join(m.cfg.LinkDir, m.primary)
+	tmp := filepath.Join(m.cfg.LinkDir, "."+m.primary+".newlink")
+	_ = root.Remove(tmp)
+	// The TARGET is deliberately not root-relative. os.Root resolves the name being
+	// created, never the text a symlink is given, and the text has to stay the
+	// absolute version-directory path an operator's shell will resolve.
+	if err := root.Symlink(target, tmp); err != nil {
 		slog.Warn("failed to stage the convenience symlink",
-			"package", m.cfg.Release.Name, "path", tmp, "error", err)
+			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, tmp), "error", err)
 		return
 	}
-	if err := m.rename(tmp, link); err != nil {
-		_ = os.Remove(tmp)
+	if err := m.rename(root, tmp, link); err != nil {
+		_ = root.Remove(tmp)
 		slog.Warn("failed to publish the convenience symlink; the bare name will not resolve, the primary path is unaffected",
-			"package", m.cfg.Release.Name, "path", link, "error", err)
+			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "error", err)
 		return
 	}
 	if err := m.fsync(linkDir); err != nil {
@@ -275,5 +296,5 @@ func (m *Manager) publishConvenienceLink(target string) {
 			"package", m.cfg.Release.Name, "error", err)
 	}
 	slog.Debug("published the convenience symlink",
-		"package", m.cfg.Release.Name, "path", link, "target", target)
+		"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "target", target)
 }

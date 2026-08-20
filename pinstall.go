@@ -148,10 +148,13 @@ type Manager struct {
 	// Seams. Every one of these is a boundary the tests replace; none is part
 	// of the public surface, because a consumer configures behaviour through
 	// Release and Config, not by substituting the filesystem.
-	fetch        func(ctx context.Context, url string, dst io.Writer) error
-	run          runCommand
-	fsync        func(path string) error
-	rename       func(oldpath, newpath string) error
+	fetch func(ctx context.Context, url string, dst io.Writer) error
+	run   runCommand
+	fsync func(path string) error
+	// rename is root-RELATIVE, so every rename this package performs is confined
+	// by the kernel rather than by the caller having built the two paths
+	// correctly. See [Manager.renameIn] for why that is the seam's shape.
+	rename       func(root *os.Root, oldname, newname string) error
 	now          func() time.Time
 	sleep        func(ctx context.Context, d time.Duration) error
 	unpack       Unpacker
@@ -174,7 +177,11 @@ type Manager struct {
 	urlTemplate string
 	primary     string
 	versionsDir string
-	statePath   string
+	// stateName is the state record's single path component under Root, which is
+	// what [Manager.writeFileDurably] takes; statePath is the same fact spelled
+	// absolutely, for the diagnostics that name it to an operator.
+	stateName string
+	statePath string
 
 	// opSem serialises the long filesystem operations (Ensure, Rescan). It is
 	// deliberately NOT the state lock: it IS held across I/O, which is the whole
@@ -264,7 +271,7 @@ func New(cfg *Config) (*Manager, error) {
 		fetch:        httpFetch,
 		run:          execRunner,
 		fsync:        fsyncPath,
-		rename:       os.Rename,
+		rename:       renameIn,
 		now:          time.Now,
 		sleep:        sleepCtx,
 		unpack:       orDefaultUnpacker(c.Release.Unpack),
@@ -277,6 +284,7 @@ func New(cfg *Config) (*Manager, error) {
 		urlTemplate:  template,
 		primary:      primary,
 		versionsDir:  filepath.Join(c.Root, c.Release.Name+versionsSuffix),
+		stateName:    c.Release.Name + stateSuffix,
 		statePath:    filepath.Join(c.Root, c.Release.Name+stateSuffix),
 		phase:        phaseIdle,
 		state:        State{Pinned: c.Version},
@@ -848,7 +856,7 @@ func (m *Manager) saveState(s *State) {
 		return
 	}
 
-	if err := m.writeFileDurably(m.statePath, append(blob, '\n'), fileMode); err != nil {
+	if err := m.writeFileDurably(m.stateName, append(blob, '\n'), fileMode); err != nil {
 		slog.Warn("failed to persist the state record; it is diagnostic only, so readiness is unaffected",
 			"package", m.cfg.Release.Name, "path", m.statePath, "error", err)
 	}

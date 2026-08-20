@@ -20,7 +20,12 @@
 // [Config.InstallWithoutCustody]. The verified archive itself is unlinked before the first byte
 // arrives and reaches the unpacker as a reader on that same descriptor, so it has
 // no name to substitute, and the unpacker writes through an [os.Root] on the
-// extraction directory, so no archive entry can escape it.
+// extraction directory, so no archive entry can escape it. Every other write, rename
+// and delete this package performs goes through an [os.Root] too, on the tree it
+// belongs to: custody covers the versions root and the ancestors above it, which
+// leaves the co-owned link directory, the state record and the purge marker directly
+// under Root, and the staging tree an in-archive installer populates, all resting on
+// containment rather than on a verdict.
 //
 // Every start re-probes the artifact it is about to activate, re-asserts the
 // caller's assertions against it, retains N predecessors and reports a readiness

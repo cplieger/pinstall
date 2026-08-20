@@ -384,14 +384,20 @@ func (e *fakeEnv) fsync(path string) error {
 	return fsyncPath(path)
 }
 
-func (e *fakeEnv) rename(oldpath, newpath string) error {
+// rename stands in for the manager's rename seam. The seam is root-RELATIVE (see
+// [renameIn]), and the hook is not: it keeps taking the two ABSOLUTE paths, because
+// what a test wants to name is the file it staged, not an offset into a root handle
+// it never opened. The join happens here, once.
+func (e *fakeEnv) rename(root *os.Root, oldname, newname string) error {
+	oldpath := filepath.Join(root.Name(), oldname)
+	newpath := filepath.Join(root.Name(), newname)
 	e.record("rename %s -> %s", oldpath, newpath)
 	if e.onRename != nil {
 		if err := e.onRename(oldpath, newpath); err != nil {
 			return err
 		}
 	}
-	return os.Rename(oldpath, newpath)
+	return root.Rename(oldname, newname)
 }
 
 func (e *fakeEnv) sleep(_ context.Context, d time.Duration) error {

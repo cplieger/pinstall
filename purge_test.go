@@ -474,3 +474,90 @@ func mustReadDir(t *testing.T, dir string) []string {
 	}
 	return out
 }
+
+// TestConvenienceLinkPublishStaysUnderRoot pins the link publish inside Root.
+//
+// LinkDir is the one tree this package writes into that nothing has proved anything
+// about: the custody walk judges the installation root and the ancestors above it,
+// and LinkDir is a SIBLING of that root, so it is never on the chain. The README
+// says a directory holding a convenience link is commonly co-owned, and the purge
+// already confines its DELETES there for exactly that reason — so a plant at that
+// name is a shape to expect, not an exotic one.
+//
+// Before the confinement this published the symlink outside Root entirely,
+// contradicting the package's own claim that Root is the only tree it writes.
+func TestConvenienceLinkPublishStaysUnderRoot(t *testing.T) {
+	env := newFakeEnv(t)
+	outside := filepath.Join(filepath.Dir(env.root), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("MkdirAll the directory outside Root: %v", err)
+	}
+	if err := os.MkdirAll(env.root, 0o755); err != nil {
+		t.Fatalf("MkdirAll Root: %v", err)
+	}
+	// Another owner of the tree puts a pointer out of Root at the link directory's
+	// name, which sticky permits: it restricts removal and renaming, never CREATE.
+	if err := os.Symlink(outside, filepath.Join(env.root, testLinkDir)); err != nil {
+		t.Fatalf("Symlink the link dir out of Root: %v", err)
+	}
+
+	m := env.manager()
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	if entries := mustReadDir(t, outside); len(entries) != 0 {
+		t.Errorf("the publish wrote %v outside Root, want nothing", entries)
+	}
+	// And the failure is a warning, not a withheld verdict: the link is not an
+	// integrity input, so an unpublishable one must not cost readiness.
+	if ready, why := m.Ready(); !ready {
+		t.Errorf("Ready() = false (%s), want true: the convenience link is never an integrity input", why)
+	}
+	if got, want := m.Path(), filepath.Join(env.versionDir(pinnedVersion), toolName); got != want {
+		t.Errorf("Path() = %q, want %q", got, want)
+	}
+}
+
+// TestPurgeMarkerWriteStaysUnderRoot pins the durable write inside Root.
+//
+// The marker and the state record are the two files this package writes DIRECTLY
+// under Root, through a temp name in the same directory. Root reaches the custody
+// walk as an ANCESTOR of the installation root, so a sticky one passes the check
+// while still letting another principal create entries in it — and the temp name is
+// derivable from the profile. Before the confinement, os.WriteFile followed a
+// symlink planted at that name: measured, a file outside Root was truncated and
+// overwritten, and the marker path was left as a symlink pointing at it.
+func TestPurgeMarkerWriteStaysUnderRoot(t *testing.T) {
+	env := newFakeEnv(t)
+	outside := filepath.Join(filepath.Dir(env.root), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("MkdirAll the directory outside Root: %v", err)
+	}
+	if err := os.MkdirAll(env.root, 0o755); err != nil {
+		t.Fatalf("MkdirAll Root: %v", err)
+	}
+	victim := filepath.Join(outside, "victim")
+	const want = "ORIGINAL\n"
+	if err := os.WriteFile(victim, []byte(want), 0o600); err != nil {
+		t.Fatalf("seed the file outside Root: %v", err)
+	}
+	for _, name := range []string{"." + legacyMarker + ".tmp", "." + toolName + stateSuffix + ".tmp"} {
+		if err := os.Symlink(victim, filepath.Join(env.root, name)); err != nil {
+			t.Fatalf("Symlink %s at the temp name: %v", name, err)
+		}
+	}
+
+	m := env.manager(func(c *Config) { c.Purge = &Purge{Marker: legacyMarker} })
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	got, err := os.ReadFile(victim)
+	switch {
+	case err != nil:
+		t.Fatalf("the file outside Root is gone: %v", err)
+	case string(got) != want:
+		t.Errorf("the file outside Root now holds %q, want it untouched at %q", string(got), want)
+	}
+}
