@@ -5,6 +5,7 @@ package pinstall
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path/filepath"
 	"slices"
@@ -268,6 +269,64 @@ func (r *Release) binary() string {
 		return r.Binary
 	}
 	return r.Name
+}
+
+// snapshot returns a Config that shares no memory with c, so nothing the caller
+// does to its own value afterwards can change what the manager installs, asserts,
+// probes or deletes.
+//
+// A plain `*cfg` is not that. Every reference-bearing field survives it — two maps,
+// six slices, two POINTERS, and one slice inside each [Assertion] — and four of them
+// are read long after [New] returns and validation has passed. Measured on the
+// shallow copy: mutating the caller's own value after construction rewrote the argv
+// of a [Release.Mandatory] assertion, which is the one thing that field exists to
+// make impossible ("the set a deployment cannot weaken, reword or drop"); rewrote
+// [Release.ProbeArgs], the argv every start runs against the artifact it is about to
+// activate; and rewrote both [Purge] slices, which is the DELETE list, after
+// [Purge.validate] had passed on the old one, so `../escaped` reached the sweep.
+//
+// It copies the fields nothing reads after construction as well, and that is
+// deliberate rather than thorough-for-its-own-sake: a copy whose boundary is "the
+// fields that happen to be read today" is a detail the next reader will miss, and
+// the next read added is then a defect nobody edited into existence.
+func (c *Config) snapshot() Config {
+	out := *c
+	out.Digests = maps.Clone(c.Digests)
+	out.Assert = cloneAssertions(c.Assert)
+	out.Require = slices.Clone(c.Require)
+	out.Optional = slices.Clone(c.Optional)
+	out.TrustedUIDs = slices.Clone(c.TrustedUIDs)
+	out.TrustedGIDs = slices.Clone(c.TrustedGIDs)
+	out.Release.ArchTokens = maps.Clone(c.Release.ArchTokens)
+	out.Release.ProbeArgs = slices.Clone(c.Release.ProbeArgs)
+	out.Release.Mandatory = cloneAssertions(c.Release.Mandatory)
+	if c.Release.Installer != nil {
+		inst := *c.Release.Installer
+		inst.Args = slices.Clone(c.Release.Installer.Args)
+		out.Release.Installer = &inst
+	}
+	if c.Purge != nil {
+		p := *c.Purge
+		p.Artifacts = slices.Clone(c.Purge.Artifacts)
+		p.Names = slices.Clone(c.Purge.Names)
+		out.Purge = &p
+	}
+	return out
+}
+
+// cloneAssertions copies a set of assertions and each one's argv. Cloning the outer
+// slice alone would leave every [Assertion.Args] pointing at the caller's own
+// backing array, which is the argv this package hands to a subprocess.
+func cloneAssertions(in []Assertion) []Assertion {
+	if in == nil {
+		return nil
+	}
+	out := make([]Assertion, 0, len(in))
+	for _, a := range in {
+		a.Args = slices.Clone(a.Args)
+		out = append(out, a)
+	}
+	return out
 }
 
 // validate checks everything about the profile that cannot depend on a
