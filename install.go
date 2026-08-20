@@ -3,6 +3,7 @@
 package pinstall
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -438,10 +439,7 @@ func (m *Manager) runInstaller(ctx context.Context, stage *stageTree) (string, e
 	if !selfContained(script) {
 		return "", fmt.Errorf("the archive holds no executable installer at %s", inst.Path)
 	}
-	homeEnv := inst.HomeEnv
-	if homeEnv == "" {
-		homeEnv = "HOME"
-	}
+	homeEnv := cmp.Or(inst.HomeEnv, "HOME")
 	timeout := inst.Timeout
 	if timeout <= 0 {
 		timeout = defaultInstallerTimeout
