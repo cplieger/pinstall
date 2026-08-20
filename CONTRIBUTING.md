@@ -39,7 +39,7 @@ even if the API is untouched.
   and the unpacker receives an `os.Root` rather than a directory path. Do not
   reintroduce a path for either: `TestDownloadedArchiveHasNoNameWhileItIsBeingUsed`
   and the `Unpacker` seam tests are what hold this. The root is a better tool, not a
-  sandbox — a callback is ordinary Go code and can call `os.OpenFile` itself — so
+  sandbox (a callback is ordinary Go code and can call `os.OpenFile` itself), so
   what it buys is that the contained path is the shortest one, and do not describe it
   as making escape impossible.
 - **Nothing reaches a version directory before the digest matches.** The staging
@@ -59,10 +59,10 @@ even if the API is untouched.
 The core package names no vendor and carries no upstream's facts. When you need a
 behaviour that varies per package, the order of preference is:
 
-1. **Data on `Release` or `Config`** — a string, a slice, a map. Most things are
+1. **Data on `Release` or `Config`**: a string, a slice, a map. Most things are
    this: the URL template, the architecture tokens, the probe argv, the artifact
    names, the assertions.
-2. **A nil-defaultable function field** — only where the shape genuinely has no
+2. **A nil-defaultable function field**: only where the shape genuinely has no
    universal form (`ParseVersion`) or where an enum with one implemented value
    would be a partially built public surface (`Unpack`).
 
@@ -77,7 +77,7 @@ behaviour that varies per package, the order of preference is:
    a better tool, not a sandbox: a callback is ordinary in-process Go code and can read
    `dst.Name()` and call `os.OpenFile` itself, so do not write down that escape is
    impossible.
-3. **Nothing** — where one strategy exists and no consumer differs on it. The
+3. **Nothing**: where one strategy exists and no consumer differs on it. The
    private-staging-home approach is deliberately not a knob; `Installer.HomeEnv`
    plus `ArtifactDir` is all the genericity it needs.
 
@@ -116,8 +116,8 @@ Flat, one concept per file:
 | `errors.go` | the sentinel errors |
 | `kirocli/` | one shipped profile; the core must never import it |
 
-Every boundary the manager crosses — the archive fetch, subprocess execution,
-`fsync`, `rename`, the clock, the sleep — is an unexported struct field on
+Every boundary the manager crosses (the archive fetch, subprocess execution,
+`fsync`, `rename`, the clock, the sleep) is an unexported struct field on
 `Manager`, replaced wholesale by the test harness. They stay unexported: a
 consumer configures behaviour through `Release` and `Config`, not by substituting
 the filesystem. Add a seam only when a real failure path cannot otherwise be
@@ -147,7 +147,7 @@ golangci-lint fmt
 ```
 
 `fieldalignment` is why the exported config structs put a trailing slice last and
-`Manager` carries an explained `//nolint` — its field order documents which lock
+`Manager` carries an explained `//nolint`: its field order documents which lock
 guards what, which is worth more than the bytes.
 
 ### Mutation testing
@@ -166,7 +166,7 @@ The core tests are in-package (`package pinstall`) because they replace the
 manager's seams; `example_test.go` and the `kirocli` tests are external, so they
 exercise the surface a consumer sees. Match the file to the unit:
 
-- `harness_test.go`: `fakeEnv` — the double for every boundary, the in-memory zip
+- `harness_test.go`: `fakeEnv`, the double for every boundary, the in-memory zip
   builders, and the fixtures that plant complete or partial version directories.
   It is profile-driven, so the same harness runs any test profile.
 - `pinstall_test.go`: construction validation, the mandatory-assertion refusal and
@@ -186,7 +186,7 @@ exercise the surface a consumer sees. Match the file to the unit:
 - `unpack_test.go`: containment positively and negatively (asserted on the
   filesystem, not on a lexical helper), mode handling, duplicate entry names, and
   the entry-count and size budgets.
-- `custody_test.go`: the precondition — a private tree accepted including the sticky
+- `custody_test.go`: the precondition: a private tree accepted including the sticky
   ancestor others can write, every shape of non-owner write refused at every depth, an
   NFSv4 ACL evaluated and then accepted once its writer is declared, a POSIX ACL whose
   mask withholds write, the chain rules (the path as written, the path it resolves to, and
