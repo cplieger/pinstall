@@ -882,3 +882,70 @@ func TestEnsureStillHonoursCancellation(t *testing.T) {
 		t.Fatal("Ensure returned nil for an already-cancelled context; a shutdown could no longer stop an install")
 	}
 }
+
+// TestNewSnapshotsTheCallerConfig pins New's claim that nothing the manager keeps
+// shares memory with the caller's Config.
+//
+// A plain `*cfg` leaves every reference-bearing field aliased, and four of them are
+// read long after New returns: the argv of each assertion (what runs against the
+// installed artifact), Release.ProbeArgs (what every start runs to identify a
+// candidate), Release.Installer.Args (what the in-archive installer is invoked with),
+// and both Purge slices (the DELETE list, aliased across the validation that just
+// approved it). The Mandatory case is the sharpest: that field exists to be the set
+// "a deployment cannot weaken, reword or drop", and an aliased Args made rewording it
+// after construction a one-line assignment.
+func TestNewSnapshotsTheCallerConfig(t *testing.T) {
+	env := newFakeEnv(t)
+	cfg := env.config(func(c *Config) {
+		c.Purge = &Purge{Artifacts: []string{"legacy-artifact"}, Names: []string{toolName}, Marker: legacyMarker}
+		c.Assert = []Assertion{{Name: "extra", Args: []string{"settings", "extra", "true"}}}
+	})
+	m, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Everything a caller could reach into after construction.
+	cfg.Digests["amd64"] = "mutated"
+	cfg.Require = append(cfg.Require, "mutated")
+	cfg.Optional = append(cfg.Optional, "mutated")
+	cfg.TrustedUIDs = append(cfg.TrustedUIDs, 4242)
+	cfg.TrustedGIDs = append(cfg.TrustedGIDs, 4242)
+	cfg.Release.ArchTokens["amd64"] = "mutated"
+	cfg.Release.ProbeArgs[0] = "mutated"
+	cfg.Release.Installer.Args[0] = "mutated"
+	cfg.Release.Mandatory[0].Args[2] = "mutated"
+	cfg.Assert[0].Args[2] = "mutated"
+	cfg.Purge.Artifacts[0] = "../escaped"
+	cfg.Purge.Names[0] = "mutated"
+
+	checks := map[string]string{
+		"Digests":                m.cfg.Digests["amd64"],
+		"Release.ArchTokens":     m.cfg.Release.ArchTokens["amd64"],
+		"Release.ProbeArgs":      m.cfg.Release.ProbeArgs[0],
+		"Release.Installer.Args": m.cfg.Release.Installer.Args[0],
+		"Purge.Artifacts":        m.cfg.Purge.Artifacts[0],
+		"Purge.Names":            m.cfg.Purge.Names[0],
+		"resolved digest":        m.digest,
+		"resolved arch token":    m.archToken,
+	}
+	for field, got := range checks {
+		if got == "mutated" || got == "../escaped" {
+			t.Errorf("%s reads %q after the caller mutated its own Config, so New aliased it", field, got)
+		}
+	}
+	for _, a := range m.cfg.Assert {
+		if slices.Contains(a.Args, "mutated") {
+			t.Errorf("assertion %q argv reads %v after the caller mutated its own Config, so New aliased it", a.Name, a.Args)
+		}
+	}
+	if slices.Contains(m.cfg.Require, "mutated") || slices.Contains(m.cfg.Optional, "mutated") {
+		t.Errorf("Require/Optional read %v/%v, so New aliased one of them", m.cfg.Require, m.cfg.Optional)
+	}
+	if slices.Contains(m.trust.uids, 4242) || slices.Contains(m.trust.gids, 4242) {
+		t.Errorf("the trust set reads %v/%v, so New aliased it", m.trust.uids, m.trust.gids)
+	}
+	if slices.Contains(m.cfg.TrustedUIDs, 4242) || slices.Contains(m.cfg.TrustedGIDs, 4242) {
+		t.Errorf("Config.TrustedUIDs/GIDs read %v/%v, so New aliased one of them", m.cfg.TrustedUIDs, m.cfg.TrustedGIDs)
+	}
+}

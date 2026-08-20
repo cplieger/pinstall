@@ -225,14 +225,19 @@ type Manager struct {
 // It resolves the architecture from runtime.GOARCH when [Config.GOARCH] is
 // empty, requires a well-formed digest for the resolved architecture, merges
 // [Release.Mandatory] into [Config.Assert], and refuses a profile that declares
-// no mandatory assertions. The caller's Config is not modified, and every fact
-// this manager depends on is copied, so a later mutation of the caller's maps or
-// slices cannot change its behaviour.
+// no mandatory assertions.
+//
+// The caller's Config is not modified, and nothing the manager keeps shares memory
+// with it: the snapshot is taken BEFORE validation, so what was validated is what
+// the manager will use. That covers the two POINTERS as well as the maps and slices
+// — [Config.Purge] and [Release.Installer] — and the argv inside every
+// [Assertion], which is what a later mutation would otherwise have been able to
+// rewrite. See [Config.snapshot].
 func New(cfg *Config) (*Manager, error) {
 	if cfg == nil {
 		return nil, errors.New("pinstall: Config is required")
 	}
-	c := *cfg
+	c := cfg.snapshot()
 	if err := c.Release.validate(); err != nil {
 		return nil, err
 	}
@@ -259,8 +264,7 @@ func New(cfg *Config) (*Manager, error) {
 	primary := c.Release.binary()
 	c.GOARCH = goarch
 	c.Assert = mergeAssertions(c.Assert, c.Release.Mandatory)
-	c.Require = withPrimaryArtifact(slices.Clone(c.Require), primary)
-	c.Optional = slices.Clone(c.Optional)
+	c.Require = withPrimaryArtifact(c.Require, primary)
 	applyConfigDefaults(&c)
 	template := c.URLTemplate
 	if template == "" {
