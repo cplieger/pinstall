@@ -196,7 +196,7 @@ An `Assertion` is a bounded command run against the installed artifact — the f
 
 `pinstall` names no vendor. A ready-made profile for one release ships alongside it:
 
-- `pinstall/kirocli` — the [kiro-cli](https://kiro.dev) release: URL shape, architecture tokens, in-archive installer, probe argv, licence notice, and the auto-update assertion. Also `kirocli.Setting(key, bool)` / `kirocli.SettingRaw(key, value)` for building assertions in that package's own settings grammar.
+- `pinstall/kirocli` — the [kiro-cli](https://kiro.dev) release: URL shape, architecture tokens, in-archive installer, probe argv, licence notice, and the auto-update assertion. Also `kirocli.Setting(key, bool)` / `kirocli.SettingRaw(key, value)` for building assertions in that package's own settings grammar. Both take a `kirocli.SettingKey` rather than a `string`, so a key and a string value cannot be transposed in a `SettingRaw` call — a literal still converts implicitly, and a variable has to be declared as one.
 
 ```go
 mgr, err := pinstall.New(&pinstall.Config{

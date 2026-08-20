@@ -34,7 +34,12 @@ const Name = "kiro-cli"
 // autoUpdateSetting is the one setting the integrity story depends on: with
 // auto-update live the binary can replace itself and invalidate the verified
 // digest, so [Release] declares it Mandatory and no deployment can drop it.
-const autoUpdateSetting = "app.disableAutoupdates"
+//
+// It is typed rather than an untyped string constant, which changes nothing at the
+// call site (an untyped constant converts implicitly) and everything about what the
+// declaration says: this package's own key is a [SettingKey] like every key a
+// consumer passes.
+const autoUpdateSetting SettingKey = "app.disableAutoupdates"
 
 // urlTemplate is the published archive URL. The version is pinned rather than a
 // floating "latest" so a given deployment is reproducible and the digest check is
