@@ -214,7 +214,7 @@ func encodeZip(entries []namedEntry) ([]byte, error) {
 // business rather than the extractor's, so the error is returned for the caller to
 // skip on.
 func zipWithRawName(name string) ([]byte, error) {
-	return encodeZip([]namedEntry{{name: name, zipEntry: zipEntry{body: "x", mode: 0o644}}})
+	return encodeZip([]namedEntry{{name: name, body: "x", mode: 0o644}})
 }
 
 // installerArchive is an archive whose only useful content is the installer the
