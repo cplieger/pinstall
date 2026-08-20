@@ -99,7 +99,7 @@ func main() {
 }
 ```
 
-The library writes only under `Root`:
+The library writes only under `Root`, and that is enforced rather than intended: every write, rename and delete it performs goes through an `os.Root` on the tree it belongs to, so a symlink at any component is refused by the kernel instead of followed. Three directories need it — the co-owned `LinkDir`, `Root` itself where the state record and the purge marker land, and the staging tree an in-archive installer populates — because none of them is covered by the custody check, which judges the versions root and the ancestors above it.
 
 ```text
 <Root>/

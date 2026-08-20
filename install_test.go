@@ -945,3 +945,56 @@ func TestPublishClearsASymlinkedDestinationThroughTheRoot(t *testing.T) {
 		t.Error("the published version directory does not hold the primary artifact")
 	}
 }
+
+// TestMoveArtifactRefusesASymlinkedSourceDirectory pins the artifact move inside the
+// staging tree.
+//
+// The source directory is territory something ELSE wrote: an in-archive installer
+// chose what it dropped into its private home, and with no installer it is the
+// extracted archive. os.Root PERMITS creating a symlink whose target leaves the root
+// (it validates the name being created, not the text the link carries) and refuses to
+// FOLLOW one, so a custom Unpacker reproducing an archive symlink can legitimately
+// leave one at ArtifactDir.
+//
+// Before the confinement, filepath.Join followed it and os.Rename moved a file from
+// outside the staging tree INTO the version directory this package is about to
+// publish — which makes the one claim everything here reduces to (the artifact came
+// out of the digest-verified archive) false, and destroys the file at its original
+// location, since a rename is not a copy.
+func TestMoveArtifactRefusesASymlinkedSourceDirectory(t *testing.T) {
+	env := newFakeEnv(t)
+	stage := t.TempDir()
+	outside := filepath.Join(stage, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("MkdirAll the directory outside the staging tree: %v", err)
+	}
+	planted := filepath.Join(outside, toolName)
+	if err := os.WriteFile(planted, []byte("not from the archive\n"), 0o755); err != nil {
+		t.Fatalf("seed the file outside the staging tree: %v", err)
+	}
+	// What the unpacker or the installer left where a directory of artifacts belongs.
+	srcRel := filepath.Join(stageHomeDir, "artifacts")
+	if err := os.MkdirAll(filepath.Join(stage, stageHomeDir), 0o755); err != nil {
+		t.Fatalf("MkdirAll the staging home: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(stage, srcRel)); err != nil {
+		t.Fatalf("Symlink the artifact dir out of the staging tree: %v", err)
+	}
+	root := openRoot(t, stage)
+	if err := root.MkdirAll(stageVersionDir, dirMode); err != nil {
+		t.Fatalf("MkdirAll the staged version directory: %v", err)
+	}
+
+	to, err := env.manager().moveArtifact(root, srcRel, toolName)
+	if err == nil {
+		t.Errorf("moveArtifact = %q, want a refusal: the source directory leaves the staging tree", to)
+	} else if !strings.Contains(err.Error(), "not reachable inside the staging tree") {
+		t.Errorf("moveArtifact error = %v, want one naming the containment refusal", err)
+	}
+	if !exists(planted) {
+		t.Error("the file outside the staging tree was renamed away, so the move escaped")
+	}
+	if exists(filepath.Join(stage, stageVersionDir, toolName)) {
+		t.Error("the staged version directory holds an artifact that never came out of the archive")
+	}
+}
