@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -776,36 +777,50 @@ func assertNoWorkingDirectoryOnPATH(t *testing.T, overlay []string) {
 
 // A caller that gives up while queued must return promptly instead of holding a
 // goroutine inside the library until an operation it never started finishes.
+//
+// Inside a synctest bubble because the first half is a NEGATIVE assertion — "it is
+// still waiting" — and on a real clock that is only ever probabilistic: a 50 ms
+// time.After says the queued caller had not returned within 50 ms, not that it
+// could not. synctest.Wait returns when every goroutine in the bubble is DURABLY
+// blocked, so reading the channel after it is a proof rather than a guess, and the
+// same substitution retires the 5 s deadline guard on the second half. The queued
+// caller parks on a channel send inside a select, which is durable, so the bubble
+// has something to settle on; a goroutine busy-spinning or parked on an external
+// socket would hang here instead.
 func TestOperationWaitIsCancellable(t *testing.T) {
 	env := newFakeEnv(t)
-	m := env.manager()
+	synctest.Test(t, func(t *testing.T) {
+		m := env.manager()
 
-	// Occupy the slot exactly as a running operation would.
-	if err := m.acquireOp(t.Context()); err != nil {
-		t.Fatalf("acquireOp: %v", err)
-	}
-	defer m.releaseOp()
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- m.acquireOp(ctx) }()
-
-	// It must still be waiting: the slot is taken.
-	select {
-	case err := <-done:
-		t.Fatalf("acquireOp returned %v while the slot was held", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("acquireOp err = %v, want context.Canceled", err)
+		// Occupy the slot exactly as a running operation would.
+		if err := m.acquireOp(t.Context()); err != nil {
+			t.Fatalf("acquireOp: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("acquireOp did not return after its context was cancelled; the wait is not cancellable")
-	}
+		defer m.releaseOp()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- m.acquireOp(ctx) }()
+
+		// It must still be waiting: the slot is taken.
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("acquireOp returned %v while the slot was held", err)
+		default:
+		}
+
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("acquireOp err = %v, want context.Canceled", err)
+			}
+		default:
+			t.Fatal("acquireOp did not return after its context was cancelled; the wait is not cancellable")
+		}
+	})
 }
 
 // A queued Rescan whose caller disconnects must not run, and must not disturb the
