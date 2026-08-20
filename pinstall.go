@@ -3,6 +3,7 @@
 package pinstall
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -266,10 +267,7 @@ func New(cfg *Config) (*Manager, error) {
 	c.Assert = mergeAssertions(c.Assert, c.Release.Mandatory)
 	c.Require = withPrimaryArtifact(c.Require, primary)
 	applyConfigDefaults(&c)
-	template := c.URLTemplate
-	if template == "" {
-		template = c.Release.URLTemplate
-	}
+	template := cmp.Or(c.URLTemplate, c.Release.URLTemplate)
 	return &Manager{
 		opSem:        make(chan struct{}, 1),
 		fetch:        httpFetch,

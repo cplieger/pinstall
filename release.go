@@ -3,6 +3,7 @@
 package pinstall
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -265,10 +266,7 @@ type Config struct {
 
 // binary returns the primary artifact's file name.
 func (r *Release) binary() string {
-	if r.Binary != "" {
-		return r.Binary
-	}
-	return r.Name
+	return cmp.Or(r.Binary, r.Name)
 }
 
 // snapshot returns a Config that shares no memory with c, so nothing the caller
