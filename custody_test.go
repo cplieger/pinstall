@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -467,6 +468,49 @@ func TestVerifyCustodyRefusesASymlinkCycle(t *testing.T) {
 	if !errors.Is(err, syscall.ELOOP) {
 		t.Errorf("error %v does not carry ELOOP, which is what an operator will recognise this as", err)
 	}
+}
+
+// TestVerifyCustodyFollowsAsManyLinksAsTheKernelWould pins where the resolution bound
+// sits. The bound mirrors SYMLOOP_MAX, so a chain the kernel would resolve has to be one
+// this walk resolves too: refusing one link earlier would refuse a tree open(2) reaches
+// perfectly well, and the refusal is an install outage rather than a diagnosis.
+//
+// Each pass expands ONE link, and the pass after the last expansion is the one that judges
+// where the tree actually lives, so a chain of exactly the bound needs one more pass than
+// it has links.
+func TestVerifyCustodyFollowsAsManyLinksAsTheKernelWould(t *testing.T) {
+	// chain links a run of symlinks ending at a private directory and returns the head.
+	chain := func(t *testing.T, links int) string {
+		t.Helper()
+		base := t.TempDir()
+		target := filepath.Join(base, "installed")
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatalf("Mkdir(%s): %v", target, err)
+		}
+		next := target
+		for i := links - 1; i >= 0; i-- {
+			link := filepath.Join(base, fmt.Sprintf("hop%02d", i))
+			if err := os.Symlink(next, link); err != nil {
+				t.Fatalf("Symlink(%s -> %s): %v", link, next, err)
+			}
+			next = link
+		}
+		return next
+	}
+
+	t.Run("a chain at the bound resolves", func(t *testing.T) {
+		if err := verifyCustodyChain(chain(t, maxSymlinkHops), trustedWriters{}, true); err != nil {
+			t.Errorf("verifyCustodyChain over %d links = %v, want nil: the kernel follows a chain this long",
+				maxSymlinkHops, err)
+		}
+	})
+
+	t.Run("a chain past the bound is refused", func(t *testing.T) {
+		err := verifyCustodyChain(chain(t, maxSymlinkHops+1), trustedWriters{}, true)
+		if !errors.Is(err, syscall.ELOOP) {
+			t.Errorf("verifyCustodyChain over %d links = %v, want an ELOOP refusal", maxSymlinkHops+1, err)
+		}
+	})
 }
 
 // TestVerifyCustodyRefusesAForeignSymlinkInAStickyDirectoryWidenedOnlyByItsACL is the
@@ -1669,6 +1713,93 @@ func TestAllowsTrustsGroupZeroWithoutPrivilege(t *testing.T) {
 	}
 	if trust.allows(principal{kind: principalEveryone}, euid) {
 		t.Error("everyone is trusted, which nothing may ever make true")
+	}
+}
+
+// TestARefusalNamesTheTrustKnobsOnlyWhileTheyAreUnused pins the hint's two directions.
+// An operator who has not heard of Config.TrustedUIDs needs the refusal to name it; one
+// who has clearly used it needs the message not to repeat the suggestion, because the
+// identity they are being told about is then the real problem rather than a knob they
+// have not found yet.
+//
+// The fixture grants EVERYONE write and the owning group nothing, so the stranger the
+// walk names is "everyone" whatever uid or gid the runner has, and everyone is one
+// identity these knobs can never declare.
+func TestARefusalNamesTheTrustKnobsOnlyWhileTheyAreUnused(t *testing.T) {
+	const knob = "Config.TrustedUIDs"
+	dir := filepath.Join(t.TempDir(), toolName+versionsSuffix)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", dir, err)
+	}
+	if err := os.Chmod(dir, 0o707); err != nil {
+		t.Fatalf("Chmod(%s): %v", dir, err)
+	}
+
+	tests := map[string]struct {
+		trust    trustedWriters
+		wantHint bool
+	}{
+		"nothing declared":    {wantHint: true},
+		"uids declared":       {trust: trustedWriters{uids: []int{4242}}},
+		"gids declared":       {trust: trustedWriters{gids: []int{4242}}},
+		"both kinds declared": {trust: trustedWriters{uids: []int{4242}, gids: []int{4242}}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := verifyCustody(dir, tc.trust)
+			if !errors.Is(err, ErrNoCustody) {
+				t.Fatalf("verifyCustody(%+v) = %v, want ErrNoCustody: everyone can write this directory", tc.trust, err)
+			}
+			switch got := strings.Contains(err.Error(), knob); {
+			case tc.wantHint && !got:
+				t.Errorf("error %q does not name %s, the knob that answers a refusal like this", err, knob)
+			case !tc.wantHint && got:
+				t.Errorf("error %q names %s to a caller that has already used it", err, knob)
+			}
+		})
+	}
+}
+
+// TestAnUncontrolledTreeIsWarnedAbout pins the diagnostic half of the custody verdict.
+// A refusal changes what the manager will ACTIVATE and nothing about what any call
+// returns, so this line is the only place an operator learns that a completion sentinel
+// in this tree has stopped being evidence — and a clean tree must not emit it, or the
+// warning stops meaning anything.
+func TestAnUncontrolledTreeIsWarnedAbout(t *testing.T) {
+	logs := captureLogs(t)
+
+	// 0707 grants everyone write and the owning group nothing, so the tree is shared
+	// whatever uid or gid the runner has.
+	env := newFakeEnv(t)
+	if err := os.MkdirAll(env.versionsRoot(), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", env.versionsRoot(), err)
+	}
+	if err := os.Chmod(env.versionsRoot(), 0o707); err != nil {
+		t.Fatalf("Chmod(%s): %v", env.versionsRoot(), err)
+	}
+	shared := env.manager()
+	shared.checkCustody()
+
+	if err := shared.custodyVerdict(); err == nil {
+		t.Fatal("custodyVerdict is nil, so this fixture is not the shared tree the test is about")
+	}
+	got := logs.at(slog.LevelWarn, "root")
+	if len(got) != 1 || got[0].attrs["root"] != env.versionsRoot() {
+		t.Fatalf("Warn records naming the installation root = %v, want one naming %s", got, env.versionsRoot())
+	}
+
+	clean := newFakeEnv(t)
+	if err := os.MkdirAll(clean.versionsRoot(), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", clean.versionsRoot(), err)
+	}
+	private := clean.manager()
+	private.checkCustody()
+
+	if err := private.custodyVerdict(); err != nil {
+		t.Fatalf("custodyVerdict = %v, want nil on a private tree", err)
+	}
+	if got := logs.at(slog.LevelWarn, "root"); len(got) != 1 {
+		t.Errorf("Warn records naming the installation root = %v, want the count unchanged by a tree this process controls", got)
 	}
 }
 

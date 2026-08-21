@@ -3,6 +3,7 @@ package pinstall
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -391,6 +392,12 @@ func TestEnsurePrunesToTheConfiguredRetention(t *testing.T) {
 			want := slices.Sorted(slices.Values(tc.want))
 			if !slices.Equal(got, want) {
 				t.Errorf("version directories = %v, want %v", got, want)
+			}
+			// A prune is a directory-entry removal, so the installation root's own
+			// entry list has to reach stable storage: an unsynced prune can come back
+			// after a crash as a version directory this sweep already decided against.
+			if syncs := env.countCalls("fsync " + env.versionsRoot()); syncs != 1 {
+				t.Errorf("fsyncs of %s = %d, want 1 once the prune removed something", env.versionsRoot(), syncs)
 			}
 		})
 	}
@@ -830,6 +837,99 @@ func TestSelectionAndRetentionAgreeOnEveryRefusal(t *testing.T) {
 				t.Errorf("selectActive selected %q (%v), want activatable = %v", sel.version, selected, tc.activatable)
 			}
 		})
+	}
+}
+
+// TestSelectActiveNamesTheWideVersionDirectoryItExcludes pins which of the two
+// exclusions an operator is told about, because the remedy is not the same. A version
+// DIRECTORY another principal can write means every artifact in it can be replaced
+// whatever the artifacts' own modes say; a single wide ENTRY is one file to fix. Naming
+// the wrong one sends the operator to chmod a file that was never the problem.
+func TestSelectActiveNamesTheWideVersionDirectoryItExcludes(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	dir := env.placeVersion(pinnedVersion)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod the version directory: %v", err)
+	}
+	m := env.manager()
+	m.checkCustody()
+
+	if _, ok := m.selectActive(t.Context()); ok {
+		t.Fatal("selectActive accepted a version directory another principal can write")
+	}
+	if got := logs.at(slog.LevelError, "dir"); len(got) != 1 || got[0].attrs["dir"] != dir {
+		t.Errorf("Error records naming a directory = %v, want one naming %s", got, dir)
+	}
+	if got := logs.at(slog.LevelError, "entry"); len(got) != 0 {
+		t.Errorf("Error records naming an entry = %v, want none: the directory itself is what was refused", got)
+	}
+}
+
+// TestThePartialSweepReportsOnlyWhatItRemoved pins the sweep's audit line and its
+// silence. Removing an incomplete install directory is a delete on a volume the operator
+// owns, so the count is reported — and a start with nothing to sweep says nothing,
+// because a line claiming a sweep that removed nothing is the noise that hides the one
+// that did something.
+func TestThePartialSweepReportsOnlyWhatItRemoved(t *testing.T) {
+	logs := captureLogs(t)
+
+	// A volume whose installation root holds nothing but a complete version: the sweep
+	// looks at it, finds no victim, and says nothing.
+	clean := newFakeEnv(t)
+	clean.placeVersion(pinnedVersion)
+	if err := clean.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure on a volume with nothing to sweep: %v", err)
+	}
+	if got := logs.at(slog.LevelInfo, "removed"); len(got) != 0 {
+		t.Fatalf("Info records carrying a removal count = %v, want none when nothing was swept", got)
+	}
+
+	env := newFakeEnv(t)
+	env.placePartial(oldVersion)
+	orphan := filepath.Join(env.versionsRoot(), stagePrefix+"crashed")
+	if err := os.MkdirAll(filepath.Join(orphan, "home"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", orphan, err)
+	}
+	if err := env.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	got := logs.at(slog.LevelInfo, "removed")
+	if len(got) != 1 {
+		t.Fatalf("Info records carrying a removal count = %v, want 1 after the sweep removed two directories", got)
+	}
+	if want := "2"; got[0].attrs["removed"] != want {
+		t.Errorf("removed = %q, want %q: the partial directory and the orphan staging tree", got[0].attrs["removed"], want)
+	}
+}
+
+// TestPruneSyncFailureWarns pins the last step of a prune. The directories are already
+// gone by then, so an unsynced installation root costs only that a crash can bring their
+// entries back — a warning rather than a failure, since the prune is hygiene and the
+// active version is unaffected.
+func TestPruneSyncFailureWarns(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	for _, v := range []string{pinnedVersion, prevVersion, oldVersion} {
+		env.placeVersion(v)
+	}
+	env.onSync = func(path string) error {
+		if path == env.versionsRoot() {
+			return errors.New("injected sync failure")
+		}
+		return nil
+	}
+	m := env.manager()
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure error = %v, want nil: a prune that cannot be synced is still a prune", err)
+	}
+	if exists(env.versionDir(oldVersion)) {
+		t.Fatal("the superseded version survived, so this fixture never reached the sync")
+	}
+	if got := logs.at(slog.LevelWarn, "error"); len(got) != 1 {
+		t.Errorf("Warn records carrying an error = %d, want 1 for the unsynced installation root; got %v",
+			len(got), logs.messages(slog.LevelWarn))
 	}
 }
 

@@ -1,6 +1,8 @@
 package pinstall
 
 import (
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -432,6 +434,12 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 		if exists(link) {
 			t.Error("the link exists although its publish rename failed")
 		}
+		// And the failed publish leaves no debris in a directory this package does not
+		// own: the staged temp is removed on the failure path too, or a co-owner's
+		// directory collects one per start.
+		if exists(filepath.Join(env.root, testLinkDir, "."+toolName+".newlink")) {
+			t.Error("the staged temp link survived the failed publish")
+		}
 	})
 
 	t.Run("a sabotaged link does not affect a rescan", func(t *testing.T) {
@@ -460,6 +468,113 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 			t.Errorf("Path() = %q, want the version-directory path %q", got, want)
 		}
 	})
+}
+
+// TestPurgeSweepsEveryDeclaredLinkName pins the Names half of the sweep on its own.
+// A consumer migrating away from a layout that only ever published bare names declares
+// no artifacts at all, and every name it does declare has to be swept from LinkDir —
+// the list is the whole of what the sweep is entitled to touch there, so a name left
+// behind is a stale bare command an operator's shell keeps finding.
+func TestPurgeSweepsEveryDeclaredLinkName(t *testing.T) {
+	// The primary is deliberately absent: the manager republishes its own convenience
+	// link at that name after the sweep, so it is the one name whose absence the sweep
+	// cannot be judged by.
+	names := []string{toolSidecar, toolExtra, "toolkit-old", "toolkit-legacy", "toolkit-ancient"}
+	env := newFakeEnv(t)
+	linkDir := filepath.Join(env.root, testLinkDir)
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", linkDir, err)
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(linkDir, name), []byte("legacy\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+	m := env.manager(func(c *Config) { c.Purge = &Purge{Names: names, Marker: legacyMarker} })
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	for _, name := range names {
+		if exists(filepath.Join(linkDir, name)) {
+			t.Errorf("%s survived the sweep although the profile declared it", name)
+		}
+	}
+}
+
+// TestPurgeRecordsWhatItRemoved pins the sweep's own audit line. The purge is the one
+// destructive act this library performs on a volume it did not create, and the count it
+// reports is all an operator gets to reconcile against: a sweep that removed something
+// says so at Info, and a volume with nothing to migrate stays quiet.
+func TestPurgeRecordsWhatItRemoved(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	planted := legacyFixture(t, env.root)
+	m := env.manager(func(c *Config) { c.Purge = testPurge() })
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	got := logs.at(slog.LevelInfo, "removed")
+	if len(got) != 1 {
+		t.Fatalf("Info records carrying a removal count = %d, want 1: the sweep's record of what it deleted", len(got))
+	}
+	// Every planted path except the one the fixture leaves absent, plus the staging tree
+	// its leftover sits in.
+	if want := "9"; got[0].attrs["removed"] != want {
+		t.Errorf("removed = %q, want %q from the %d planted paths", got[0].attrs["removed"], want, len(planted))
+	}
+}
+
+// TestPurgeMarkerFailureWarnsAndLeavesTheSweepDone pins the marker's failure posture.
+// Losing the marker only costs a repeated sweep, which is a no-op on a swept volume, so
+// it must not fail the start — but it has to be visible, or a volume that sweeps on
+// every start looks like a library that cannot count.
+func TestPurgeMarkerFailureWarnsAndLeavesTheSweepDone(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	legacyFixture(t, env.root)
+	marker := filepath.Join(env.root, legacyMarker)
+	env.onRename = failRenameTo(marker)
+	m := env.manager(func(c *Config) { c.Purge = testPurge() })
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure error = %v, want nil: the completion marker is not on the readiness path", err)
+	}
+	if exists(marker) {
+		t.Fatal("the marker exists although its write failed, so this fixture proves nothing")
+	}
+	got := logs.at(slog.LevelWarn, "path")
+	if len(got) != 1 || got[0].attrs["path"] != marker {
+		t.Errorf("Warn records naming a path = %v, want one naming %s", got, marker)
+	}
+}
+
+// TestConvenienceLinkSyncFailureWarns pins the last step of the convenience publish.
+// The link is already in place by then, so an unsynced parent costs only the link's
+// survival across a crash — a warning, never a withheld verdict, and never silence.
+func TestConvenienceLinkSyncFailureWarns(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	linkDir := filepath.Join(env.root, testLinkDir)
+	env.onSync = func(path string) error {
+		if path == linkDir {
+			return errors.New("injected sync failure")
+		}
+		return nil
+	}
+	m := env.manager()
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure error = %v, want nil: the convenience link is never an integrity input", err)
+	}
+	if ready, why := m.Ready(); !ready {
+		t.Errorf("Ready() = false (%s), want true", why)
+	}
+	if got := logs.at(slog.LevelWarn, "error"); len(got) != 1 {
+		t.Errorf("Warn records carrying an error = %d, want 1 for the unsynced link directory; got %v",
+			len(got), logs.messages(slog.LevelWarn))
+	}
 }
 
 func mustReadDir(t *testing.T, dir string) []string {

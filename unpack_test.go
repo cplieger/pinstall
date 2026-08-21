@@ -108,6 +108,7 @@ func TestUnpackZipAcceptsTheEntriesALegitimateArchiveCarries(t *testing.T) {
 		".config/x":         {body: "dotted\n", mode: 0o644},
 		"pkg//tool":         {body: "redundant\n", mode: 0o644},
 		"./":                {dir: true},
+		"pkg/state/":        {dir: true},
 		"pkg/lib/README.md": {body: "docs\n", mode: 0o644},
 	}
 	out := t.TempDir()
@@ -118,6 +119,15 @@ func TestUnpackZipAcceptsTheEntriesALegitimateArchiveCarries(t *testing.T) {
 		if !exists(filepath.Join(out, filepath.FromSlash(want))) {
 			t.Errorf("entry %q was not extracted", want)
 		}
+	}
+	// A directory entry holding nothing is the only entry whose extraction is the
+	// directory itself, so nothing else in the archive can stand in for it.
+	fi, err := os.Stat(filepath.Join(out, "pkg", "state"))
+	if err != nil {
+		t.Fatalf("Stat the directory entry pkg/state/: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Errorf("pkg/state mode = %v, want the directory the archive's own entry names", fi.Mode())
 	}
 }
 
@@ -221,6 +231,29 @@ func TestUnpackZipRefusesTooManyEntries(t *testing.T) {
 	}
 }
 
+// TestUnpackZipAcceptsAnArchiveAtTheEntryCeiling pins the ceiling's accepting side.
+// The bound exists to refuse a hostile or corrupt archive, so an archive exactly at it
+// is one this extractor must still unpack: refusing there would refuse a legitimate
+// release and the install has no way around it.
+func TestUnpackZipAcceptsAnArchiveAtTheEntryCeiling(t *testing.T) {
+	entries := make([]namedEntry, 0, maxExtractEntries)
+	for i := range maxExtractEntries {
+		entries = append(entries, namedEntry{name: fmt.Sprintf("e%d", i), mode: 0o644})
+	}
+	raw := buildZipOrdered(t, entries)
+	out := t.TempDir()
+	if err := UnpackZip(t.Context(), bytesReader(raw), openRoot(t, out)); err != nil {
+		t.Fatalf("UnpackZip refused an archive of exactly %d entries: %v", maxExtractEntries, err)
+	}
+	written, readErr := os.ReadDir(out)
+	if readErr != nil {
+		t.Fatalf("ReadDir the extraction dir: %v", readErr)
+	}
+	if len(written) != maxExtractEntries {
+		t.Errorf("the extraction dir holds %d entries, want all %d extracted", len(written), maxExtractEntries)
+	}
+}
+
 // TestExtractFileRefusesAnExhaustedBudget pins the total-size guard's boundary,
 // which a whole-archive test cannot reach without a multi-gigabyte fixture.
 func TestExtractFileRefusesAnExhaustedBudget(t *testing.T) {
@@ -246,6 +279,26 @@ func TestExtractFileRefusesAnExhaustedBudget(t *testing.T) {
 				t.Errorf("extractFile budget=%d error = %v, wantErr %v", tc.budget, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestExtractFileRefusesAnEmptyEntryOnceTheBudgetIsGone pins that the budget is
+// consulted BEFORE the entry's size is known. A zero-byte entry writes nothing, so byte
+// accounting alone would let an archive keep creating files after the extraction limit
+// was reached — and the file count is the other half of what the limit is protecting.
+func TestExtractFileRefusesAnEmptyEntryOnceTheBudgetIsGone(t *testing.T) {
+	raw := buildZip(t, map[string]zipEntry{"hollow": {mode: 0o644}})
+	r, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatalf("zip.NewReader: %v", err)
+	}
+	out := t.TempDir()
+
+	if _, err := extractFile(r.File[0], "hollow", openRoot(t, out), 0); err == nil {
+		t.Error("extractFile budget=0 error = nil, want the exhausted-budget refusal on an empty entry too")
+	}
+	if exists(filepath.Join(out, "hollow")) {
+		t.Error("the extraction dir holds hollow, want nothing created once the budget is gone")
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -314,6 +316,7 @@ func TestPersistedAssertionsOKNeverGatesReadiness(t *testing.T) {
 // not on the readiness path: losing it warns, it does not fail an otherwise good
 // install.
 func TestStateSaveFailureDoesNotAffectReadiness(t *testing.T) {
+	logs := captureLogs(t)
 	env := newFakeEnv(t)
 	env.placeVersion(pinnedVersion)
 	env.onRename = failRenameTo(env.statePath())
@@ -324,6 +327,18 @@ func TestStateSaveFailureDoesNotAffectReadiness(t *testing.T) {
 	}
 	if ready, why := m.Ready(); !ready {
 		t.Errorf("Ready() = false (%s), want true", why)
+	}
+	// Not on the readiness path is not the same as unreported: a volume whose state
+	// record silently stops being written leaves an operator reading a stale file.
+	if got := logs.at(slog.LevelWarn, "path"); len(got) != 1 || got[0].attrs["path"] != env.statePath() {
+		t.Errorf("Warn records naming a path = %v, want one naming %s", got, env.statePath())
+	}
+	// A failed durable write leaves no debris behind either: the staged temp name is
+	// removed on every failure path, so a Root this package shares with another owner
+	// does not collect one per failed start.
+	tmp := filepath.Join(env.root, "."+toolName+stateSuffix+".tmp")
+	if exists(tmp) {
+		t.Errorf("Root holds %s, want the staged temp removed after the rename failed", tmp)
 	}
 }
 
@@ -526,6 +541,124 @@ func TestEnsureIsIdempotent(t *testing.T) {
 	}
 	if got := env.countCalls("assert settings " + mandatoryName); got <= afterFirst {
 		t.Error("the second Ensure did not reassert the required assertion")
+	}
+}
+
+// TestEnsureWithRetryUsesTheLibraryPolicyWhenTheRetryKnobsAreUnset pins the two retry
+// defaults as VALUES rather than as "something non-zero". A MaxAttempts left at zero is
+// a retry loop that never runs a single attempt — a start that installs nothing and
+// reports no error — and a backoff left at zero is a hot loop against the upstream.
+func TestEnsureWithRetryUsesTheLibraryPolicyWhenTheRetryKnobsAreUnset(t *testing.T) {
+	env := newFakeEnv(t)
+	env.installerFails = true
+	m := env.manager(func(c *Config) {
+		c.MaxAttempts = 0
+		c.RetryBackoff = 0
+	})
+
+	if err := m.EnsureWithRetry(t.Context()); err == nil {
+		t.Fatal("EnsureWithRetry returned nil although every attempt failed")
+	}
+	if got := env.fetchCount(); got != defaultMaxAttempts {
+		t.Errorf("fetches = %d, want %d: one per attempt of the default bound", got, defaultMaxAttempts)
+	}
+	want := []time.Duration{defaultRetryBackoff, 2 * defaultRetryBackoff, 4 * defaultRetryBackoff}
+	if got := env.sleeps(); !slices.Equal(got, want) {
+		t.Errorf("backoffs = %v, want %v: the default backoff, doubling", got, want)
+	}
+}
+
+// TestReadinessReportsInstallingWhileAFreshAttemptIsInFlight pins the lifecycle
+// distinction a consumer shows its own users. The FIRST attempt of a run is installing
+// rather than retrying, and a manager that has already exhausted its attempts says
+// installing again while a new run is in flight rather than still reporting the state it
+// gave up in — "we are working on it" and "we gave up" are the two answers a start page
+// has to tell apart, and only the phase carries the difference.
+func TestReadinessReportsInstallingWhileAFreshAttemptIsInFlight(t *testing.T) {
+	env := newFakeEnv(t)
+	m := env.manager(func(c *Config) { c.MaxAttempts = 1 })
+	var seen []Reason
+	env.onFetch = func(io.Writer) error {
+		_, why := m.Ready()
+		seen = append(seen, why)
+		return errors.New("the archive could not be fetched")
+	}
+
+	if err := m.EnsureWithRetry(t.Context()); err == nil {
+		t.Fatal("EnsureWithRetry returned nil although the fetch failed")
+	}
+	if len(seen) != 1 || seen[0] != ReasonInstalling {
+		t.Fatalf("reasons observed mid-attempt = %v, want [%v] on the first attempt of a fresh manager", seen, ReasonInstalling)
+	}
+
+	// The same question asked of a manager that has given up: the run that follows is a
+	// fresh attempt, not the terminal state.
+	if err := m.EnsureWithRetry(t.Context()); err == nil {
+		t.Fatal("EnsureWithRetry returned nil on the second run although the fetch failed")
+	}
+	if len(seen) != 2 || seen[1] != ReasonInstalling {
+		t.Fatalf("reasons observed mid-attempt = %v, want [%v %v]: a new run reports installing, not the state the last one ended in",
+			seen, ReasonInstalling, ReasonInstalling)
+	}
+}
+
+// TestServingAPredecessorSaysThePinIsNotInstalled pins the distinction between the two
+// activations. Serving the pinned version is routine; serving a PREDECESSOR because the
+// pin could not be installed is a degraded state an operator has to act on, and the
+// verdict a consumer reads is "ready" in both cases — so the log line is the only place
+// the difference exists.
+func TestServingAPredecessorSaysThePinIsNotInstalled(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	env.placeVersion(prevVersion)
+	env.installerFails = true
+	m := env.manager()
+
+	// The install failure is reported; the previous version still serves.
+	if err := m.Ensure(t.Context()); err == nil {
+		t.Fatal("Ensure returned nil although the pinned version could not be installed")
+	}
+	if ready, why := m.Ready(); !ready {
+		t.Fatalf("Ready() = false (%s), want true on the previous version", why)
+	}
+	got := logs.at(slog.LevelWarn, "active")
+	if len(got) != 1 {
+		t.Fatalf("Warn records naming the active version = %v, want 1 for a start serving a predecessor", got)
+	}
+	if got[0].attrs["active"] != prevVersion || got[0].attrs["pinned"] != pinnedVersion {
+		t.Errorf("Warn named active=%q pinned=%q, want active=%q pinned=%q",
+			got[0].attrs["active"], got[0].attrs["pinned"], prevVersion, pinnedVersion)
+	}
+}
+
+// TestExhaustedRetriesWithNothingUsableIsAnError pins the terminal report. Every
+// individual attempt has already been logged as a failure by then; what this line adds
+// is that the bounded retries are OVER and nothing is installed, which is the moment an
+// operator has to intervene — and a start that ends ready must not emit it.
+func TestExhaustedRetriesWithNothingUsableIsAnError(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	env.installerFails = true
+	m := env.manager(func(c *Config) { c.MaxAttempts = 2 })
+
+	if err := m.EnsureWithRetry(t.Context()); err == nil {
+		t.Fatal("EnsureWithRetry returned nil although every attempt failed")
+	}
+	got := logs.at(slog.LevelError, "attempts")
+	if len(got) != 1 {
+		t.Fatalf("Error records naming the attempt bound = %v, want 1 once the retries are exhausted", got)
+	}
+	if got[0].attrs["attempts"] != "2" {
+		t.Errorf("attempts = %q, want %q", got[0].attrs["attempts"], "2")
+	}
+
+	// A run that ends ready reports no such thing.
+	fine := newFakeEnv(t)
+	if err := fine.manager().EnsureWithRetry(t.Context()); err != nil {
+		t.Fatalf("EnsureWithRetry on a working install: %v", err)
+	}
+	if got := logs.at(slog.LevelError, "attempts"); len(got) != 1 {
+		t.Errorf("Error records naming the attempt bound = %v, want the count unchanged after a successful run", got)
 	}
 }
 
