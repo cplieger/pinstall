@@ -58,6 +58,80 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// logRecord is one captured log line, flattened to what a test asserts on.
+type logRecord struct {
+	attrs map[string]string
+	msg   string
+	level slog.Level
+}
+
+// logRecorder collects every record the manager logs, at every level.
+type logRecorder struct {
+	mu   sync.Mutex
+	seen []logRecord
+}
+
+func (h *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logRecorder) Handle(_ context.Context, r slog.Record) error {
+	rec := logRecord{level: r.Level, msg: r.Message, attrs: make(map[string]string, r.NumAttrs())}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = append(h.seen, rec)
+	return nil
+}
+
+func (h *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logRecorder) WithGroup(string) slog.Handler      { return h }
+
+// at returns the captured records logged at level carrying key, whatever its value.
+// The key is the discriminator rather than the message, so a rewording of a diagnostic
+// does not break a test about which line was emitted.
+func (h *logRecorder) at(level slog.Level, key string) []logRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []logRecord
+	for _, r := range h.seen {
+		if _, ok := r.attrs[key]; ok && r.level == level {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// messages returns the messages of the captured records at level.
+func (h *logRecorder) messages(level slog.Level) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.seen {
+		if r.level == level {
+			out = append(out, r.msg)
+		}
+	}
+	return out
+}
+
+// captureLogs sends this package's log output to a recorder for the rest of the test,
+// which is how a warn-only path is asserted on at all: several of this library's
+// failures are deliberately non-fatal, and the log line IS the observable half of that
+// contract.
+//
+// slog's default logger is process-global, so a test holding this must not run in
+// parallel. TestMain discards the package's output for every other test, and the
+// cleanup puts that back.
+func captureLogs(t *testing.T) *logRecorder {
+	t.Helper()
+	rec := &logRecorder{}
+	slog.SetDefault(slog.New(rec))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+	return rec
+}
+
 // toolRelease is the primary test profile.
 func toolRelease() Release {
 	return Release{
@@ -190,6 +264,11 @@ func encodeZip(entries []namedEntry) ([]byte, error) {
 	zw := zip.NewWriter(&buf)
 	for _, e := range entries {
 		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		if e.body == "" {
+			// An empty entry has nothing to compress, and a deflate stream for one is
+			// pure cost: the entry-ceiling fixtures build tens of thousands of them.
+			h.Method = zip.Store
+		}
 		mode := e.mode
 		if e.dir {
 			mode |= os.ModeDir

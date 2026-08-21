@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -487,6 +489,7 @@ func TestInstallerEnvAndArgsComeFromTheProfile(t *testing.T) {
 // commonly fails on shell profiles it cannot write, so what decides is the staged
 // artifact. A failure that also produces nothing still fails the install.
 func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T) {
+	logs := captureLogs(t)
 	env := newFakeEnv(t)
 	baseRun := env.run
 	m := env.manager()
@@ -503,6 +506,11 @@ func TestInstallContinuesPastAFailingInstallerAndLetsTheGatesDecide(t *testing.T
 	}
 	if ready, why := m.Ready(); !ready {
 		t.Errorf("Ready() = false (%s), want true", why)
+	}
+	// Non-fatal is not the same as unrecorded: an installer that reported a failure and
+	// still passed the gates is exactly the case an operator wants to see afterwards.
+	if got := logs.at(slog.LevelWarn, "installer"); len(got) != 1 || got[0].attrs["installer"] != toolInstaller {
+		t.Errorf("Warn records naming the installer = %v, want one naming %s", got, toolInstaller)
 	}
 }
 
@@ -719,6 +727,164 @@ func TestCopyWithStallGuardAbortsAStalledTransfer(t *testing.T) {
 	}
 	if !cancelled {
 		t.Error("the watchdog did not cancel the request context")
+	}
+}
+
+// TestInstallerTimeoutFallsBackToTheLibraryDefault pins which deadline bounds an
+// in-archive installer. A profile that declares one gets exactly that; a profile that
+// declares nothing gets the library's documented default, because a zero there would be
+// an UNBOUNDED subprocess — the one shape that can stall the start it exists to
+// complete, and the reason the timeout is not simply passed through.
+func TestInstallerTimeoutFallsBackToTheLibraryDefault(t *testing.T) {
+	tests := map[string]struct {
+		declared time.Duration
+		want     time.Duration
+	}{
+		"the profile declares none": {want: defaultInstallerTimeout},
+		"the profile declares one":  {declared: 7 * time.Second, want: 7 * time.Second},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := newFakeEnv(t)
+			env.release.Installer = &ArchiveInstaller{Path: toolInstaller, Timeout: tc.declared}
+			baseRun := env.run
+			m := env.manager()
+			var got time.Duration
+			m.run = func(ctx context.Context, c *command) ([]byte, error) {
+				if env.isInstaller(c.Path) {
+					got = c.Timeout
+				}
+				return baseRun(ctx, c)
+			}
+
+			if err := m.Ensure(t.Context()); err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("installer timeout = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEnsureInstallsEveryOptionalArtifactAnArchiveProvides pins the Optional contract
+// on the ordinary shape for a package whose extras ship in the same archive: more
+// optional artifacts than required ones. "Installed when the archive provides it" is
+// the contract Optional's own doc states, and it is per artifact rather than per
+// archive.
+func TestEnsureInstallsEveryOptionalArtifactAnArchiveProvides(t *testing.T) {
+	const secondExtra = "toolkit-doc"
+	env := newEnv(t, toolRelease(), installerArchive(t), nil, []string{toolSidecar, toolExtra, secondExtra})
+	env.produces = map[string]string{
+		toolName:    pinnedVersion,
+		toolSidecar: pinnedVersion,
+		toolExtra:   pinnedVersion,
+		secondExtra: pinnedVersion,
+	}
+	m := env.manager()
+
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	dir := env.versionDir(pinnedVersion)
+	for _, name := range []string{toolName, toolSidecar, toolExtra, secondExtra} {
+		if !exists(filepath.Join(dir, name)) {
+			t.Errorf("%s missing from the published version directory", name)
+		}
+	}
+}
+
+// TestCopyWithStallGuardKeepsASlowButProgressingTransfer pins the other side of the
+// watchdog. The bound is LACK of progress, not elapsed time, so a transfer slower than
+// the window overall must run to completion: aborting it would turn the guard back into
+// the bandwidth floor an absolute deadline already is.
+func TestCopyWithStallGuardKeepsASlowButProgressingTransfer(t *testing.T) {
+	const window = 100 * time.Millisecond
+	const chunks = 8
+	reads := 0
+	src := readerFunc(func(p []byte) (int, error) {
+		if reads == chunks {
+			return 0, io.EOF
+		}
+		reads++
+		// A slow upstream: each chunk arrives well inside the window, while the
+		// transfer as a whole takes considerably longer than one.
+		time.Sleep(window / 4)
+		p[0] = 'x'
+		return 1, nil
+	})
+
+	var got bytes.Buffer
+	if err := copyWithStallGuard(func() {}, &got, src, window); err != nil {
+		t.Fatalf("copyWithStallGuard error = %v, want nil: every read delivered bytes inside the window", err)
+	}
+	if got.Len() != chunks {
+		t.Errorf("copied %d bytes, want %d", got.Len(), chunks)
+	}
+}
+
+// TestCopyWithStallGuardTreatsAReadYieldingNothingAsNoProgress pins what counts as
+// progress. io.Reader's own contract calls a zero count with a nil error "nothing
+// happened", so counting it would let an upstream hold a transfer open indefinitely
+// without ever sending a byte — the exact hang the watchdog exists to bound.
+func TestCopyWithStallGuardTreatsAReadYieldingNothingAsNoProgress(t *testing.T) {
+	const window = 100 * time.Millisecond
+	const emptyReads = 8
+	reads := 0
+	src := readerFunc(func(p []byte) (int, error) {
+		if reads == emptyReads {
+			p[0] = 'x'
+			return 1, io.EOF
+		}
+		reads++
+		time.Sleep(window / 4)
+		return 0, nil
+	})
+
+	err := copyWithStallGuard(func() {}, io.Discard, src, window)
+	if err == nil || !strings.Contains(err.Error(), "no progress") {
+		t.Fatalf("copyWithStallGuard error = %v, want a no-progress abort", err)
+	}
+}
+
+// TestFsyncPathReportsAMissingPathAsSuch pins the classification of the one failure
+// the sync helper can be handed: a name that is not there. The seam's error is what a
+// caller reports to an operator, and "no such file" is what distinguishes a tree that
+// was never created from a volume that will not commit.
+func TestFsyncPathReportsAMissingPathAsSuch(t *testing.T) {
+	err := fsyncPath(filepath.Join(t.TempDir(), "absent"))
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("fsyncPath on a missing path = %v, want an error wrapping fs.ErrNotExist", err)
+	}
+}
+
+// TestTheProfileNoticeIsLoggedOncePerInstall pins the one log line the profile itself
+// supplies. A Notice is how a consumer discharges an obligation it has taken on — a
+// third-party licence acceptance, typically — so an install that quietly stops emitting
+// it retires that obligation without anyone deciding to.
+func TestTheProfileNoticeIsLoggedOncePerInstall(t *testing.T) {
+	logs := captureLogs(t)
+	env := newFakeEnv(t)
+	notice := env.release.Notice
+	if notice == "" {
+		t.Fatal("the profile declares no notice, so this fixture proves nothing")
+	}
+
+	if err := env.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := logs.messages(slog.LevelInfo); !slices.Contains(got, notice) {
+		t.Errorf("Info messages = %v, want one that is the profile's own notice %q", got, notice)
+	}
+
+	// And a profile declaring none does not log an empty line in its place.
+	quiet := newFakeEnv(t)
+	quiet.release.Notice = ""
+	if err := quiet.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure with no notice declared: %v", err)
+	}
+	if got := logs.messages(slog.LevelInfo); slices.Contains(got, "") {
+		t.Errorf("Info messages = %v, want no empty message for a profile that declares no notice", got)
 	}
 }
 

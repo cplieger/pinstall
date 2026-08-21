@@ -979,6 +979,75 @@ func TestParsePOSIXACLRefusesMalformedInput(t *testing.T) {
 	}
 }
 
+// TestParseNFS4ACLAcceptsAListWithNoEntries pins the other side of the header-length
+// check. A list of exactly the header and nothing else is well formed and grants
+// nobody anything, so it has to be READ as an empty writer set rather than reported as
+// a truncated read: refusing it would refuse every object whose ACL is empty, and the
+// mode floor is what covers the identities such an object still lets write.
+func TestParseNFS4ACLAcceptsAListWithNoEntries(t *testing.T) {
+	blob := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), 0)
+
+	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 568})
+	if err != nil {
+		t.Fatalf("parseNFS4ACL(%x) = %v, want an empty writer set on a list carrying no entries", blob, err)
+	}
+	if len(got) != 0 {
+		t.Errorf("parseNFS4ACL(%x) = %v, want no writers", blob, got)
+	}
+}
+
+// TestParseNFS4ACLAcceptsAListAtTheEntryCeiling pins the entry cap's accepting side.
+// The cap is a sanity bound against a hostile count, so a list exactly at it is one
+// this parser must still read to the end — the alternative is a refusal on a list the
+// filesystem considers valid, and a refusal is an install outage.
+//
+// The last entry carries the only write grant, so a parser that stopped early would
+// report a writer set missing the identity the list names.
+func TestParseNFS4ACLAcceptsAListAtTheEntryCeiling(t *testing.T) {
+	const namedUID = 4242
+	blob := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), nfs4MaxACEs)
+	blob = append(blob, make([]byte, (nfs4MaxACEs-1)*nfs4ACESize)...)
+	granting := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, namedUID)
+	blob = append(blob, granting[nfs4HeaderSize:]...)
+
+	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 568})
+	if err != nil {
+		t.Fatalf("parseNFS4ACL on a list of %d entries = %v, want the list read", nfs4MaxACEs, err)
+	}
+	want := []principal{{kind: principalUser, id: namedUID}}
+	if !samePrincipals(got, want) {
+		t.Errorf("parseNFS4ACL on a list of %d entries = %v, want %v", nfs4MaxACEs, got, want)
+	}
+}
+
+// TestParsePOSIXACLAcceptsAListAtTheEntryCeiling is the POSIX.1e half of the same
+// boundary. The named entry granting write is the LAST one in the list, so a decoder
+// that stopped one entry short would answer "nobody" for an object that grants a
+// stranger write — the one direction this check must not fail in.
+func TestParsePOSIXACLAcceptsAListAtTheEntryCeiling(t *testing.T) {
+	const rwx, rx = 7, 5
+	const namedUID uint32 = 1234
+	entries := []posixACLEntry{
+		{tag: posixTagUserObj, perm: rwx, id: aclUndefinedID},
+		{tag: posixTagGroupObj, perm: rx, id: aclUndefinedID},
+		{tag: posixTagOther, perm: 0, id: aclUndefinedID},
+	}
+	for id := len(entries); id < posixACLMaxEntries-1; id++ {
+		entries = append(entries, posixACLEntry{tag: posixTagUser, perm: rx, id: uint32(2000 + id)})
+	}
+	entries = append(entries, posixACLEntry{tag: posixTagUser, perm: rwx, id: namedUID})
+
+	blob := encodePOSIXACL(entries)
+	got, err := parsePOSIXACL(blob, &syscall.Stat_t{Gid: 8888})
+	if err != nil {
+		t.Fatalf("parsePOSIXACL on a list of %d entries = %v, want the list read", len(entries), err)
+	}
+	want := []principal{{kind: principalUser, id: int(namedUID)}}
+	if !samePrincipals(got, want) {
+		t.Errorf("parsePOSIXACL on a list of %d entries = %v, want %v", len(entries), got, want)
+	}
+}
+
 // TestControllersOfWrapsAParseError pins the last unwitnessed path in the sticky exemption.
 // An unreadable list already propagates; a list that reads fine and does not PARSE went
 // through a different return, and a nil error there would exempt a world-writable sticky
