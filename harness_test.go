@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"maps"
 	"os"
@@ -122,14 +123,75 @@ func (h *logRecorder) messages(level slog.Level) []string {
 // contract.
 //
 // slog's default logger is process-global, so a test holding this must not run in
-// parallel. TestMain discards the package's output for every other test, and the
-// cleanup puts that back.
+// parallel. The cleanup restores whatever was installed before, which is normally
+// the discard handler TestMain set for the package.
+//
+// slog.SetDefault also points the standard log package at the installed handler,
+// and it skips that redirect when the logger being installed carries slog's own
+// default handler. Reinstalling the previous logger therefore does not undo the
+// redirect, so the writer and flags are saved and restored explicitly. slog goes
+// back first: reinstalling a previous handler that is not slog's default re-runs
+// the redirect and would overwrite a log restore done before it.
 func captureLogs(t *testing.T) *logRecorder {
 	t.Helper()
 	rec := &logRecorder{}
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(rec))
-	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 	return rec
+}
+
+// TestCaptureLogsRestoresLogGlobals pins the restore in captureLogs: the swap
+// redirects the standard log package's writer and zeroes its flags, and the
+// cleanup must put both back. Without it, one test silences slog for the rest of
+// the package, because slog's own default handler writes through log.Output.
+func TestCaptureLogsRestoresLogGlobals(t *testing.T) {
+	// TestMain's discard logger already zeroed log's flags for the whole binary,
+	// so hand the restore a non-zero value to put back; without one the flags
+	// half of this test cannot fail.
+	original := log.Flags()
+	t.Cleanup(func() { log.SetFlags(original) })
+	log.SetFlags(log.LstdFlags)
+
+	wantWriter, wantFlags := log.Writer(), log.Flags()
+
+	t.Run("swap", func(t *testing.T) {
+		captureLogs(t)
+		if log.Writer() == wantWriter {
+			t.Fatal("captureLogs did not redirect log.Writer(); the restore under test would guard nothing")
+		}
+	})
+
+	if got := log.Writer(); got != wantWriter {
+		t.Errorf("log.Writer() after captureLogs cleanup = %T(%p), want the original %T(%p)", got, got, wantWriter, wantWriter)
+	}
+	if got := log.Flags(); got != wantFlags {
+		t.Errorf("log.Flags() after captureLogs cleanup = %d, want %d", got, wantFlags)
+	}
+}
+
+// TestCaptureLogsRestoresThePreviousHandler pins the other half of the restore:
+// the cleanup puts back the handler that was installed, so a nested capture
+// hands the outer one its recorder back instead of a fresh discard handler.
+func TestCaptureLogsRestoresThePreviousHandler(t *testing.T) {
+	outer := captureLogs(t)
+
+	t.Run("nested", func(t *testing.T) {
+		inner := captureLogs(t)
+		slog.Info("inner line")
+		if got := inner.messages(slog.LevelInfo); len(got) != 1 {
+			t.Fatalf("inner recorder captured %v, want exactly one line", got)
+		}
+	})
+
+	slog.Info("outer line")
+	if got := outer.messages(slog.LevelInfo); len(got) != 1 || got[0] != "outer line" {
+		t.Errorf("outer recorder captured %v after the nested capture returned, want [outer line]", got)
+	}
 }
 
 // toolRelease is the primary test profile.
