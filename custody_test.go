@@ -1202,7 +1202,7 @@ func TestSharedStickyAsksTheListAndFailsClosed(t *testing.T) {
 }
 
 // TestRetentionNeverExecutesAVersionSelectionRefuses pins the ordering inside
-// usableAsFallback. probeVersion EXECUTES the artifact, so asking it about a directory
+// predecessorRole. probeVersion EXECUTES the artifact, so asking it about a directory
 // selection has refused would run a binary this manager declined to activate, as its own
 // uid, on the shared volume Config.Untrusted describes. Retention is a disk-hygiene
 // decision and must not become an execution path selection would not take.
@@ -1215,8 +1215,8 @@ func TestRetentionNeverExecutesAVersionSelectionRefuses(t *testing.T) {
 	if mayActivate, _ := m.trusted("9.9.9"); mayActivate {
 		t.Fatal("the fixture is wrong: the planted version must be untrusted for this test to mean anything")
 	}
-	if m.usableAsFallback(t.Context(), "9.9.9") {
-		t.Error("usableAsFallback accepted a version selection refuses")
+	if role := m.predecessorRole(t.Context(), "9.9.9"); role == roleFallback {
+		t.Error("predecessorRole counted a version selection refuses as a fallback")
 	}
 	if got := env.countCalls("probe " + filepath.Join(planted, toolName)); got != 0 {
 		t.Errorf("the planted artifact was executed %d times by retention, after selection had refused it", got)

@@ -828,9 +828,9 @@ func TestSelectionAndRetentionAgreeOnEveryRefusal(t *testing.T) {
 			m.checkCustody()
 
 			sel, selected := m.selectActive(t.Context())
-			retained := m.usableAsFallback(t.Context(), pinnedVersion)
+			retained := m.predecessorRole(t.Context(), pinnedVersion) == roleFallback
 			if selected != retained {
-				t.Errorf("selectActive = %v but usableAsFallback = %v for the same directory; retention promises the answers agree, and a retained version selection refuses is not a fallback",
+				t.Errorf("selectActive = %v but predecessorRole-is-fallback = %v for the same directory; retention promises the answers agree, and a retained version selection refuses is not a fallback",
 					selected, retained)
 			}
 			if selected != tc.activatable {
@@ -980,5 +980,79 @@ func writeSentinelFile(t *testing.T, dir, version string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, sentinelName), []byte(version+"\n"), 0o600); err != nil {
 		t.Fatalf("write sentinel: %v", err)
+	}
+}
+
+// TestRetentionBoundsAnUntrustedTree is the defect Config.Untrusted used to document as
+// a limitation: a directory this process did not install is not activatable, so it went
+// into the immune set and NOTHING pruned it. keep never filled, every predecessor was
+// immune, and the tree grew one version per pin bump forever — ~240 MB a time for a
+// package the size of the ones this library installs.
+//
+// The bound must come from the prunable set having no immunity, NEVER from letting a
+// non-activatable directory count against Retain: that shape keeps a corrupt newer
+// directory while pruning the good older one, exactly when the pin has already failed.
+func TestRetentionBoundsAnUntrustedTree(t *testing.T) {
+	env := newFakeEnv(t)
+	// Three predecessors this process did not install, plus the pin it did.
+	for _, v := range []string{"1.0.0", "1.1.0", "1.2.0"} {
+		env.placeVersion(v)
+	}
+	env.placeVersion(pinnedVersion)
+	m := env.manager(func(c *Config) { c.Untrusted = true })
+	m.checkCustody()
+	if verdict := m.custodyVerdict(); verdict != nil {
+		t.Fatalf("the fixture needs a CLEAN custody verdict so Untrusted is the sole reason, got %v", verdict)
+	}
+
+	keep, immune := m.usablePredecessors(t.Context(), m.completeVersions(), pinnedVersion, m.cfg.Retain)
+
+	if len(keep) != 0 {
+		t.Errorf("keep = %v, want empty: no foreign directory may spend a fallback slot", keep)
+	}
+	if len(immune) != 0 {
+		t.Errorf("immune = %v, want empty: with custody clean these are this deployment's own dead installs, not evidence and not a stranger's", immune)
+	}
+	victims := victimsOf(m.completeVersions(), []string{pinnedVersion}, immune)
+	for _, v := range []string{"1.0.0", "1.1.0", "1.2.0"} {
+		if !slices.Contains(victims, v) {
+			t.Errorf("%s survived pruning; the tree is still unbounded", v)
+		}
+	}
+	if slices.Contains(victims, pinnedVersion) {
+		t.Errorf("the active version %s was pruned", pinnedVersion)
+	}
+}
+
+// TestRetentionSparesAStrangersInstallWhenCustodyRefused is the other half of the same
+// split, and the reason it turns on the VERDICT rather than on which flag was set. A
+// waived bad verdict means the tree provably has a writer this library cannot account
+// for, so a complete directory in it may be another principal's — deleting a stranger's
+// files is not a disk-hygiene decision this library gets to make.
+func TestRetentionSparesAStrangersInstallWhenCustodyRefused(t *testing.T) {
+	env := newFakeEnv(t)
+	env.placeVersion("1.0.0")
+	env.placeVersion(pinnedVersion)
+	// Make custody refuse, and accept it, which is what a consumer with nothing
+	// precise to say about its volume does.
+	if err := os.Chmod(env.root, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	m := env.manager(func(c *Config) { c.InstallWithoutCustody = true })
+	m.checkCustody()
+	if m.custodyVerdict() == nil {
+		t.Skip("this filesystem did not make the widened tree fail custody; the split cannot be exercised")
+	}
+
+	keep, immune := m.usablePredecessors(t.Context(), m.completeVersions(), pinnedVersion, m.cfg.Retain)
+
+	if len(keep) != 0 {
+		t.Errorf("keep = %v, want empty: an unverifiable directory is not a fallback", keep)
+	}
+	if !slices.Contains(immune, "1.0.0") {
+		t.Errorf("immune = %v, want it to hold 1.0.0: a stranger's install must not be deleted", immune)
+	}
+	if slices.Contains(victimsOf(m.completeVersions(), []string{pinnedVersion}, immune), "1.0.0") {
+		t.Error("a directory that may be another principal's was pruned")
 	}
 }

@@ -115,7 +115,17 @@ func (m *Manager) versionDirComplete(version string) bool {
 // want is at least 1 by construction: [applyConfigDefaults] replaces a Retain of zero or
 // less with defaultRetain, and [Manager.pruneSuperseded] is the only caller, which is why
 // the capacity below is used unclamped.
-func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) (keep, unusable []string) {
+//
+// A rolePrunable candidate is added to NEITHER return value, which is how it becomes a
+// victim without ever spending a fallback slot. That split is what answers the shape this
+// was nearly built as — deciding the slot from completeness and privateness alone, both
+// non-executing — whose defect was that one unprobeable predecessor captured the whole
+// budget, so a complete-but-corrupt newer directory was kept while the good older one was
+// pruned, exactly when the pin had already failed and the fallback was all there was.
+// Retention answers two questions with two budgets instead of one budget with a weaker
+// question: `keep` still admits only what selection would activate, so the fallback
+// guarantee is untouched, and the bound comes from the prunable set having no immunity.
+func (m *Manager) usablePredecessors(ctx context.Context, complete []string, active string, want int) (keep, immune []string) {
 	keep = make([]string, 0, want)
 	for _, version := range predecessorCandidates(complete, active) {
 		if len(keep) >= want {
@@ -123,13 +133,16 @@ func (m *Manager) usablePredecessors(ctx context.Context, complete []string, act
 			// would cost a subprocess to reach the same outcome.
 			break
 		}
-		if !m.usableAsFallback(ctx, version) {
-			unusable = append(unusable, version)
-			continue
+		switch m.predecessorRole(ctx, version) {
+		case roleFallback:
+			keep = append(keep, version)
+		case roleImmune:
+			immune = append(immune, version)
+		case rolePrunable:
+			// Deliberately neither: victimsOf prunes what it is not told to spare.
 		}
-		keep = append(keep, version)
 	}
-	return keep, unusable
+	return keep, immune
 }
 
 // activationStage names the check a version directory failed. It exists so selection and
@@ -207,28 +220,61 @@ func (m *Manager) activatable(ctx context.Context, version string) activation {
 	}
 }
 
-// usableAsFallback reports whether a complete version directory would survive
-// selection, and says why in the log when it would not.
+// retentionRole is what retention does with a complete predecessor. Three answers
+// rather than a bool, because "not a fallback" hides two opposite conclusions: a
+// directory this library must not touch, and one it must not keep.
+type retentionRole uint8
+
+const (
+	// roleFallback would survive selection, so it counts against Retain.
+	roleFallback retentionRole = iota
+	// roleImmune cannot serve AND is not this library's to delete: a directory in a
+	// state selection refuses (evidence this library did not create), or one that may
+	// belong to another principal sharing a tree custody could not vouch for.
+	roleImmune
+	// rolePrunable cannot serve and is not evidence, so it is bounded like any other
+	// superseded directory. It exists so a tree of directories nothing can ever
+	// activate does not grow without limit.
+	rolePrunable
+)
+
+// predecessorRole classifies one complete predecessor, and says why in the log when it
+// is not a fallback.
 //
 // It asks [Manager.activatable] rather than repeating selection's checks, which is what
-// makes the doc claim above true rather than merely intended.
-func (m *Manager) usableAsFallback(ctx context.Context, version string) bool {
+// makes retention's claim to agree with selection true rather than merely intended.
+//
+// THE UNTRUSTED SPLIT IS THE WHOLE REASON THIS RETURNS THREE ANSWERS, and it turns on
+// the custody verdict rather than on which flag was set. Untrusted DECLARED over a tree
+// custody vouches for means the directory is this deployment's own earlier install:
+// `Manager.installed` is per-process and never persisted, so no process — this one or a
+// later one — will ever activate it. It is not a fallback, it is not evidence, and
+// leaving it forever is what made Retain unable to bound the tree at all. When custody
+// itself REFUSED, the same stage means something else: the tree provably has a writer
+// this library cannot account for, so a complete directory in it may be another
+// principal's install, and deleting a stranger's files is not a disk-hygiene decision.
+func (m *Manager) predecessorRole(ctx context.Context, version string) retentionRole {
 	a := m.activatable(ctx, version)
 	switch a.stage {
 	case stageUntrusted:
-		slog.Warn("not counting a version directory towards retention: this process may not activate it, so it is not a fallback and must not be executed to find out",
-			"package", m.cfg.Release.Name, "version", version)
-		return false
+		if a.verdict == nil {
+			slog.Info("pruning a version directory no process can activate: this process did not install it and the tree is declared untrusted, so it is neither a fallback nor evidence",
+				"package", m.cfg.Release.Name, "version", version)
+			return rolePrunable
+		}
+		slog.Warn("not counting a version directory towards retention, and not deleting it: custody refused the tree, so this directory may be another principal's install",
+			"package", m.cfg.Release.Name, "version", version, "verdict", a.verdict)
+		return roleImmune
 	case stageWideEntry:
 		slog.Warn("not counting a version directory towards retention: selection would refuse it because an entry is not provably private to this process",
 			"package", m.cfg.Release.Name, "version", version, "offender", a.entry, "reason", a.reason)
-		return false
+		return roleImmune
 	case stageProbeFailed, stageVersionMismatch:
 		slog.Warn("not counting a version directory towards retention: it would not survive selection's version probe",
 			"package", m.cfg.Release.Name, "version", version, "reported", a.reported, "error", a.err)
-		return false
+		return roleImmune
 	}
-	return true
+	return roleFallback
 }
 
 // completeVersions lists the completed version directories, newest first.
@@ -559,11 +605,14 @@ func victimsOf(complete, spare, unusable []string) []string {
 //
 // Such a directory is also never a victim. It is left exactly as found, for the
 // operator to look at: this library did not put it in that state and deleting evidence
-// is not its call.
+// is not its call. The one refusal that is NOT evidence is a directory this process did
+// not install in a tree declared untrusted but vouched for by custody — nothing will
+// ever activate that, and treating it as immune is what left the tree unbounded (see
+// predecessorRole).
 func (m *Manager) pruneSuperseded(ctx context.Context, active string) {
 	complete := m.completeVersions()
-	keep, unusable := m.usablePredecessors(ctx, complete, active, m.cfg.Retain)
-	victims := victimsOf(complete, append([]string{active}, keep...), unusable)
+	keep, immune := m.usablePredecessors(ctx, complete, active, m.cfg.Retain)
+	victims := victimsOf(complete, append([]string{active}, keep...), immune)
 	if len(victims) == 0 {
 		return
 	}
