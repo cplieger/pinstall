@@ -189,15 +189,19 @@ type Config struct {
 	// uses 1, which is what makes a bad activation recoverable without a
 	// rollback journal.
 	//
-	// Retention counts only what could actually SERVE. A directory this process
-	// may not activate is not a fallback, so it is not a keeper — and it is not
-	// collected either, because the library did not put it into that state and
-	// deleting an install it cannot vouch for is not its call. The consequence is
-	// worth planning for: when nothing pre-existing is activatable, which is what
-	// Untrusted and InstallWithoutCustody both mean for a directory installed by
-	// an earlier process, this bound does not apply to those directories and the
-	// tree grows by one per upgrade until something outside this library collects
-	// them. Under a clean verdict with neither flag, Retain bounds the tree.
+	// Retention counts only what could actually SERVE, and that is deliberately
+	// NOT the same question as what may be deleted. A directory this process may
+	// not activate never spends a slot the real fallback needs — keeping a corrupt
+	// newer tree while pruning the good older one is the failure that rule exists
+	// to prevent, and it would bite exactly when the pin has already failed.
+	//
+	// What may be deleted is a second question with its own answer. A directory in
+	// a state selection refuses is left as found, because the library did not put
+	// it there and deleting evidence is not its call, and so is one that may belong
+	// to another principal when custody REFUSED the tree. A directory that merely
+	// predates this process under [Config.Untrusted] with a clean verdict is
+	// neither: nothing will ever activate it, so it is collected. Retain therefore
+	// bounds the tree under a clean verdict whether or not Untrusted is set.
 	Retain int
 	// RetryBackoff is the first [Manager.EnsureWithRetry] backoff; it doubles
 	// per attempt up to a ten minute cap. Zero uses 30s.
@@ -257,10 +261,13 @@ type Config struct {
 	// digest-verified reinstall on every start, which is the price of not believing a
 	// sentinel.
 	//
-	// It also stops [Config.Retain] bounding the tree, because a directory an earlier
-	// process installed is one this one may not activate, so it is neither a fallback to
-	// keep nor an install this library will delete. Expect accumulation on a long-lived
-	// volume and collect it out of band.
+	// It no longer stops [Config.Retain] bounding the tree. A directory an earlier
+	// process installed is one no process will activate — `installed` is per-process and
+	// never persisted — so under this flag with a CLEAN custody verdict such a directory
+	// is neither a fallback to keep nor evidence to preserve, and pruning collects it.
+	// The one shape still left alone is a complete directory in a tree custody REFUSED
+	// and the caller waived: there the tree provably has a writer this library cannot
+	// account for, so the directory may be another principal's install.
 	Untrusted bool
 }
 
