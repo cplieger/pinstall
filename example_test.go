@@ -81,7 +81,7 @@ func ExampleNew_missingMandatory() {
 		Root:    "/var/lib/example/tools",
 		GOARCH:  "amd64",
 	})
-	fmt.Println(strings.SplitN(err.Error(), ";", 2)[0])
+	fmt.Println(strings.SplitN(err.Error(), ". ", 2)[0])
 
 	// Output:
 	// pinstall: Release.Mandatory is empty

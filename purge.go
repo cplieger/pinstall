@@ -43,7 +43,7 @@ func (p *Purge) validate(linkDir string) error {
 		}
 	}
 	if len(p.Names) > 0 && linkDir == "" {
-		return fmt.Errorf("pinstall: Purge.Names sweeps entries under LinkDir, which is empty (name %q has no directory to be swept from)", p.Names[0])
+		return fmt.Errorf("pinstall: Purge.Names sweeps entries under LinkDir, which is empty, so name %q has no directory to be swept from", p.Names[0])
 	}
 	if p.StagePrefix != "" && !strings.HasPrefix(p.StagePrefix, ".") {
 		return fmt.Errorf("pinstall: Purge.StagePrefix %q must start with a dot, so a version scan cannot reach what it matches", p.StagePrefix)

@@ -331,10 +331,10 @@ func (c *Config) validate() error {
 		return errors.New("pinstall: Root is required")
 	}
 	if !filepath.IsAbs(c.Root) {
-		return fmt.Errorf("pinstall: Root %q must be absolute (its paths are handed to a subprocess)", c.Root)
+		return fmt.Errorf("pinstall: Root %q must be absolute, because its paths are handed to a subprocess", c.Root)
 	}
 	if len(c.Digests) == 0 {
-		return errors.New("pinstall: Digests is required (map a GOARCH to that archive's lowercase hex SHA-256)")
+		return errors.New("pinstall: Digests is required. Map a GOARCH to that archive's lowercase hex SHA-256")
 	}
 	if c.URLTemplate != "" {
 		if err := validateURLTemplate("URLTemplate", c.URLTemplate); err != nil {
@@ -905,7 +905,7 @@ func validateVersion(version string) error {
 			r >= 'A' && r <= 'Z',
 			r == '.', r == '-', r == '+', r == '_':
 		default:
-			return fmt.Errorf("illegal character %q (want only letters, digits and .-+_)", r)
+			return fmt.Errorf("illegal character %q, want only letters, digits and .-+_", r)
 		}
 	}
 	if strings.HasPrefix(version, ".") || strings.Contains(version, "..") {

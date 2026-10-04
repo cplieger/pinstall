@@ -162,7 +162,7 @@ func copyWithStallGuard(cancel context.CancelFunc, dst io.Writer, src io.Reader,
 		return fmt.Errorf("reading the archive body: %w", err)
 	}
 	if written == 0 {
-		return errors.New("archive body was empty (partial download?)")
+		return errors.New("archive body was empty, which suggests a partial download")
 	}
 	return nil
 }
@@ -330,7 +330,7 @@ func (m *Manager) downloadArchive(ctx context.Context) (*verifiedArchive, error)
 	got := hex.EncodeToString(sum.Sum(nil))
 	if got != m.digest {
 		_ = f.Close()
-		return nil, fmt.Errorf("%w: arch=%s expected=%s actual=%s (bump the version and every digest literal together)",
+		return nil, fmt.Errorf("%w: arch=%s expected=%s actual=%s. Bump the version and every digest literal together",
 			ErrDigestMismatch, m.cfg.GOARCH, m.digest, got)
 	}
 	slog.Info("archive SHA-256 verified against the pinned digest",
@@ -463,7 +463,7 @@ func (m *Manager) runInstaller(ctx context.Context, stage *stageTree) (string, e
 // primary artifact, and refuses one whose required assertions do not hold.
 func (m *Manager) gateStaged(ctx context.Context, staged string) error {
 	if !selfContained(staged) {
-		return fmt.Errorf("no self-contained executable at %s (absent, not executable, or a symlink whose target dies with the staging cleanup)", staged)
+		return fmt.Errorf("no self-contained executable at %s. It is absent, not executable, or a symlink whose target is removed during staging cleanup", staged)
 	}
 	got, err := m.probeVersion(ctx, staged)
 	if err != nil {

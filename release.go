@@ -344,13 +344,13 @@ func (r *Release) validate() error {
 		return err
 	}
 	if len(r.ArchTokens) == 0 {
-		return errors.New("pinstall: Release.ArchTokens is required (map a GOARCH to the publisher's token)")
+		return errors.New("pinstall: Release.ArchTokens is required. Map a GOARCH to the publisher's token")
 	}
 	if err := validateURLTemplate("Release.URLTemplate", r.URLTemplate); err != nil {
 		return err
 	}
 	if len(r.ProbeArgs) == 0 {
-		return errors.New("pinstall: Release.ProbeArgs is required (every start probes the artifact it activates)")
+		return errors.New("pinstall: Release.ProbeArgs is required, because every start probes the artifact it activates")
 	}
 	if err := validateRelPath("Release.ArtifactDir", r.ArtifactDir, true); err != nil {
 		return err
@@ -376,17 +376,17 @@ func (r *Release) validate() error {
 // purpose.
 func validateMandatory(mandatory []Assertion) error {
 	if len(mandatory) == 0 {
-		return errors.New("pinstall: Release.Mandatory is empty; declare at least one assertion that must hold after every install " +
-			"(the self-update switch, or the cheapest bounded command that must succeed against a working install), " +
+		return errors.New("pinstall: Release.Mandatory is empty. Declare at least one assertion that must hold after every install, " +
+			"such as the self-update switch or the cheapest bounded command that must succeed against a working install, " +
 			"so a deployment cannot lose the guarantee by omitting it")
 	}
 	seen := make(map[string]bool, len(mandatory))
 	for i, a := range mandatory {
 		if a.Name == "" {
-			return fmt.Errorf("pinstall: Release.Mandatory[%d] has no Name (it is the log identity and the override key)", i)
+			return fmt.Errorf("pinstall: Release.Mandatory[%d] has no Name, which is the log identity and the override key", i)
 		}
 		if len(a.Args) == 0 {
-			return fmt.Errorf("pinstall: Release.Mandatory[%d] (%s) has no Args", i, a.Name)
+			return fmt.Errorf("pinstall: Release.Mandatory[%d] named %s has no Args", i, a.Name)
 		}
 		if seen[a.Name] {
 			return fmt.Errorf("pinstall: Release.Mandatory has two assertions named %q", a.Name)
@@ -472,7 +472,7 @@ func validateIdentifier(field, value string) error {
 		return err
 	}
 	if strings.HasPrefix(value, ".") {
-		return fmt.Errorf("pinstall: %s %q must not start with a dot (dot-prefixed entries are this package's own sentinels and staging trees)", field, value)
+		return fmt.Errorf("pinstall: %s %q must not start with a dot, because dot-prefixed entries are this package's own sentinels and staging trees", field, value)
 	}
 	return nil
 }
