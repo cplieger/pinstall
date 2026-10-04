@@ -346,7 +346,7 @@ func readACL(path string) (*aclDialect, []byte, error) {
 		found, readErr := getxattrAll(path, dialect)
 		switch {
 		case readErr == nil && dialect.parse == nil:
-			return nil, nil, fmt.Errorf("%w: %s holds %s, %s; name the identities allowed to write it in Config.TrustedUIDs or Config.TrustedGIDs, or waive the check with Config.InstallWithoutCustody",
+			return nil, nil, fmt.Errorf("%w: %s holds %s, %s. Name the identities allowed to write it in Config.TrustedUIDs or Config.TrustedGIDs, or waive the check with Config.InstallWithoutCustody",
 				ErrACLDialectUnsupported, path, dialect.xattr, dialect.undecodable)
 		case readErr == nil:
 			return dialect, found, nil

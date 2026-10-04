@@ -329,7 +329,7 @@ func checkComponent(path string, euid int, installRoot, parentShared bool, trust
 			return fmt.Errorf("%w: %w", ErrNoCustody, ctlErr)
 		}
 		if stranger, found := trust.firstStranger(controllers, euid); found {
-			return fmt.Errorf("%w: %s (mode %#o) is sticky, but its access-control list lets %s remove an entry it does not own, take its ownership or rewrite that list, and each of those removes the protection the sticky bit was providing%s",
+			return fmt.Errorf("%w: %s, mode %#o, is sticky, but its access-control list lets %s remove an entry it does not own, take its ownership or rewrite that list, and each of those removes the protection the sticky bit was providing%s",
 				ErrNoCustody, path, mode.Perm(), stranger, trust.hint())
 		}
 		return nil
@@ -339,7 +339,7 @@ func checkComponent(path string, euid int, installRoot, parentShared bool, trust
 		return fmt.Errorf("%w: %w", ErrNoCustody, err)
 	}
 	if stranger, found := trust.firstStranger(writers, euid); found {
-		return fmt.Errorf("%w: %s (mode %#o) can be modified by %s%s%s",
+		return fmt.Errorf("%w: %s, mode %#o, can be modified by %s%s%s",
 			ErrNoCustody, path, mode.Perm(), stranger, stickyNote(mode, installRoot), trust.hint())
 	}
 	return nil
