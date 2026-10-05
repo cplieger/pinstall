@@ -146,7 +146,7 @@ The ownership check verifies once and refuses, as OpenSSH's [StrictModes](https:
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and how to run the checks locally.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
