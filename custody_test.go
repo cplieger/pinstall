@@ -175,7 +175,7 @@ func TestVerifyCustodyNeverTrustsEveryone(t *testing.T) {
 	// refusal is not an artifact of an incomplete list.
 	trust := trustedWriters{
 		uids: []int{0, 1, 2, 3000, os.Geteuid()},
-		gids: []int{0, 1, 2, 568, os.Getgid()},
+		gids: []int{0, 1, 2, 1500, os.Getgid()},
 	}
 	err := verifyCustody(root, trust)
 	if !errors.Is(err, ErrNoCustody) {

@@ -34,14 +34,14 @@ var nfs4Samples = map[string]struct {
 	mode uint32
 	want []principal
 }{
-	"dataset root, owned by apps, mode 0770 with a named admin and a group grant": {
+	"dataset root, owned by a service account, mode 0770 with a named admin and a group grant": {
 		b64:  "AAIAAAAAAAQAAAAAAAAAAwAAAAAAHwH/AAALuAAAAAAAAAADAAAAAQAeAf8AAAABAAAAAAAAAEMAAAABABIA7wAAAAIAAAAAAAAAAAAAAAEAEgCIAAAAAw==",
-		uid:  568,
-		gid:  568,
+		uid:  1500,
+		gid:  1500,
 		mode: 0o770,
 		want: []principal{
-			{kind: principalUser, id: 3000}, // the named admin, WRITE_DATA and more
-			{kind: principalGroup, id: 568}, // group@, resolved to the object's gid
+			{kind: principalUser, id: 3000},  // the named admin, WRITE_DATA and more
+			{kind: principalGroup, id: 1500}, // group@, resolved to the object's gid
 		},
 	},
 	"root-owned tools directory, mode 0750": {
@@ -56,10 +56,10 @@ var nfs4Samples = map[string]struct {
 		// 0750. The entry that does apply grants the group r-x.
 		want: []principal{{kind: principalUser, id: 3000}},
 	},
-	"root:apps config directory, mode 0750": {
+	"root:service config directory, mode 0750": {
 		b64:  "AAIAAAAAAAYAAAAAAAAAgwAAAAAAHwH/AAALuAAAAAAAAACLAAAAAQAeAf8AAAABAAAAAAAAAMsAAAABABIA7wAAAAIAAAAAAAAAAAAAAAEAHgH/AAAAAQAAAAAAAABAAAAAAQASAKkAAAACAAAAAAAAAAAAAAABABIAiAAAAAM=",
 		uid:  0,
-		gid:  568,
+		gid:  1500,
 		mode: 0o750,
 		// Same shape: the group@ entry granting write is inherit-only, so the
 		// directory on the path is writable only by the admin. This is the sample that
@@ -69,7 +69,7 @@ var nfs4Samples = map[string]struct {
 	},
 }
 
-// TestParseNFS4ACLAgainstRealSamples pins the NFSv4 parser on lists this fleet actually
+// TestParseNFS4ACLAgainstRealSamples pins the NFSv4 parser on lists a real ZFS dataset
 // carries. A hand-built fixture would only prove the parser agrees with my reading of the
 // format; these prove it agrees with the filesystem.
 func TestParseNFS4ACLAgainstRealSamples(t *testing.T) {
@@ -96,7 +96,7 @@ func TestParseNFS4ACLAgainstRealSamples(t *testing.T) {
 // are — under-reporting writers is how this check would wave through the exact tree it
 // exists to refuse.
 func TestParseNFS4ACLRefusesMalformedInput(t *testing.T) {
-	valid, err := base64.StdEncoding.DecodeString(nfs4Samples["dataset root, owned by apps, mode 0770 with a named admin and a group grant"].b64)
+	valid, err := base64.StdEncoding.DecodeString(nfs4Samples["dataset root, owned by a service account, mode 0770 with a named admin and a group grant"].b64)
 	if err != nil {
 		t.Fatalf("decoding the fixture: %v", err)
 	}
@@ -987,7 +987,7 @@ func TestParsePOSIXACLRefusesMalformedInput(t *testing.T) {
 func TestParseNFS4ACLAcceptsAListWithNoEntries(t *testing.T) {
 	blob := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), 0)
 
-	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 568})
+	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 1500})
 	if err != nil {
 		t.Fatalf("parseNFS4ACL(%x) = %v, want an empty writer set on a list carrying no entries", blob, err)
 	}
@@ -1010,7 +1010,7 @@ func TestParseNFS4ACLAcceptsAListAtTheEntryCeiling(t *testing.T) {
 	granting := buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteData, namedUID)
 	blob = append(blob, granting[nfs4HeaderSize:]...)
 
-	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 568})
+	got, err := parseNFS4ACL(blob, &syscall.Stat_t{Uid: 1000, Gid: 1500})
 	if err != nil {
 		t.Fatalf("parseNFS4ACL on a list of %d entries = %v, want the list read", nfs4MaxACEs, err)
 	}
@@ -1071,7 +1071,7 @@ func TestControllersOfWrapsAParseError(t *testing.T) {
 func nfs4FuzzSeeds(f *testing.F) [][]byte {
 	f.Helper()
 	valid, err := base64.StdEncoding.DecodeString(
-		nfs4Samples["dataset root, owned by apps, mode 0770 with a named admin and a group grant"].b64,
+		nfs4Samples["dataset root, owned by a service account, mode 0770 with a named admin and a group grant"].b64,
 	)
 	if err != nil {
 		f.Fatalf("decoding the fixture: %v", err)
