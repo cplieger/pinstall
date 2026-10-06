@@ -1,15 +1,13 @@
 // Package kirocli is the [pinstall] profile for the kiro-cli release.
 //
-// It exists so that every consumer installing kiro-cli states the same facts
-// about it — the release host and archive shape, the architecture tokens, the
-// in-archive installer, the probe argv, the licence notice and the assertion the
-// integrity story depends on — exactly once. A profile duplicated per consumer is
-// a drift surface: the copies diverge silently, and the one that matters is
-// whichever consumer was updated last.
+// It states once, for every consumer installing kiro-cli, the release host and
+// archive shape, the architecture tokens, the in-archive installer, the probe
+// argv, the licence notice and the assertion the integrity check depends on. A
+// profile copied into each consumer would drift silently between the copies.
 //
-// The pin itself is NOT here. The version and the per-architecture digests belong
-// to the deployment (and to whatever bumps them), so a consumer passes them in
-// [pinstall.Config]:
+// The pin itself is not here. The version and the per-architecture digests
+// belong to the deployment and to whatever bumps them, so a consumer passes them
+// in [pinstall.Config]:
 //
 //	mgr, err := pinstall.New(&pinstall.Config{
 //		Release: kirocli.Release(),
