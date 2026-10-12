@@ -736,7 +736,7 @@ func (m *Manager) writeFileDurably(name string, data []byte, mode os.FileMode) e
 //
 // The seam is shaped this way rather than as [os.Rename] over two absolute paths
 // because three of this package's four renames land in territory something else
-// wrote — the directory holding the convenience link, the directory holding the
+// wrote — the directory holding the convenience links, the directory holding the
 // state record, and the artifact tree an in-archive installer populated — and a
 // symlink at any component of those made the rename land outside Root. An
 // [os.Root] answers that in the kernel, on every component, which is the same

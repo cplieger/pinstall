@@ -216,8 +216,8 @@ type Manager struct {
 	// assertionsOK records whether THIS process asserted every required
 	// assertion against active.bin. It is the readiness authority.
 	assertionsOK bool
-	// purged latches the one-shot purge so retries and rescans do not re-delete
-	// the convenience link this manager publishes.
+	// purged latches the one-shot purge so retries and rescans do not walk the
+	// co-owned link directory again.
 	purged bool
 }
 
@@ -394,7 +394,7 @@ func (m *Manager) releaseOp() { <-m.opSem }
 // directories go (a partial is never a selection candidate), then selection
 // probes each candidate's own version before accepting it, then — only when the
 // pin is not already activatable — the install runs, then the assertions are
-// re-asserted against whatever was selected, then the convenience link is
+// re-asserted against whatever was selected, then the convenience links are
 // republished, and only then may pruning run.
 func (m *Manager) Ensure(ctx context.Context) error {
 	// Cancellable wait, then the work keeps the caller's context: Ensure is
@@ -450,7 +450,7 @@ func (m *Manager) mayMutateTree() bool {
 // finish activates sel: it re-asserts the assertions against the SELECTED
 // artifact (their effect lives in the package's mutable configuration, not in
 // the immutable version directory, so a remembered success proves nothing),
-// commits the state, republishes the convenience link, and prunes.
+// commits the state, republishes the convenience links, and prunes.
 func (m *Manager) finish(ctx context.Context, sel selection, installErr error) error {
 	assertErr := m.applyAssertions(ctx, sel.bin)
 	m.commit(sel, installErr, assertErr)
@@ -460,7 +460,7 @@ func (m *Manager) finish(ctx context.Context, sel selection, installErr error) e
 	// the waiver's installed set — and a run that has just logged that it will not
 	// touch the tree must not then delete directories and write a symlink in it.
 	if m.mayMutateTree() {
-		m.publishConvenienceLink(sel.bin)
+		m.publishConvenienceLinks(sel)
 		// Pruning runs only after a successful install, and therefore only after
 		// publish has synced the parent directory. A FAILED install prunes nothing:
 		// the versions on the volume are the fallback set that makes the failure
@@ -469,7 +469,7 @@ func (m *Manager) finish(ctx context.Context, sel selection, installErr error) e
 			m.pruneSuperseded(ctx, sel.version)
 		}
 	} else {
-		slog.Warn("skipping the convenience link and the retention prune: both write inside a tree this process does not exclusively control",
+		slog.Warn("skipping the convenience links and the retention prune: both write inside a tree this process does not exclusively control",
 			"package", m.cfg.Release.Name, "root", m.versionsDir, "reason", m.custodyVerdict())
 	}
 	switch {

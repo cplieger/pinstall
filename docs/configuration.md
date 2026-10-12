@@ -34,7 +34,7 @@ A `Release` is everything true of the package wherever it runs, so you write it 
 | `Optional` | Artifacts installed when the archive has them, with a warning when it does not. | _(unset)_ |
 | `Assert` | Assertions run again on every pass. `Release.Mandatory` is merged in. | _(unset)_ |
 | `Purge` | A one-shot sweep of a layout an earlier installer left. Nil skips it. See [the sweep](how-it-works.md#sweeping-an-earlier-installers-layout). | _(unset)_ |
-| `LinkDir` | A directory under `Root` for a convenience symlink. Empty, or a directory that resolves outside `Root`, publishes none. | _(unset)_ |
+| `LinkDir` | A directory under `Root` for a convenience symlink per installed artifact. Empty, or a directory that resolves outside `Root`, publishes none. See [the install layout](how-it-works.md#the-install-layout). | _(unset)_ |
 | `Retain` | Predecessors kept besides the active version. See [Retention](#retention). | 1 |
 | `RetryBackoff` | The first `EnsureWithRetry` wait. It doubles on each attempt, up to 10 minutes. | 30s |
 | `MaxAttempts` | The number of attempts `EnsureWithRetry` makes. | 4 |

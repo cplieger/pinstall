@@ -67,7 +67,7 @@ func main() {
 		Version: widgetVersion,
 		Digests: map[string]string{"amd64": amd64SHA, "arm64": arm64SHA},
 		Root:    "/var/lib/example/tools",
-		LinkDir: "bin",                     // optional convenience symlink
+		LinkDir: "bin",                     // optional convenience symlinks
 		Require: []string{"widget-helper"}, // artifacts you cannot run without
 	})
 	if err != nil {
@@ -116,7 +116,7 @@ A `Manager` logs installs, retries and warnings through the default `log/slog` l
 - The install root stays private. Before anything is fetched, the root and every directory above it must be owned by you or root and writable by nobody else, access-control lists included.
 - It refuses an unsafe tree and leaves the fix to you. When another account that can write the tree already holds root, such as an administrator, list it in `TrustedUIDs` or `TrustedGIDs`.
 - The verified archive cannot be swapped. Its file name is deleted before the first byte arrives, and extraction reads the same open file the digest check read.
-- Names it acts on stay under `Root`. Archive entries, moved artifacts, the state record, the link and every sweep target go through an `os.Root`, so the kernel refuses a symlink that would redirect one.
+- Names it acts on stay under `Root`. Archive entries, moved artifacts, the state record, the links and every sweep target go through an `os.Root`, so the kernel refuses a symlink that would redirect one.
 - Required settings hold on every start. Each `Mandatory` assertion runs against the staged binary before publication and against the active one on every pass, and a failure withholds readiness.
 - A failed install keeps the old version serving. Pruning runs only after a successful publish.
 
