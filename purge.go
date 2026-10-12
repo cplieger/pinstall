@@ -3,11 +3,13 @@
 package pinstall
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -62,9 +64,9 @@ func (p *Purge) validate(linkDir string) error {
 }
 
 // purgeOnce runs the sweep at most once per process AND at most once per volume.
-// The in-process latch protects the convenience link this manager publishes at one
-// of the swept paths; the on-disk marker is what stops a start that has nothing
-// left to migrate from walking a co-owned directory at all.
+// The in-process latch stops a retry or rescan re-walking the co-owned directory;
+// the on-disk marker is what stops a start that has nothing left to migrate from
+// walking it at all.
 func (m *Manager) purgeOnce() {
 	if m.cfg.Purge == nil {
 		return
@@ -231,70 +233,133 @@ func (m *Manager) recordPurge() {
 	slog.Debug("recorded the purge as complete", "package", m.cfg.Release.Name, "path", path)
 }
 
-// publishConvenienceLink republishes <Root>/<LinkDir>/<Binary> as a symlink at
-// the active artifact, for an operator shelling into the environment. An empty
-// LinkDir publishes nothing.
-//
-// It is explicitly NON-AUTHORITATIVE: nothing in this package reads it, no
-// integrity or readiness decision consults it, and a consumer always runs the
-// absolute version-directory path from [Manager.Path]. Publication is atomic
-// (write a temp name, rename over the old one) with the parent synced and the
-// target validated, and every failure is a warning — a missing convenience
-// pointer must never withhold readiness from a correctly installed release.
-//
-// Every step goes through an [os.Root] on Root, for the reason the sweep at the top
-// of this file already states about the same directory: a directory holding a
-// convenience link is commonly CO-OWNED, so LinkDir is the one tree this package
-// writes into that nothing has proved anything about. The custody walk cannot
-// cover it — it judges the installation root and the ancestors above it, and
-// LinkDir is a SIBLING of that root, never on the chain. Measured on the
-// unconfined form: with LinkDir a symlink out of Root, the link was published
-// outside Root entirely, contradicting this package's own claim that Root is the
-// only tree it writes. Deleting from here was already confined; publishing was not,
-// and one rule for one directory is the point.
-func (m *Manager) publishConvenienceLink(target string) {
+// publishConvenienceLinks republishes <Root>/<LinkDir>/<name> into sel's directory
+// for every artifact sel holds, and retracts this manager's own link at every
+// declared name sel lacks, so no link dangles once the old version is pruned.
+// Non-authoritative: every failure only warns.
+// LinkDir is commonly co-owned, so only an empty slot or this manager's own link
+// is replaced or removed ([Manager.ownsLink]). Every step goes through an
+// [os.Root] on Root: with LinkDir a symlink out of Root, an unconfined publish was
+// measured landing outside Root.
+func (m *Manager) publishConvenienceLinks(sel selection) {
 	if m.cfg.LinkDir == "" {
-		return
-	}
-	if !selfContained(target) {
-		slog.Warn("not publishing the convenience symlink: the active artifact is not a self-contained executable",
-			"package", m.cfg.Release.Name, "target", target)
 		return
 	}
 	root, err := os.OpenRoot(m.cfg.Root)
 	if err != nil {
-		slog.Warn("failed to open the root to publish the convenience symlink",
+		slog.Warn("failed to open the root to publish the convenience symlinks",
 			"package", m.cfg.Release.Name, "root", m.cfg.Root, "error", err)
 		return
 	}
 	defer root.Close()
 	linkDir := filepath.Join(m.cfg.Root, m.cfg.LinkDir)
 	if err := root.MkdirAll(m.cfg.LinkDir, dirMode); err != nil {
-		slog.Warn("failed to create the link dir for the convenience symlink",
+		slog.Warn("failed to create the link dir for the convenience symlinks",
 			"package", m.cfg.Release.Name, "path", linkDir, "error", err)
 		return
 	}
-	link := filepath.Join(m.cfg.LinkDir, m.primary)
-	tmp := filepath.Join(m.cfg.LinkDir, "."+m.primary+".newlink")
+	changed := false
+	for _, name := range m.linkNames() {
+		target := filepath.Join(sel.dir, name)
+		if selfContained(target) {
+			changed = m.publishLink(root, name, target) || changed
+			continue
+		}
+		if slices.Contains(m.cfg.Require, name) {
+			slog.Warn("not publishing a convenience symlink: the active version holds no self-contained executable at this required artifact",
+				"package", m.cfg.Release.Name, "target", target)
+		}
+		changed = m.retractLink(root, name) || changed
+	}
+	if !changed {
+		return
+	}
+	if err := m.fsync(linkDir); err != nil {
+		slog.Warn("failed to sync the link dir after republishing the convenience symlinks",
+			"package", m.cfg.Release.Name, "error", err)
+	}
+}
+
+// linkNames is every artifact name a version directory may hold, each once: the
+// set the convenience links are published and retracted as.
+func (m *Manager) linkNames() []string {
+	names := make([]string, 0, len(m.cfg.Require)+len(m.cfg.Optional))
+	for _, name := range slices.Concat(m.cfg.Require, m.cfg.Optional) {
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// publishLink points <LinkDir>/<name> at target and reports whether it changed the
+// link directory. An entry this manager does not own is left as it is.
+func (m *Manager) publishLink(root *os.Root, name, target string) bool {
+	link := filepath.Join(m.cfg.LinkDir, name)
+	if free, own := m.linkSlot(root, name); !free && !own {
+		slog.Warn("not publishing a convenience symlink: another owner of the link dir holds an entry at its name",
+			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link))
+		return false
+	}
+	tmp := filepath.Join(m.cfg.LinkDir, "."+name+".newlink")
 	_ = root.Remove(tmp)
 	// The TARGET is deliberately not root-relative. os.Root resolves the name being
 	// created, never the text a symlink is given, and the text has to stay the
 	// absolute version-directory path an operator's shell will resolve.
 	if err := root.Symlink(target, tmp); err != nil {
-		slog.Warn("failed to stage the convenience symlink",
+		slog.Warn("failed to stage a convenience symlink",
 			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, tmp), "error", err)
-		return
+		return false
 	}
 	if err := m.rename(root, tmp, link); err != nil {
 		_ = root.Remove(tmp)
-		slog.Warn("failed to publish the convenience symlink; the bare name will not resolve, the primary path is unaffected",
+		slog.Warn("failed to publish a convenience symlink; the bare name will not resolve, the primary path is unaffected",
 			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "error", err)
-		return
+		return false
 	}
-	if err := m.fsync(linkDir); err != nil {
-		slog.Warn("failed to sync the link dir after publishing the convenience symlink",
-			"package", m.cfg.Release.Name, "error", err)
-	}
-	slog.Debug("published the convenience symlink",
+	slog.Debug("published a convenience symlink",
 		"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "target", target)
+	return true
+}
+
+// retractLink removes this manager's own link at <LinkDir>/<name> and reports
+// whether it changed the link directory. Anything else at that name is left alone.
+func (m *Manager) retractLink(root *os.Root, name string) bool {
+	if _, own := m.linkSlot(root, name); !own {
+		return false
+	}
+	link := filepath.Join(m.cfg.LinkDir, name)
+	if err := root.Remove(link); err != nil {
+		slog.Warn("failed to retract a convenience symlink at an artifact the active version does not hold; it may dangle",
+			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "error", err)
+		return false
+	}
+	slog.Debug("retracted a convenience symlink the active version has no artifact for",
+		"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link))
+	return true
+}
+
+// linkSlot reports whether <LinkDir>/<name> is free, and whether what is there is
+// this manager's own link. Lstat, never Stat: a foreign symlink must be judged as
+// itself, not as whatever it points at. A slot that cannot be read is neither.
+func (m *Manager) linkSlot(root *os.Root, name string) (free, own bool) {
+	link := filepath.Join(m.cfg.LinkDir, name)
+	fi, err := root.Lstat(link)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true, false
+	case err != nil, fi.Mode()&fs.ModeSymlink == 0:
+		return false, false
+	}
+	text, err := root.Readlink(link)
+	return false, err == nil && m.ownsLink(name, text)
+}
+
+// ownsLink reports whether a symlink at <LinkDir>/<name> with this text has the
+// shape [Manager.publishConvenienceLinks] writes: the path of an artifact of that
+// same name directly inside a directory of this installation root. The shape is the
+// ownership record, so nothing else is persisted, and a dangling link into a pruned
+// version is still recognised and so still retracted.
+func (m *Manager) ownsLink(name, text string) bool {
+	return filepath.Base(text) == name && filepath.Dir(filepath.Dir(text)) == m.versionsDir
 }

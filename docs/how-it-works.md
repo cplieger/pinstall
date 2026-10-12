@@ -12,10 +12,10 @@ Each version installs into its own directory under `Root`:
 │   ├── 1.4.2/            # the active version: artifacts + .complete
 │   └── 1.4.1/            # the retained predecessor
 ├── <Name>-state.json     # a diagnostic record; never an input to Ready
-└── bin/<Binary>          # the optional convenience symlink
+└── bin/<artifact>        # the optional convenience symlinks
 ```
 
-Your program finds the active version through `Path()` and `PathEntry()`, never through the symlink. The symlink exists only so an operator can run the tool by name, and pinstall never reads it. The state file is for an operator reading the volume, and `Ready` never consults it.
+Your program finds the active version through `Path()` and `PathEntry()`, never through the symlinks. They exist only so an operator can run the tool by name, and pinstall never reads them. Each artifact the active version holds gets one: the primary, every `Require` entry and every `Optional` entry the archive provided. That matters for a tool whose primary binary starts its helpers by name from `PATH`. When a new version drops an optional artifact, its link is removed rather than left dangling. In a shared `LinkDir`, pinstall replaces or removes only an empty name or a link it wrote itself, one pointing at a same-named artifact in a directory under `<Name>-versions/`. An entry another installer put there is left alone. The state file is for an operator reading the volume, and `Ready` never consults it.
 
 ## A version is complete or absent
 
@@ -83,7 +83,7 @@ A `Manager` is safe for concurrent use. `Ensure` and `Rescan` run one at a time,
 
 ## Writes stay under Root
 
-pinstall uses an `os.Root` whenever it acts on a name that comes from a profile, an archive or a tree already on disk. That covers archive entries, the artifacts moved out of the staging tree, the version directory a publish replaces, the state record, the sweep marker, the convenience link and every sweep target. The kernel then refuses a symlink at any path component instead of following it.
+pinstall uses an `os.Root` whenever it acts on a name that comes from a profile, an archive or a tree already on disk. That covers archive entries, the artifacts moved out of the staging tree, the version directory a publish replaces, the state record, the sweep marker, the convenience links and every sweep target. The kernel then refuses a symlink at any path component instead of following it.
 
 The staging tree, the archive file and the completion marker have names pinstall generates itself. It creates them inside the versions directory, whose custody it checked first.
 
