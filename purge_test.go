@@ -2,6 +2,8 @@ package pinstall
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -322,13 +324,11 @@ func TestNilPurgeSweepsNothing(t *testing.T) {
 	if err := m.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
+	// The legacy files at the artifact names included: the convenience links replace
+	// only an empty slot or the manager's own link.
 	for _, rel := range files {
-		if rel == testLinkDir+"/"+toolName {
-			// The convenience link republishes over this exact path.
-			continue
-		}
-		if !exists(filepath.Join(env.root, rel)) {
-			t.Errorf("%s was removed although no Purge is configured", rel)
+		if fi, err := os.Lstat(filepath.Join(env.root, rel)); err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("%s was removed or replaced although no Purge is configured", rel)
 		}
 	}
 	for _, e := range mustReadDir(t, env.root) {
@@ -338,9 +338,8 @@ func TestNilPurgeSweepsNothing(t *testing.T) {
 	}
 }
 
-// TestPurgeRunsOncePerProcess pins that the sweep is latched: it deletes the entry
-// under LinkDir that is exactly where the convenience link is published, so a retry
-// or a rescan must not delete it again.
+// TestPurgeRunsOncePerProcess pins that the sweep is latched: a retry or a rescan
+// does not sweep again, and the convenience link published at a swept name survives.
 func TestPurgeRunsOncePerProcess(t *testing.T) {
 	env := newFakeEnv(t)
 	m := env.manager(func(c *Config) { c.Purge = testPurge() })
@@ -475,11 +474,12 @@ func TestConvenienceLinkIsNeverConsultedForReadiness(t *testing.T) {
 // no artifacts at all, and every name it does declare has to be swept from LinkDir —
 // the list is the whole of what the sweep is entitled to touch there, so a name left
 // behind is a stale bare command an operator's shell keeps finding.
+//
+// The artifact names get the manager's own symlinks after the sweep, so the check is
+// that no legacy regular file survives at any name, not that every name is empty. A
+// legacy file the sweep missed also blocks the link, because it is not the manager's.
 func TestPurgeSweepsEveryDeclaredLinkName(t *testing.T) {
-	// The primary is deliberately absent: the manager republishes its own convenience
-	// link at that name after the sweep, so it is the one name whose absence the sweep
-	// cannot be judged by.
-	names := []string{toolSidecar, toolExtra, "toolkit-old", "toolkit-legacy", "toolkit-ancient"}
+	names := []string{toolName, toolSidecar, toolExtra, "toolkit-old", "toolkit-legacy", "toolkit-ancient"}
 	env := newFakeEnv(t)
 	linkDir := filepath.Join(env.root, testLinkDir)
 	if err := os.MkdirAll(linkDir, 0o755); err != nil {
@@ -496,7 +496,7 @@ func TestPurgeSweepsEveryDeclaredLinkName(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 	for _, name := range names {
-		if exists(filepath.Join(linkDir, name)) {
+		if fi, err := os.Lstat(filepath.Join(linkDir, name)); err == nil && fi.Mode().IsRegular() {
 			t.Errorf("%s survived the sweep although the profile declared it", name)
 		}
 	}
@@ -674,5 +674,182 @@ func TestPurgeMarkerWriteStaysUnderRoot(t *testing.T) {
 		t.Fatalf("the file outside Root is gone: %v", err)
 	case string(got) != want:
 		t.Errorf("the file outside Root now holds %q, want it untouched at %q", string(got), want)
+	}
+}
+
+// readLink returns the text of the symlink at path, failing the test when path is
+// anything else.
+func readLink(t *testing.T, path string) string {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(%s): %v", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is not a symlink (mode %v)", path, fi.Mode())
+	}
+	text, err := os.Readlink(path)
+	if err != nil {
+		t.Fatalf("Readlink(%s): %v", path, err)
+	}
+	return text
+}
+
+// TestConvenienceLinksCoverEveryInstalledArtifact pins the link set: the primary,
+// every required artifact and every optional one the version holds each get a link
+// into the active version directory, because a primary that re-execs a sidecar by
+// bare name finds it only if the sidecar resolves from the same directory. An
+// optional artifact the archive did not provide gets no link at all, never a
+// dangling one.
+func TestConvenienceLinksCoverEveryInstalledArtifact(t *testing.T) {
+	t.Run("every artifact the version holds", func(t *testing.T) {
+		env := newFakeEnv(t)
+		m := env.manager()
+		if err := m.Ensure(t.Context()); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		for _, name := range []string{toolName, toolSidecar, toolExtra} {
+			link := filepath.Join(env.root, testLinkDir, name)
+			if got, want := readLink(t, link), filepath.Join(env.versionDir(pinnedVersion), name); got != want {
+				t.Errorf("%s -> %q, want %q", name, got, want)
+			}
+			if exists(filepath.Join(env.root, testLinkDir, "."+name+".newlink")) {
+				t.Errorf("the staged temp link for %s survived publication", name)
+			}
+		}
+	})
+
+	t.Run("an optional artifact the archive lacks", func(t *testing.T) {
+		env := newFakeEnv(t)
+		delete(env.produces, toolExtra)
+		m := env.manager()
+		if err := m.Ensure(t.Context()); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		if exists(filepath.Join(env.root, testLinkDir, toolExtra)) {
+			t.Errorf("a link was published for %s, which the active version does not hold", toolExtra)
+		}
+		if got, want := readLink(t, filepath.Join(env.root, testLinkDir, toolSidecar)), filepath.Join(env.versionDir(pinnedVersion), toolSidecar); got != want {
+			t.Errorf("%s -> %q, want %q", toolSidecar, got, want)
+		}
+	})
+}
+
+// TestConvenienceLinksFollowAVersionSwitch pins the set across an activation that
+// changes what the version holds: every link moves to the new version, and the link
+// of an optional artifact the new version dropped is retracted rather than left
+// pointing at the old one, where it would dangle once retention prunes it.
+func TestConvenienceLinksFollowAVersionSwitch(t *testing.T) {
+	const nextVersion = "2.14.3"
+	env := newFakeEnv(t)
+	if err := env.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure %s: %v", pinnedVersion, err)
+	}
+	if !exists(filepath.Join(env.root, testLinkDir, toolExtra)) {
+		t.Fatalf("no %s link after the first activation, so this fixture proves nothing", toolExtra)
+	}
+	env.placeVersion(nextVersion, toolName, toolSidecar)
+
+	m := env.manager(func(c *Config) { c.Version = nextVersion })
+	if err := m.Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure %s: %v", nextVersion, err)
+	}
+	if st, _ := m.Active(); st.ActiveVersion != nextVersion {
+		t.Fatalf("active version = %q, want %q", st.ActiveVersion, nextVersion)
+	}
+
+	for _, name := range []string{toolName, toolSidecar} {
+		if got, want := readLink(t, filepath.Join(env.root, testLinkDir, name)), filepath.Join(env.versionDir(nextVersion), name); got != want {
+			t.Errorf("%s -> %q, want %q", name, got, want)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(env.root, testLinkDir, toolExtra)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Lstat(%s) error = %v, want not-exist: the new version ships no %s", toolExtra, err, toolExtra)
+	}
+}
+
+// TestConvenienceLinksRetractADanglingOwnedLink pins that ownership is read from the
+// link text and never from its target: a link of this manager's shape into a version
+// directory retention already pruned is still its own, so it is removed when the
+// active version lacks that artifact.
+func TestConvenienceLinksRetractADanglingOwnedLink(t *testing.T) {
+	env := newFakeEnv(t)
+	delete(env.produces, toolExtra)
+	linkDir := filepath.Join(env.root, testLinkDir)
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pruned := filepath.Join(env.versionDir("2.0.0"), toolExtra)
+	if exists(pruned) {
+		t.Fatalf("%s exists, so the planted link would not dangle", pruned)
+	}
+	link := filepath.Join(linkDir, toolExtra)
+	if err := os.Symlink(pruned, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if err := env.manager().Ensure(t.Context()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if _, err := os.Lstat(link); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Lstat(%s) error = %v, want not-exist: a dangling link of this manager's shape must be retracted", toolExtra, err)
+	}
+}
+
+// TestConvenienceLinksLeaveAForeignEntryAlone pins the ownership rule in the
+// co-owned link directory, through the purge and the republish together. Another
+// installer's entry at one of the artifact names, or anywhere else there, is neither
+// replaced when the active version holds that artifact nor retracted when it does
+// not: only an empty slot or a link of this manager's own shape is ever touched.
+func TestConvenienceLinksLeaveAForeignEntryAlone(t *testing.T) {
+	foreign := map[string]func(env *fakeEnv) string{
+		"a link into another tool tree": func(env *fakeEnv) string {
+			return filepath.Join(env.root, "opt", toolExtra, "1.0.0", toolExtra)
+		},
+		"a link into this tree at another artifact": func(env *fakeEnv) string {
+			return filepath.Join(env.versionDir(pinnedVersion), toolName)
+		},
+		"a relative link": func(*fakeEnv) string {
+			return filepath.Join("..", toolName+versionsSuffix, pinnedVersion, toolExtra)
+		},
+	}
+	for name, targetOf := range foreign {
+		for _, holds := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, version holds it %v", name, holds), func(t *testing.T) {
+				env := newFakeEnv(t)
+				if !holds {
+					delete(env.produces, toolExtra)
+				}
+				linkDir := filepath.Join(env.root, testLinkDir)
+				if err := os.MkdirAll(linkDir, 0o755); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				planted := map[string]string{
+					toolExtra:   targetOf(env),
+					"othertool": filepath.Join(env.root, "opt", "othertool", "2.0.0", "othertool"),
+				}
+				for link, target := range planted {
+					if err := os.Symlink(target, filepath.Join(linkDir, link)); err != nil {
+						t.Fatalf("Symlink(%s): %v", link, err)
+					}
+				}
+				m := env.manager(func(c *Config) { c.Purge = testPurge() })
+
+				if err := m.Ensure(t.Context()); err != nil {
+					t.Fatalf("Ensure: %v", err)
+				}
+				if _, err := m.Rescan(t.Context()); err != nil {
+					t.Fatalf("Rescan: %v", err)
+				}
+				for link, want := range planted {
+					if got := readLink(t, filepath.Join(linkDir, link)); got != want {
+						t.Errorf("foreign %s -> %q, want it untouched at %q", link, got, want)
+					}
+				}
+				if got, want := readLink(t, filepath.Join(linkDir, toolSidecar)), filepath.Join(env.versionDir(pinnedVersion), toolSidecar); got != want {
+					t.Errorf("%s -> %q, want %q: a foreign entry must not stop the rest of the set", toolSidecar, got, want)
+				}
+			})
+		}
 	}
 }

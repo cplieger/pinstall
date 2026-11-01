@@ -50,7 +50,7 @@ type Release struct {
 	// the sentinel's claim. It is NOT the artifact name — see Binary.
 	Name string
 	// Binary is the primary artifact: the file the version probe runs, the file
-	// the convenience link points at, and an always-present member of the
+	// its convenience link points at, and an always-present member of the
 	// required set. Empty defaults to Name, which covers the common case; a
 	// package named "aws-cli" that ships a binary called "aws" sets both.
 	Binary string
@@ -176,9 +176,12 @@ type Config struct {
 	// server. Empty uses the release's own template.
 	URLTemplate string
 	// LinkDir is a directory under Root holding a NON-AUTHORITATIVE
-	// convenience symlink at the active artifact, for an operator shelling
-	// into the environment. Empty publishes none. Nothing in this package ever
-	// reads the link.
+	// convenience symlink at each artifact the active version holds (the
+	// primary, Require, and every Optional present), for an operator shelling
+	// into the environment. A version switch retracts the link of an artifact
+	// the new version lacks, and an entry another owner put at one of these
+	// names is never replaced. Empty publishes none. Nothing in this package
+	// ever reads the links.
 	LinkDir string
 	// Optional names artifacts installed when the archive provides them, and
 	// only warned about when it does not. It closes the pointer-bearing fields
@@ -242,7 +245,7 @@ type Config struct {
 	//
 	// It also re-authorises what the library otherwise declines to do in a tree it does
 	// not control: the one-shot Purge, the sweep of partial directories and orphan staging
-	// trees, the retention prune, the convenience symlink, and the state record. That
+	// trees, the retention prune, the convenience symlinks, and the state record. That
 	// follows from what it means — the library is installing there, so refusing to tidy up
 	// after itself would leave Purge silently dead and let partial directories accumulate
 	// without bound.
