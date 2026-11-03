@@ -1,8 +1,9 @@
 // Package kirocli is the [pinstall] profile for the kiro-cli release.
 //
 // It states once, for every consumer installing kiro-cli, the release host and
-// archive shape, the architecture tokens, the in-archive installer, the probe
-// argv, the licence notice and the assertion the integrity check depends on. A
+// archive shape, the architecture tokens, where the archive holds its binaries,
+// the probe argv, the licence notice and the assertion the integrity check
+// depends on. A
 // profile copied into each consumer would drift silently between the copies.
 //
 // The pin itself is not here. The version and the per-architecture digests
@@ -21,7 +22,6 @@ package kirocli
 
 import (
 	"strconv"
-	"time"
 
 	"github.com/cplieger/pinstall/v3"
 )
@@ -63,12 +63,11 @@ func Release() pinstall.Release {
 			"amd64": "x86_64-linux",
 			"arm64": "aarch64-linux",
 		},
-		Installer: &pinstall.ArchiveInstaller{
-			Path:    "kirocli/install.sh",
-			Args:    []string{"--no-confirm"},
-			Timeout: 120 * time.Second,
-		},
-		ArtifactDir: ".local/bin",
+		// No Installer: the archive's kirocli/bin already holds every binary, and
+		// its install.sh is not stable across releases. 3.0.0's rejects the
+		// --no-confirm that 2.x took and exits before copying anything, and 2.x's
+		// ran `kiro-cli setup`, which a container does not want.
+		ArtifactDir: "kirocli/bin",
 		ProbeArgs:   []string{"--version"},
 		Notice:      licenceNotice,
 		Mandatory:   []pinstall.Assertion{Setting(autoUpdateSetting, true)},
