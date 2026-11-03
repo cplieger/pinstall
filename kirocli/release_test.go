@@ -75,7 +75,7 @@ func TestReleaseDeclaresTheAutoUpdateGateAsMandatory(t *testing.T) {
 
 // TestReleaseCarriesTheArchivesRealShape pins the facts a consumer would otherwise
 // re-derive from upstream documentation: the release host, the archive file name, the
-// two published architecture tokens, and the installer inside the archive.
+// two published architecture tokens, and where the archive holds its binaries.
 func TestReleaseCarriesTheArchivesRealShape(t *testing.T) {
 	release := kirocli.Release()
 	if release.Name != kirocli.Name {
@@ -101,20 +101,14 @@ func TestReleaseCarriesTheArchivesRealShape(t *testing.T) {
 	if len(release.ArchTokens) != len(wantTokens) {
 		t.Errorf("ArchTokens = %v, want exactly the published set %v", release.ArchTokens, wantTokens)
 	}
-	if release.Installer == nil {
-		t.Fatal("Installer is nil, but the archive ships an installer rather than bare artifacts")
+	// The archive's own install.sh takes different flags per release (3.0.0 refuses
+	// 2.x's --no-confirm before copying anything), so the profile runs none and reads
+	// the binaries where every release ships them.
+	if release.Installer != nil {
+		t.Errorf("Installer = %+v, want nil: the archive already holds the binaries", release.Installer)
 	}
-	if release.Installer.Path != "kirocli/install.sh" {
-		t.Errorf("Installer.Path = %q, want kirocli/install.sh", release.Installer.Path)
-	}
-	if !slices.Equal(release.Installer.Args, []string{"--no-confirm"}) {
-		t.Errorf("Installer.Args = %v, want the non-interactive flag", release.Installer.Args)
-	}
-	if release.Installer.Timeout <= 0 {
-		t.Error("Installer.Timeout is unset; a wedged installer must not stall a start forever")
-	}
-	if release.ArtifactDir != ".local/bin" {
-		t.Errorf("ArtifactDir = %q, want .local/bin (relative to the installer's private home)", release.ArtifactDir)
+	if release.ArtifactDir != "kirocli/bin" {
+		t.Errorf("ArtifactDir = %q, want kirocli/bin (relative to the extracted archive)", release.ArtifactDir)
 	}
 	if !slices.Equal(release.ProbeArgs, []string{"--version"}) {
 		t.Errorf("ProbeArgs = %v, want --version", release.ProbeArgs)
@@ -147,15 +141,11 @@ func TestReleaseCarriesTheLicenceNotice(t *testing.T) {
 func TestReleaseIsFreshOnEveryCall(t *testing.T) {
 	first := kirocli.Release()
 	first.ArchTokens["amd64"] = "hijacked"
-	first.Installer.Args[0] = "--hijacked"
 	first.Mandatory[0].Args[2] = "false"
 
 	second := kirocli.Release()
 	if second.ArchTokens["amd64"] != "x86_64-linux" {
 		t.Error("mutating one Release's ArchTokens changed the next one")
-	}
-	if second.Installer.Args[0] != "--no-confirm" {
-		t.Error("mutating one Release's installer args changed the next one")
 	}
 	if second.Mandatory[0].Args[2] != "true" {
 		t.Error("mutating one Release's mandatory assertion changed the next one")

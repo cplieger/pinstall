@@ -79,7 +79,7 @@ cfg.TrustedUIDs = uids
 
 ## The kiro-cli profile
 
-The core package names no vendor. `pinstall/kirocli` is a ready-made profile for the [kiro-cli](https://kiro.dev/cli/) release. It sets the URL shape, the architecture tokens, the in-archive installer, the probe arguments, the license notice and the assertion that turns auto-update off.
+The core package names no vendor. `pinstall/kirocli` is a ready-made profile for the [kiro-cli](https://kiro.dev/cli/) release. It sets the URL shape, the architecture tokens, the directory inside the archive that holds the binaries, the probe arguments, the license notice and the assertion that turns auto-update off.
 
 `kirocli.Setting(key, bool)` and `kirocli.SettingRaw(key, value)` build assertions in kiro-cli's own settings syntax. Both take a `kirocli.SettingKey` rather than a `string`, so a key and a string value cannot be swapped in a `SettingRaw` call. A string literal converts on its own, and a variable has to be declared as a `SettingKey`.
 
