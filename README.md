@@ -4,7 +4,7 @@
 
 pinstall installs a pinned version of another program from your Go code, refuses it unless its SHA-256 matches your pin, and tells your program when it is ready to run.
 
-It replaces the download, checksum and install steps you would otherwise write in a shell script or a container entrypoint. It runs on Linux only, needs Go 1.27.1 or later and is licensed under Apache-2.0. Its one dependency outside the standard library is [pathinside](https://github.com/cplieger/pathinside), which uses only the standard library itself.
+It replaces the download, checksum and install steps you would otherwise write in a shell script or a container entrypoint. It runs on Linux only, needs Go 1.27.1 or later and is licensed under Apache-2.0. Its one dependency outside the standard library is [pathinside](https://github.com/cplieger/go/tree/main/pathinside), which uses only the standard library itself.
 
 ## Why use it
 
