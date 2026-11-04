@@ -178,10 +178,10 @@ type Config struct {
 	// LinkDir is a directory under Root holding a NON-AUTHORITATIVE
 	// convenience symlink at each artifact the active version holds (the
 	// primary, Require, and every Optional present), for an operator shelling
-	// into the environment. A version switch retracts the link of an artifact
-	// the new version lacks, and an entry another owner put at one of these
-	// names is never replaced. Empty publishes none. Nothing in this package
-	// ever reads the links.
+	// into the environment. A link this manager published that the active
+	// version no longer backs is retracted, declared or not; an entry another
+	// owner put in LinkDir is never touched. Empty publishes none. Nothing in
+	// this package ever reads the links.
 	LinkDir string
 	// Optional names artifacts installed when the archive provides them, and
 	// only warned about when it does not. It closes the pointer-bearing fields
