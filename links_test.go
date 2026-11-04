@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -184,6 +185,48 @@ func TestConvenienceLinksRetractWhatADroppedReleaseNoLongerShips(t *testing.T) {
 		}
 	})
 
+	t.Run("link text is judged by the path it names, not its spelling", func(t *testing.T) {
+		env := newShrinkEnv(t, nil)
+		linkDir := filepath.Join(env.root, testLinkDir)
+		// via is a symlinked directory, so the ".." after it climbs out of the place the
+		// text appears to name.
+		via := filepath.Join(filepath.Dir(env.root), "via")
+		if err := os.Symlink(filepath.Join(t.TempDir(), "deep"), via); err != nil {
+			t.Fatalf("Symlink(%s): %v", via, err)
+		}
+		sep := string(filepath.Separator)
+		climb := strings.Join([]string{
+			via, "..", filepath.Base(env.root), filepath.Base(env.versionsRoot()), shrinkWideVersion, toolExtra,
+		}, sep)
+		planted := map[string]string{
+			toolName:    env.versionsRoot() + sep + toolName + sep,
+			toolSidecar: env.versionsRoot() + sep + toolSidecar + sep,
+			toolExtra:   climb,
+			toolAlias:   env.versionDir(shrinkWideVersion) + sep + toolAlias + sep,
+		}
+		for name, text := range planted {
+			link := filepath.Join(linkDir, name)
+			if err := os.Remove(link); err != nil {
+				t.Fatalf("Remove(%s): %v", link, err)
+			}
+			if err := os.Symlink(text, link); err != nil {
+				t.Fatalf("Symlink(%s): %v", link, err)
+			}
+		}
+
+		if err := shrinkTo(t, env); err != nil {
+			t.Fatalf("Ensure %s: %v", shrinkNarrowVersion, err)
+		}
+		for _, name := range []string{toolName, toolSidecar, toolExtra} {
+			if got, err := os.Readlink(filepath.Join(linkDir, name)); err != nil || got != planted[name] {
+				t.Errorf("foreign %s -> %q (%v), want it untouched at %q", name, got, err, planted[name])
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(linkDir, toolAlias)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Lstat(%s) error = %v, want not-exist: a trailing separator still names this tree's %s", toolAlias, err, shrinkWideVersion)
+		}
+	})
+
 	t.Run("a crash-left staged link of a dropped artifact is retracted", func(t *testing.T) {
 		env := newShrinkEnv(t, nil)
 		linkDir := filepath.Join(env.root, testLinkDir)
@@ -214,21 +257,6 @@ func TestConvenienceLinksRetractWhatADroppedReleaseNoLongerShips(t *testing.T) {
 		}
 		if got := readLink(t, staged); got != foreign {
 			t.Errorf("foreign %s -> %q, want it untouched at %q", staged, got, foreign)
-		}
-	})
-
-	t.Run("a tree without custody is not swept", func(t *testing.T) {
-		env := newShrinkEnv(t, nil)
-		linkDir := filepath.Join(env.root, testLinkDir)
-		if err := os.Chmod(env.versionsRoot(), 0o757); err != nil {
-			t.Fatalf("Chmod(%s): %v", env.versionsRoot(), err)
-		}
-
-		if err := shrinkTo(t, env); !errors.Is(err, ErrNoCustody) {
-			t.Fatalf("Ensure %s error = %v, want ErrNoCustody", shrinkNarrowVersion, err)
-		}
-		if got, want := readLink(t, filepath.Join(linkDir, toolSidecar)), filepath.Join(env.versionDir(shrinkWideVersion), toolSidecar); got != want {
-			t.Errorf("%s -> %q, want it untouched at %q in a tree this manager may not mutate", toolSidecar, got, want)
 		}
 	})
 

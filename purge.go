@@ -391,11 +391,11 @@ func (m *Manager) retractLink(root *os.Root, entry, artifact string) bool {
 	}
 	link := filepath.Join(m.cfg.LinkDir, entry)
 	if err := root.Remove(link); err != nil {
-		slog.Warn("failed to retract a convenience symlink the active version does not publish; it may dangle",
+		slog.Warn("failed to retract a convenience symlink; it may dangle",
 			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "error", err)
 		return false
 	}
-	slog.Debug("retracted a convenience symlink the active version does not publish",
+	slog.Debug("retracted a convenience symlink",
 		"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link))
 	return true
 }
@@ -421,7 +421,14 @@ func (m *Manager) linkSlot(root *os.Root, entry, artifact string) (free, own boo
 // [Manager.publishConvenienceLinks] writes: the path of an artifact of that same name
 // directly inside a directory of this installation root. The shape is the ownership
 // record, so nothing else is persisted, and a dangling link into a pruned version is
-// still recognised and so still retracted.
+// still recognised and so still retracted. The test runs on the cleaned text, since
+// filepath.Base and filepath.Dir skip a trailing separator rather than a component,
+// and refuses a ".." element, which resolves through a symlinked directory to
+// somewhere other than its lexical meaning.
 func (m *Manager) ownsLink(name, text string) bool {
-	return filepath.Base(text) == name && filepath.Dir(filepath.Dir(text)) == m.versionsDir
+	if slices.Contains(strings.Split(text, string(filepath.Separator)), "..") {
+		return false
+	}
+	clean := filepath.Clean(text)
+	return filepath.Base(clean) == name && filepath.Dir(filepath.Dir(clean)) == m.versionsDir
 }
