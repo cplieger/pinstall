@@ -330,7 +330,7 @@ func (m *Manager) publishLink(root *os.Root, name, target string) bool {
 // a consumer that stops declaring an artifact a new release dropped still has the link
 // published for it, and that link would dangle once retention prunes its version.
 func (m *Manager) retractStrayLinks(root *os.Root, declared []string) bool {
-	entries, err := fs.ReadDir(root.FS(), filepath.ToSlash(m.cfg.LinkDir))
+	entries, err := m.listLinkDir(root)
 	if err != nil {
 		slog.Warn("failed to list the link dir to retract stale convenience symlinks",
 			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, m.cfg.LinkDir), "error", err)
@@ -350,6 +350,18 @@ func (m *Manager) retractStrayLinks(root *os.Root, declared []string) bool {
 		changed = m.retractLink(root, e.Name(), artifact) || changed
 	}
 	return changed
+}
+
+// listLinkDir lists LinkDir through root.Open rather than root.FS: io/fs accepts only
+// fs.ValidPath names, which refuses spellings validation admits ("bin/", "./bin") and
+// the other link operations resolve.
+func (m *Manager) listLinkDir(root *os.Root) ([]fs.DirEntry, error) {
+	dir, err := root.Open(m.cfg.LinkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	return dir.ReadDir(-1)
 }
 
 // stagedLinkSuffix ends the name [Manager.publishLink] stages a link under before
@@ -379,11 +391,11 @@ func (m *Manager) retractLink(root *os.Root, entry, artifact string) bool {
 	}
 	link := filepath.Join(m.cfg.LinkDir, entry)
 	if err := root.Remove(link); err != nil {
-		slog.Warn("failed to retract a convenience symlink the active version does not back; it may dangle",
+		slog.Warn("failed to retract a convenience symlink the active version does not publish; it may dangle",
 			"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link), "error", err)
 		return false
 	}
-	slog.Debug("retracted a convenience symlink the active version does not back",
+	slog.Debug("retracted a convenience symlink the active version does not publish",
 		"package", m.cfg.Release.Name, "path", filepath.Join(m.cfg.Root, link))
 	return true
 }

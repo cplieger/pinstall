@@ -59,12 +59,13 @@ func newShrinkEnv(t *testing.T, plant func(env *fakeEnv, linkDir string)) *fakeE
 
 // shrinkTo points env at the one-binary release, declared with nothing beyond the
 // primary, and runs Ensure on it.
-func shrinkTo(t *testing.T, env *fakeEnv) error {
+func shrinkTo(t *testing.T, env *fakeEnv, mutate ...func(*Config)) error {
 	t.Helper()
 	env.archive = shrinkArchive(t, shrinkNarrowVersion, toolName)
 	env.digest = digestOf(env.archive)
 	env.require, env.optional = nil, nil
-	return env.manager(func(c *Config) { c.Version = shrinkNarrowVersion }).Ensure(t.Context())
+	mutate = append([]func(*Config){func(c *Config) { c.Version = shrinkNarrowVersion }}, mutate...)
+	return env.manager(mutate...).Ensure(t.Context())
 }
 
 // TestConvenienceLinksRetractWhatADroppedReleaseNoLongerShips pins retraction on
@@ -94,6 +95,44 @@ func TestConvenienceLinksRetractWhatADroppedReleaseNoLongerShips(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(linkDir, name)); !errors.Is(err, fs.ErrNotExist) {
 				t.Errorf("Lstat(%s) error = %v, want not-exist: %s ships no %s", name, err, shrinkNarrowVersion, name)
 			}
+		}
+	})
+
+	// Config validation accepts these spellings of the same directory, and every other
+	// link operation resolves them, so the retraction must too.
+	for form, spelled := range map[string]string{
+		"a trailing slash": testLinkDir + "/",
+		"a dot prefix":     "./" + testLinkDir,
+	} {
+		t.Run("own links are retracted with LinkDir spelled with "+form, func(t *testing.T) {
+			env := newShrinkEnv(t, nil)
+			linkDir := filepath.Join(env.root, testLinkDir)
+
+			if err := shrinkTo(t, env, func(c *Config) { c.LinkDir = spelled }); err != nil {
+				t.Fatalf("Ensure %s: %v", shrinkNarrowVersion, err)
+			}
+			for _, name := range []string{toolSidecar, toolExtra, toolAlias, toolAliasChat} {
+				if _, err := os.Lstat(filepath.Join(linkDir, name)); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("Lstat(%s) error = %v, want not-exist: %s ships no %s", name, err, shrinkNarrowVersion, name)
+				}
+			}
+		})
+	}
+
+	t.Run("an own link that already dangles is retracted", func(t *testing.T) {
+		env := newShrinkEnv(t, nil)
+		linkDir := filepath.Join(env.root, testLinkDir)
+		const pruned = "toolkit-legacy"
+		dangling := filepath.Join(linkDir, pruned)
+		if err := os.Symlink(filepath.Join(env.versionsRoot(), "1.0.0", pruned), dangling); err != nil {
+			t.Fatalf("Symlink(%s): %v", dangling, err)
+		}
+
+		if err := shrinkTo(t, env); err != nil {
+			t.Fatalf("Ensure %s: %v", shrinkNarrowVersion, err)
+		}
+		if _, err := os.Lstat(dangling); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Lstat(%s) error = %v, want not-exist: it points into a version retention already pruned", dangling, err)
 		}
 	})
 
@@ -158,6 +197,23 @@ func TestConvenienceLinksRetractWhatADroppedReleaseNoLongerShips(t *testing.T) {
 		}
 		if _, err := os.Lstat(staged); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("Lstat(%s) error = %v, want not-exist: no later publish reuses that temp name", staged, err)
+		}
+	})
+
+	t.Run("a foreign symlink at a staged-link name is left alone", func(t *testing.T) {
+		env := newShrinkEnv(t, nil)
+		linkDir := filepath.Join(env.root, testLinkDir)
+		staged := filepath.Join(linkDir, "."+toolExtra+".newlink")
+		foreign := filepath.Join("/opt", "other", toolExtra)
+		if err := os.Symlink(foreign, staged); err != nil {
+			t.Fatalf("Symlink(%s): %v", staged, err)
+		}
+
+		if err := shrinkTo(t, env); err != nil {
+			t.Fatalf("Ensure %s: %v", shrinkNarrowVersion, err)
+		}
+		if got := readLink(t, staged); got != foreign {
+			t.Errorf("foreign %s -> %q, want it untouched at %q", staged, got, foreign)
 		}
 	})
 
