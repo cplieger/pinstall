@@ -1002,6 +1002,14 @@ func TestFinishDoesNotMutateATreeWhoseVerdictFlippedMidOperation(t *testing.T) {
 		}
 		return env.probeAnswer(bin)
 	}
+	// An own link of an undeclared artifact, which a permitted finish would retract.
+	stray := filepath.Join(env.root, "bin", "toolkit-legacy")
+	if err := os.MkdirAll(filepath.Dir(stray), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(env.versionDir("0.8.0"), "toolkit-legacy"), stray); err != nil {
+		t.Fatalf("Symlink(%s): %v", stray, err)
+	}
 	m := env.manager(func(c *Config) { c.LinkDir = "bin" })
 
 	err := m.Ensure(t.Context())
@@ -1016,6 +1024,9 @@ func TestFinishDoesNotMutateATreeWhoseVerdictFlippedMidOperation(t *testing.T) {
 	}
 	if exists(filepath.Join(env.root, "bin", toolName)) {
 		t.Error("the convenience link was published inside a tree the same operation refused to mutate")
+	}
+	if !exists(stray) {
+		t.Error("the stray-link sweep retracted a link inside a tree the same operation refused to mutate")
 	}
 }
 
