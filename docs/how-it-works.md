@@ -41,7 +41,7 @@ A list that cannot be read is a refusal, never an absence. That covers a malform
 
 ### Two exemptions
 
-A sticky ancestor that others can write to passes, because the sticky bit stops another user renaming your directory away. That is what makes `/tmp` usable as a root. The exemption is lost when an access-control list grants someone `DELETE_CHILD`, ownership of that directory, or the right to rewrite its list. Write access is read from the list as well as the mode, so a `1755` directory with an `EVERYONE@` write entry counts as shared.
+A sticky ancestor that others can write to passes, because the sticky bit stops another user renaming your directory away. That is what makes `/tmp` usable as a root. The exemption is lost when an access-control list grants someone ownership of that directory or the right to rewrite its list. A list entry granting `DELETE_CHILD` does not lift it, because Linux applies the sticky rule to every removal and rename. Write access is read from the list as well as the mode, so a `1755` directory with an `EVERYONE@` write entry counts as shared.
 
 Group 0 counts as trusted, so the check does not guard against an account that belongs to group 0.
 

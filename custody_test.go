@@ -2,6 +2,7 @@ package pinstall
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1430,20 +1431,10 @@ func TestNewWiresTheDeclaredIdentities(t *testing.T) {
 }
 
 // TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway pins the one condition the
-// sticky exemption depends on and cannot itself check.
-//
-// The exemption is sound as an argument about the CURRENT mode: sticky restricts removal
-// and renaming to each entry's owner, so a principal who can create files beside ours
-// cannot rename ours away, which is what makes /tmp a usable place to root an install. But
-// it is an argument about a mode and an ownership that a sufficiently privileged ACE can
-// change. WRITE_OWNER lets its holder take the directory, after which chmod is theirs and
-// the sticky bit goes; WRITE_ACL lets them grant themselves the rest; DELETE_CHILD is the
-// sticky rule itself written into the list, which RFC 7530 lets the list decide. The kernel
-// enforcing check_sticky() today says nothing about a rule the attacker can rewrite tomorrow.
-//
-// So the sticky branch reads the grants that would retire the sticky rule itself and nothing
-// else: an ordinary write grant on a sticky ancestor stays exempt, which is the whole point
-// of the exemption.
+// sticky exemption depends on and cannot itself check: that nobody else can clear the
+// sticky bit. WRITE_OWNER takes the directory and then chmod; WRITE_ACL grants the rest.
+// Every other write grant on a sticky ancestor stays exempt, because the kernel applies
+// the sticky rule to each removal and rename whatever the list says.
 func TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway(t *testing.T) {
 	const stranger = 4242
 
@@ -1453,15 +1444,10 @@ func TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway(t *testing.T) {
 	}{
 		"write access, which sticky genuinely contains": {mask: nfs4WriteData},
 		"append, likewise": {mask: nfs4AppendData},
-		// DELETE_CHILD is not something sticky contains, it is the sticky rule stated in
-		// the list -- and RFC 7530 makes the list the access decision, leaving sticky as
-		// the fallback for when it does not decide. On the 1777 ancestor this exemption
-		// exists for, the mode already lets its holder create the replacement, so being
-		// able to remove a component this walk has just judged is a complete substitution
-		// of the tree probeVersion then executes as root.
-		"delete child, which the list is entitled to grant over sticky": {mask: nfs4DeleteChild, wantRefus: true},
-		"take ownership, which removes the sticky bit":                  {mask: nfs4WriteOwner, wantRefus: true},
-		"rewrite the list, which grants the rest":                       {mask: nfs4WriteACL, wantRefus: true},
+		// fs/namei.c may_delete_dentry checks sticky after the directory permission.
+		"delete child, which the kernel's sticky rule still overrides": {mask: nfs4DeleteChild},
+		"take ownership, which removes the sticky bit":                 {mask: nfs4WriteOwner, wantRefus: true},
+		"rewrite the list, which grants the rest":                      {mask: nfs4WriteACL, wantRefus: true},
 	}
 
 	for name, tc := range tests {
@@ -1493,6 +1479,84 @@ func TestVerifyCustodyRefusesAStickyAncestorWhoseACLGivesItAway(t *testing.T) {
 			}
 			if tc.wantRefus && err != nil && !strings.Contains(err.Error(), "sticky") {
 				t.Errorf("error %q does not explain that the sticky bit was what failed", err)
+			}
+		})
+	}
+}
+
+// TestVerifyCustodyAcceptsTheListZFSDerivesForA1777Ancestor serves the list OpenZFS stores
+// for a chmod 1777 directory, whose group@ and everyone@ entries carry DELETE_CHILD. Linux
+// still enforces sticky over that grant, so the ancestor passes; every other shared shape
+// built from the same list must still be refused.
+func TestVerifyCustodyAcceptsTheListZFSDerivesForA1777Ancestor(t *testing.T) {
+	const stranger = 4242
+	zfs1777, err := base64.StdEncoding.DecodeString(nfs4Samples[zfs1777Sample].b64)
+	if err != nil {
+		t.Fatalf("decoding the fixture: %v", err)
+	}
+	// Appends one ALLOW entry for uid stranger and bumps the entry count in the header.
+	withWriteACL := slices.Clone(zfs1777)
+	binary.BigEndian.PutUint32(withWriteACL[4:], binary.BigEndian.Uint32(withWriteACL[4:])+1)
+	withWriteACL = append(withWriteACL, buildNFS4ACL(nfs4TypeAllow, 0, 0, nfs4WriteACL, stranger)[nfs4HeaderSize:]...)
+
+	tests := map[string]struct {
+		blob       []byte
+		onRoot     bool
+		parentMode os.FileMode
+		rootMode   os.FileMode
+		wantErr    string
+	}{
+		"a 1777 ancestor passes": {
+			blob: zfs1777, parentMode: os.ModeSticky | 0o777, rootMode: 0o755,
+		},
+		"a 1777 installation root is refused": {
+			blob: zfs1777, onRoot: true, parentMode: 0o755, rootMode: os.ModeSticky | 0o777,
+			wantErr: "can be modified by",
+		},
+		"a 0777 ancestor is refused": {
+			blob: zfs1777, parentMode: 0o777, rootMode: 0o755,
+			wantErr: "can be modified by everyone",
+		},
+		"a 1777 ancestor whose list also grants WRITE_ACL is refused": {
+			blob: withWriteACL, parentMode: os.ModeSticky | 0o777, rootMode: 0o755,
+			wantErr: "lets uid 4242 take its ownership or rewrite that list",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			parent := filepath.Join(t.TempDir(), "tools")
+			root := filepath.Join(parent, "pkg-versions")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.Chmod(root, tc.rootMode); err != nil {
+				t.Fatalf("chmod root: %v", err)
+			}
+			if err := os.Chmod(parent, tc.parentMode); err != nil {
+				t.Fatalf("chmod parent: %v", err)
+			}
+			served := parent
+			if tc.onRoot {
+				served = root
+			}
+			var st syscall.Stat_t
+			if err := syscall.Stat(served, &st); err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			defer serveACL(t, served, xattrNFS4XDR, tc.blob)()
+
+			// The group@ entry resolves to the runner's own group; trusting it leaves
+			// everyone@ as the only stranger the list names.
+			err := verifyCustody(root, trustedWriters{gids: []int{int(st.Gid)}})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("verifyCustody = %v, want nil: the kernel enforces sticky over DELETE_CHILD", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("verifyCustody = %v, want ErrNoCustody containing %q", err, tc.wantErr)
 			}
 		})
 	}

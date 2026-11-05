@@ -13,20 +13,13 @@ import (
 	"testing"
 )
 
-// Real access-control lists, read from an OpenZFS nfsv4 dataset and captured verbatim
-// with their stat data. They are the fixtures that pin the wire format, because that
-// format is not something to infer from a specification and hope: every field below was
-// cross-checked against nfs4xdr_getfacl's rendering of the same object, bit for bit.
+// Real access-control lists, read from an OpenZFS nfsv4 dataset with their stat data and
+// cross-checked bit for bit against nfs4xdr_getfacl's rendering of the same object.
 //
-// The first sample is the lossy case this whole check exists for: mode 0770 shows the
-// owning group write, and says nothing at all about the named user who also has it. A
-// mode-only reading of that directory misses uid 3000 entirely.
-//
-// The other two are the correction to my own reading of the same tree, and they are here
-// so nobody repeats it. Their wide group@ entries are INHERIT_ONLY, so they do not apply
-// to the directory itself; they are copied onto things created inside it, which is why a
-// 0700 mkdir there stores 0770 while the directory is 0750. Parsing the list is what tells
-// those two situations apart, and eyeballing nfs4xdr_getfacl output is what does not.
+// The 0770 sample is the lossy case: the mode says nothing about the named uid 3000 who
+// can write. The two 0750 samples carry a wide group@ entry that is INHERIT_ONLY, so it
+// applies to new children (a 0700 mkdir there stores 0770), not to the directory. The
+// 1777 sample is the list ZFS derives from a chmod 1777, the shape of /tmp there.
 var nfs4Samples = map[string]struct {
 	b64  string
 	uid  uint32
@@ -67,7 +60,18 @@ var nfs4Samples = map[string]struct {
 		// directory's CHILDREN, not for the directory.
 		want: []principal{{kind: principalUser, id: 3000}},
 	},
+	zfs1777Sample: {
+		b64:  "AAMAAQAAAAMAAAAAAAAAAAAAAAEAHgH/AAAAAQAAAAAAAABAAAAAAQASAO8AAAACAAAAAAAAAAAAAAABABIA7wAAAAM=",
+		uid:  0,
+		gid:  0,
+		mode: 0o777,
+		want: []principal{{kind: principalGroup, id: 0}, {kind: principalEveryone}},
+	},
 }
+
+// zfs1777Sample names the nfs4Samples entry whose group@ and everyone@ write grants carry
+// DELETE_CHILD, which ZFS adds to every mode-derived write grant on a directory.
+const zfs1777Sample = "shared sticky directory, mode 1777, the list ZFS derives from that mode"
 
 // TestParseNFS4ACLAgainstRealSamples pins the NFSv4 parser on lists a real ZFS dataset
 // carries. A hand-built fixture would only prove the parser agrees with my reading of the
@@ -550,6 +554,24 @@ func TestControllersOfAnswersOnlyForNFSv4(t *testing.T) {
 		}
 		if !slices.Contains(got, principal{kind: principalUser, id: stranger}) {
 			t.Errorf("controllers = %v, want uid %d, who can take ownership and clear the sticky bit", got, stranger)
+		}
+	})
+
+	t.Run("the list ZFS derives for a 1777 directory names nobody", func(t *testing.T) {
+		blob, err := base64.StdEncoding.DecodeString(nfs4Samples[zfs1777Sample].b64)
+		if err != nil {
+			t.Fatalf("decoding the fixture: %v", err)
+		}
+		old := getxattrFn
+		getxattrFn = serveOne(xattrNFS4XDR, blob)
+		defer func() { getxattrFn = old }()
+
+		got, err := controllersOf("/irrelevant", &syscall.Stat_t{Gid: 9})
+		if err != nil {
+			t.Fatalf("controllersOf: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("controllers = %v, want none: only owner@ holds WRITE_ACL or WRITE_OWNER, and DELETE_CHILD is not a control", got)
 		}
 	})
 

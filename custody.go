@@ -59,8 +59,8 @@ import (
 //     access-control list. An ANCESTOR is exempted from that one question when it
 //     carries the sticky bit, because sticky restricts removal and renaming to the
 //     owner of each entry, and that is what makes /tmp (1777 everywhere) usable. The
-//     exemption does not cover a grant that retires the sticky rule itself — deleting
-//     entries somebody does not own, taking the directory, or rewriting its list. The
+//     exemption does not cover a grant that lets someone else clear the sticky bit:
+//     taking the directory, or rewriting its list. The
 //     installation root itself is not exempted at all: sticky says nothing about
 //     CREATE, and anyone who can create entries there can plant a version directory.
 //   - It carries no access-control list of a dialect whose mode is not an upper
@@ -313,23 +313,15 @@ func checkComponent(path string, euid int, installRoot, parentShared bool, trust
 	// create entries there can plant a complete-looking version directory, which
 	// selection would otherwise accept as an installed version.
 	if !installRoot && mode&os.ModeSticky != 0 {
-		// The exemption is conditional on facts a sufficiently privileged ACE can change:
-		// that the sticky bit is set, that this directory belongs to somebody who will not
-		// clear it, and that removing an entry needs to be its owner. A principal granted
-		// WRITE_OWNER can take the directory and then chmod the bit away; one granted
-		// WRITE_ACL can grant itself the rest; and one granted DELETE_CHILD may remove an
-		// entry it does not own, which is the sticky rule itself rather than a
-		// consequence of it -- RFC 7530 makes the ACL the decision and leaves sticky as
-		// the fallback for when the list does not decide. Each of those retires the
-		// protection this branch is relying on, so all three are read even here: the
-		// kernel enforcing check_sticky() today says nothing about a rule the attacker can
-		// rewrite tomorrow.
+		// The exemption holds only while nobody else can clear the sticky bit: WRITE_OWNER
+		// takes the directory and then chmod, and WRITE_ACL grants itself the rest. Removal
+		// itself stays the kernel's sticky rule; [nfs4ControlMask] owns which grants count.
 		controllers, ctlErr := controllersOf(path, stat)
 		if ctlErr != nil {
 			return fmt.Errorf("%w: %w", ErrNoCustody, ctlErr)
 		}
 		if stranger, found := trust.firstStranger(controllers, euid); found {
-			return fmt.Errorf("%w: %s, mode %#o, is sticky, but its access-control list lets %s remove an entry it does not own, take its ownership or rewrite that list, and each of those removes the protection the sticky bit was providing%s",
+			return fmt.Errorf("%w: %s, mode %#o, is sticky, but its access-control list lets %s take its ownership or rewrite that list, and either removes the protection the sticky bit was providing%s",
 				ErrNoCustody, path, mode.Perm(), stranger, trust.hint())
 		}
 		return nil

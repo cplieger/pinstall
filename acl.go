@@ -74,7 +74,7 @@ var aclDialects = []aclDialect{{
 	ceiling:   posixACLHeaderSize + posixACLMaxEntries*posixACLEntrySize,
 	parse:     parsePOSIXACL,
 	modeFloor: false,
-	// POSIX.1e cannot grant WRITE_ACL, WRITE_OWNER or DELETE_CHILD: chmod and chown stay
+	// POSIX.1e cannot grant WRITE_ACL or WRITE_OWNER: chmod and chown stay
 	// with the owner, whom every caller checks separately, and removal is the kernel's
 	// sticky rule with nothing in the list able to override it.
 	controls: nil,
@@ -230,20 +230,15 @@ const (
 const nfs4WriteMask = nfs4WriteData | nfs4AppendData | nfs4DeleteChild |
 	nfs4Delete | nfs4WriteACL | nfs4WriteOwner
 
-// nfs4ControlMask is the subset of nfs4WriteMask that lets a principal dismantle an
-// object's own protection rather than merely write through it: take the ownership that
-// gates chmod and chown, rewrite the list itself, or remove an entry it does not own.
+// nfs4ControlMask is the subset of nfs4WriteMask that dismantles a sticky ancestor's
+// protection: take the ownership that gates chmod and chown, or rewrite the list. See
+// [controllersOf].
 //
-// DELETE_CHILD is in the set because it is the sticky rule, not a consequence of it. RFC
-// 7530 makes an explicit grant the access decision and leaves the sticky bit as the
-// fallback for when the list does not decide, so a named identity holding DELETE_CHILD on
-// an ancestor can remove a component this walk has just judged and put its own tree at that
-// name — while the mode, on the 1777 ancestor the exemption exists for, already lets it
-// create the replacement.
-//
-// It exists because the sticky exemption is conditional on facts a holder of these bits can
-// change. See [controllersOf].
-const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner | nfs4DeleteChild
+// DELETE_CHILD is not in it: Linux applies the sticky rule to every removal and rename
+// whatever the list grants (may_delete_dentry and check_sticky in fs/namei.c), and so does
+// OpenZFS (zfs_zaccess_delete, case 2a). ZFS adds DELETE_CHILD to every mode-derived write
+// grant on a directory, so counting it refused every 1777 directory on an nfsv4 dataset.
+const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner
 
 // ErrACLUnreadable reports that an access-control list is present but could not be
 // evaluated. It is deliberately distinct from a refusal on the CONTENT of an ACL: this
@@ -361,14 +356,12 @@ func readACL(path string) (*aclDialect, []byte, error) {
 }
 
 // controllersOf returns every principal that can dismantle path's OWN protection -- take
-// the ownership that gates chmod and chown, rewrite the access-control list, or remove an
-// entry it does not own -- as opposed to one that can merely write inside it.
+// the ownership that gates chmod and chown, or rewrite the access-control list -- as
+// opposed to one that can merely write inside it.
 //
-// Only NFSv4 can express any of those grants, which is recorded as a nil controls on every
-// other dialect's row rather than as a name compared here. Under POSIX.1e chmod and chown
-// stay with the owner, whom the caller checks separately, removal is the kernel's sticky
-// rule with nothing in the list able to override it, and no mode bit confers any of the
-// three, so the answer is nothing rather than a guess.
+// Only NFSv4 can express either grant, recorded as a nil controls on every other
+// dialect's row. Under POSIX.1e chmod and chown stay with the owner, whom the caller
+// checks separately, and no mode bit confers either, so the answer is nothing.
 func controllersOf(path string, stat *syscall.Stat_t) ([]principal, error) {
 	dialect, blob, err := readACL(path)
 	if err != nil {
