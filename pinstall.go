@@ -356,6 +356,11 @@ func (c *Config) validate() error {
 	if err := validateRelPath("LinkDir", c.LinkDir, true); err != nil {
 		return err
 	}
+	// Join cleans ".." lexically while the publish's os.Root resolves it after
+	// a symlink, so the fsync and the logs would name another directory.
+	if slices.Contains(strings.Split(c.LinkDir, "/"), "..") {
+		return fmt.Errorf("pinstall: LinkDir %q must not contain a \"..\" component", c.LinkDir)
+	}
 	for _, group := range [][]string{c.Require, c.Optional} {
 		for _, name := range group {
 			if err := validateIdentifier("artifact name", name); err != nil {

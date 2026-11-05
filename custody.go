@@ -79,8 +79,8 @@ import (
 // where another principal has that. The one place another principal CAN create entries
 // is a sticky ancestor others can write, and sticky is exactly the rule that stops them
 // touching an entry they do not own, which is why the ownership of a symlink is demanded
-// there and nowhere else. Root is
-// outside the model entirely, as it is for every check of this kind.
+// there and nowhere else. Root is outside the model entirely, as it is for every check of
+// this kind.
 //
 // It also cannot see a filesystem that does not make the mode its access decision at
 // all — a cifs mount with noperm, a FUSE filesystem without default_permissions —
