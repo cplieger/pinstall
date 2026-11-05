@@ -70,9 +70,9 @@ func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
 		// Both bits set names the GROUP, not everyone: writersOf enumerates the group
 		// first and firstStranger stops at the first writer the caller has not
 		// accounted for. The group is pinned to a stranger here rather than left as
-		// whatever gid the test process happens to carry, because the root group is
-		// trusted — so as root this case would report everyone and as anyone else the
-		// group, and the assertion would be describing the environment.
+		// whatever gid the test process happens to carry, so the expected identity is
+		// the same on every runner and the assertion describes the rule rather than
+		// the environment.
 		"both writable, the group reported first":       {mode: 0o777, chgrp: true, want: "gid 65500"},
 		"group write only, by a group that is not root": {mode: 0o720, chgrp: true, want: "gid 65500"},
 	}
@@ -162,9 +162,8 @@ func TestVerifyCustodyAcceptsADeclaredGroup(t *testing.T) {
 //
 // The mode grants everyone write and the group NOTHING, so everyone is the only writer in
 // the set and the assertion cannot be satisfied by some other stranger reported first. At
-// 0777 the group is enumerated ahead of everyone, and the root group is trusted while an
-// ordinary one is not, so that mode would report everyone as root and a gid as anyone
-// else — an assertion about the environment rather than about the rule.
+// 0777 the group is enumerated ahead of everyone, so that mode would report the
+// directory's gid and never reach everyone at all.
 func TestVerifyCustodyNeverTrustsEveryone(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pkg-versions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -477,9 +476,9 @@ func TestVerifyCustodyRefusesASymlinkCycle(t *testing.T) {
 // this walk resolves too: refusing one link earlier would refuse a tree open(2) reaches
 // perfectly well, and the refusal is an install outage rather than a diagnosis.
 //
-// Each pass expands ONE link, and the pass after the last expansion is the one that judges
-// where the tree actually lives, so a chain of exactly the bound needs one more pass than
-// it has links.
+// The walk counts every symlink it follows, as the kernel does, and refuses the hop that
+// takes the count past the bound: a chain of exactly maxSymlinkHops links resolves and one
+// more link is ELOOP, the same answer open(2) gives for both.
 func TestVerifyCustodyFollowsAsManyLinksAsTheKernelWould(t *testing.T) {
 	// chain links a run of symlinks ending at a private directory and returns the head.
 	chain := func(t *testing.T, links int) string {
@@ -824,9 +823,9 @@ func TestMoveArtifactRefusesToPublishAWritableArtifact(t *testing.T) {
 	if err == nil {
 		t.Fatal("Ensure published an artifact the installer left writable by another principal")
 	}
-	// "writable by" rather than the identity: the writer set enumerates the group first
-	// and gid 0 is trusted, so a root container names everyone where an unprivileged CI
-	// runner names the process's own gid. Both are the same refusal.
+	// "writable by" rather than the identity: the writer set enumerates the group first,
+	// so a root container names gid 0 where an unprivileged runner names its own gid.
+	// Both are the same refusal.
 	if !strings.Contains(err.Error(), "writable by") || !strings.Contains(err.Error(), toolName) {
 		t.Errorf("Ensure error = %v, want one naming the writable artifact", err)
 	}
@@ -1969,5 +1968,39 @@ func TestVerifyCustodyRefusesAnEmptyPath(t *testing.T) {
 	}
 	if err := verifyCustody("", trustedWriters{}); !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), "an empty path") {
 		t.Errorf("verifyCustody(\"\") = %v, want the empty path refused", err)
+	}
+}
+
+// TestVerifyCustodyRefusesAForeignSymlinkReachedAfterDotDot pins that ".." recomputes
+// whether the directory reached is shared: a stranger's link in a sticky directory others
+// can write is refused when reached through "mine/..", as when named directly.
+func TestVerifyCustodyRefusesAForeignSymlinkReachedAfterDotDot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to hand the link to another uid")
+	}
+	const stranger = 4242
+	base := mustEval(t, t.TempDir())
+	sticky := filepath.Join(base, "sticky")
+	target := filepath.Join(base, "real", "pkg")
+	for _, d := range []string{filepath.Join(sticky, "mine"), target} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(sticky, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(sticky, "evil")
+	if err := os.Symlink(filepath.Dir(target), evil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Lchown(evil, stranger, stranger); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{evil + "/pkg", sticky + "/mine/../evil/pkg"} { // not Join
+		err := verifyCustody(path, trustedWriters{})
+		if !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), fmt.Sprintf("is a symlink owned by uid %d", stranger)) {
+			t.Errorf("verifyCustody(%s) = %v, want the stranger's link refused", path, err)
+		}
 	}
 }

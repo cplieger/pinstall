@@ -74,11 +74,12 @@ import (
 //
 // A verdict is a statement about one instant, and the operations it authorises happen
 // afterwards. What makes that gap safe is not the timing but the content of the
-// verdict: replacing any component of any of those chains needs write access to the
-// directory holding it, and the walk has refused every chain where another principal has
-// that. The one place another principal CAN create entries is a sticky ancestor others can
-// write, and sticky is exactly the rule that stops them touching an entry they do not own —
-// which is why the ownership of a symlink is demanded there and nowhere else. Root is
+// verdict: replacing any directory the walk passed through, or any link it followed,
+// needs write access to the directory holding it, and the walk has refused every path
+// where another principal has that. The one place another principal CAN create entries
+// is a sticky ancestor others can write, and sticky is exactly the rule that stops them
+// touching an entry they do not own, which is why the ownership of a symlink is demanded
+// there and nowhere else. Root is
 // outside the model entirely, as it is for every check of this kind.
 //
 // It also cannot see a filesystem that does not make the mode its access decision at
@@ -258,7 +259,7 @@ func sharedSticky(path string, euid int, trust trustedWriters) bool {
 // installRoot marks the component that IS the installation root, which is held to a
 // stricter rule than its ancestors: it is never exempted from the write question, however
 // sticky it is. It is the last component of the chain only when the caller is walking the
-// installation root itself, so [walkChain] is told rather than inferring it. parentShared
+// installation root itself, so [verifyCustodyChain] is told rather than inferring it. parentShared
 // says the containing directory was sticky and writable by somebody the caller has not
 // accounted for, which is the only case where a symlink's ownership is load-bearing.
 func checkComponent(path string, euid int, installRoot, parentShared bool, trust trustedWriters) error {

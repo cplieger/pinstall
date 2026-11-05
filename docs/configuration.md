@@ -27,7 +27,7 @@ A `Release` is everything true of the package wherever it runs, so you write it 
 | `Release` | The profile above. | required |
 | `Version` | The pin, limited to characters that are safe in a path and in a URL. | required |
 | `Digests` | Maps a `GOARCH` to the lowercase hex SHA-256 of that architecture's archive. The running architecture needs an entry. | required |
-| `Root` | The absolute install root. It is the only tree pinstall reads, writes or deletes. | required |
+| `Root` | The absolute install root, with no `..` component. It is the only tree pinstall reads, writes or deletes. | required |
 | `GOARCH` | Overrides the architecture. | `runtime.GOARCH` |
 | `URLTemplate` | Overrides the release's template, for a mirror. | the release's template |
 | `Require` | Artifacts a version directory must hold to count as complete. The primary artifact is always included. | _(unset)_ |

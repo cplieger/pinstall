@@ -31,6 +31,7 @@ func TestNewValidatesItsPins(t *testing.T) {
 		"dotted version":        {mutate: func(c *Config) { c.Version = ".hidden" }, wantErr: "dot"},
 		"missing root":          {mutate: func(c *Config) { c.Root = "" }, wantErr: "Root is required"},
 		"relative root":         {mutate: func(c *Config) { c.Root = "tools" }, wantErr: "must be absolute"},
+		"dot-dot in root":       {mutate: func(c *Config) { c.Root += "/x/.." }, wantErr: "must not contain"},
 		"no digests at all":     {mutate: func(c *Config) { c.Digests = nil }, wantErr: "Digests is required"},
 		"no digest for arch":    {mutate: func(c *Config) { delete(c.Digests, "amd64") }, wantErr: "no pinned digest"},
 		"unsupported arch":      {mutate: func(c *Config) { c.GOARCH = "sparc64" }, wantErr: "no published archive"},

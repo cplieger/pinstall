@@ -168,7 +168,9 @@ type Config struct {
 	// because it is interpolated into both a URL and a filesystem path.
 	Version string
 	// Root is the persistent installation root: the only tree this package
-	// reads, writes or deletes.
+	// reads, writes or deletes. It must be absolute and hold no ".." component,
+	// so the directory the custody check judges is the one every later open
+	// reaches.
 	Root string
 	// GOARCH selects the architecture. Empty resolves it from runtime.GOARCH.
 	GOARCH string
