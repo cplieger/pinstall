@@ -44,6 +44,7 @@ func TestNewValidatesItsPins(t *testing.T) {
 		"absolute link dir":     {mutate: func(c *Config) { c.LinkDir = "/usr/local/bin" }, wantErr: "must be relative"},
 		"escaping link dir":     {mutate: func(c *Config) { c.LinkDir = "../bin" }, wantErr: "escape"},
 		"dot-dot in link dir":   {mutate: func(c *Config) { c.LinkDir = "x/../bin" }, wantErr: "must not contain"},
+		"dot-dot ending link":   {mutate: func(c *Config) { c.LinkDir = "bin/x/.." }, wantErr: "must not contain"},
 		"artifact with a slash": {mutate: func(c *Config) { c.Require = []string{"sub/tool"} }, wantErr: "single path component"},
 		"dotted artifact":       {mutate: func(c *Config) { c.Require = []string{".complete"} }, wantErr: "must not start with a dot"},
 		"bad url override":      {mutate: func(c *Config) { c.URLTemplate = "ftp://x/{version}" }, wantErr: "http or https"},

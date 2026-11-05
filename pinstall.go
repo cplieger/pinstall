@@ -356,8 +356,8 @@ func (c *Config) validate() error {
 	if err := validateRelPath("LinkDir", c.LinkDir, true); err != nil {
 		return err
 	}
-	// Join cleans ".." lexically while the publish's os.Root resolves it after
-	// a symlink, so the fsync and the logs would name another directory.
+	// root.MkdirAll and the listing resolve ".." after a symlink, while every link,
+	// fsync and log path is Join-cleaned, so the two would reach different directories.
 	if slices.Contains(strings.Split(c.LinkDir, "/"), "..") {
 		return fmt.Errorf("pinstall: LinkDir %q must not contain a \"..\" component", c.LinkDir)
 	}
