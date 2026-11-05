@@ -699,19 +699,9 @@ func (t trustedWriters) allows(p principal, euid int) bool {
 	case principalUser:
 		return p.id == euid || p.id == 0 || slices.Contains(t.uids, p.id)
 	case principalGroup:
-		// Group 0 is trusted, and NOT for the reason it is tempting to give: membership of
-		// the root group is not root's privilege. A uid 1000 process holding gid 0 gets
-		// write on a root:root 0770 tree and nothing else root can do, so on a host where
-		// group root has members this check does not cover them. That is a stated limit,
-		// not an oversight.
-		//
-		// It stays because the asymmetry runs the other way. The walk judges EVERY
-		// ancestor, so refusing gid 0 would refuse a single root:root 0775 component --
-		// what `install -d -m 775` produces as root, and what /usr/local is on Debian --
-		// and turn an ordinary tree into a total install outage. Being wrong by trusting
-		// costs a clean verdict where an admin who already had root chose to add a member;
-		// being wrong by refusing costs every install on a normal host.
-		return p.id == 0 || slices.Contains(t.gids, p.id)
+		// Only a declared group: a non-root member of group 0 could rename the tree
+		// within any directory group 0 can write, so the root group is a stranger too.
+		return slices.Contains(t.gids, p.id)
 	}
 	return false
 }

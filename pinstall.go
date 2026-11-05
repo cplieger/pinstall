@@ -322,16 +322,28 @@ func orDefaultParser(p func(string) string) func(string) string {
 	return LastFieldOfFirstLine
 }
 
+// validateRoot refuses a Root that is empty, relative or holds a ".." component.
+// Join cleans ".." lexically while an open resolves it after a symlink, so the
+// custody verdict and the operations it authorises could reach two directories.
+func validateRoot(root string) error {
+	switch {
+	case root == "":
+		return errors.New("pinstall: Root is required")
+	case !filepath.IsAbs(root):
+		return fmt.Errorf("pinstall: Root %q must be absolute, because its paths are handed to a subprocess", root)
+	case slices.Contains(strings.Split(root, "/"), ".."):
+		return fmt.Errorf("pinstall: Root %q must not contain a \"..\" component", root)
+	}
+	return nil
+}
+
 // validate checks the deployment half of the configuration.
 func (c *Config) validate() error {
 	if err := validateVersion(c.Version); err != nil {
 		return fmt.Errorf("pinstall: Version %q: %w", c.Version, err)
 	}
-	if c.Root == "" {
-		return errors.New("pinstall: Root is required")
-	}
-	if !filepath.IsAbs(c.Root) {
-		return fmt.Errorf("pinstall: Root %q must be absolute, because its paths are handed to a subprocess", c.Root)
+	if err := validateRoot(c.Root); err != nil {
+		return err
 	}
 	if len(c.Digests) == 0 {
 		return errors.New("pinstall: Digests is required. Map a GOARCH to that archive's lowercase hex SHA-256")
@@ -343,6 +355,11 @@ func (c *Config) validate() error {
 	}
 	if err := validateRelPath("LinkDir", c.LinkDir, true); err != nil {
 		return err
+	}
+	// root.MkdirAll and the listing resolve ".." after a symlink, while every link,
+	// fsync and log path is Join-cleaned, so the two would reach different directories.
+	if slices.Contains(strings.Split(c.LinkDir, "/"), "..") {
+		return fmt.Errorf("pinstall: LinkDir %q must not contain a \"..\" component", c.LinkDir)
 	}
 	for _, group := range [][]string{c.Require, c.Optional} {
 		for _, name := range group {

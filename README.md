@@ -120,7 +120,7 @@ A `Manager` logs installs, retries and warnings through the default `log/slog` l
 - Required settings hold on every start. Each `Mandatory` assertion runs against the staged binary before publication and against the active one on every pass, and a failure withholds readiness.
 - A failed install keeps the old version serving. Pruning runs only after a successful publish.
 
-The ownership check has two exemptions. A directory above the root may be writable by others when its sticky bit is set, as on `/tmp`. Group 0 counts as trusted, so the check does not guard against an account that belongs to group 0. [How pinstall works](docs/how-it-works.md) has the full contract.
+A directory above the root may be writable by others when its sticky bit is set, as on `/tmp`. No group counts as trusted unless you declare it in `TrustedGIDs`, group 0 included. [How pinstall works](docs/how-it-works.md) has the full contract.
 
 ## Unsupported by design
 

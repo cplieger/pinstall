@@ -23,17 +23,16 @@ var (
 	// claim.
 	ErrVersionMismatch = errors.New("binary reported a version its install directory does not claim")
 	// ErrNoCustody reports that the installation root, or a directory on the way to
-	// it, can be modified by a principal other than this process's identity or root —
-	// so nothing installed there can be trusted to stay what was installed. The
+	// it, can be modified by a principal other than this process's identity, the root
+	// user, or an identity declared in [Config.TrustedUIDs] or [Config.TrustedGIDs].
+	// No group is trusted unless declared, the root group included, so nothing
+	// installed there can be trusted to stay what was installed. The
 	// wrapped text names the offending path and what is wrong with it: an owner, a
 	// mode, or an access-control list whose entries the mode does not show. Fix the
 	// volume, or set [Config.InstallWithoutCustody] to proceed anyway.
 	//
-	// Its absence is not a proof of safety. Two limits are worth knowing before relying
-	// on a clean verdict. Group 0 is trusted, so a host where the root GROUP has members
-	// is not covered — those accounts can write a root:root group-writable tree and this
-	// check will not say so (see the reasoning on trustedWriters.allows). And the check
-	// reads Unix ownership, the mode and the ACL-dialect attributes; a filesystem that does not make the mode its
+	// Its absence is not a proof of safety: the check reads Unix ownership, the mode and
+	// the ACL-dialect attributes, so a filesystem that does not make the mode its
 	// access decision at all — a cifs mount with noperm, a FUSE filesystem without
 	// default_permissions — returns a clean verdict from inside the process no matter
 	// who can write. If that is your volume, you know something this library cannot

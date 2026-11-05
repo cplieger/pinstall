@@ -27,7 +27,7 @@ An interrupted install has no marker, so it is never a candidate for activation.
 
 Every guarantee rests on one claim. The artifact pinstall activates came out of an archive that matched your pinned digest. The digest is checked once, on the bytes as they arrive. After that, the claim holds only while nobody else can write into the tree.
 
-So pinstall checks custody before it fetches anything. The root and every directory above it must be owned by you or root and writable by nobody else. This holds on the path as written, on the path it resolves to, and on the directory that holds each symlink in between. A chain of more than 40 symlinks is refused.
+So pinstall checks custody before it fetches anything. The root and every directory the system passes through to reach it must be owned by you or root and writable by nobody else. pinstall follows the path as the kernel resolves it, one component at a time: each symlink's target in place, and every `..` from the directory actually reached. A chain of more than 40 symlinks is refused.
 
 The version directory and every entry in it get the same questions at publish and again at activation. A file's mode is independent of its directory's. A symlink inside a version directory is refused.
 
@@ -43,7 +43,7 @@ A list that cannot be read is a refusal, never an absence. That covers a malform
 
 A sticky ancestor that others can write to passes, because the sticky bit stops another user renaming your directory away. That is what makes `/tmp` usable as a root. The exemption is lost when an access-control list grants someone ownership of that directory or the right to rewrite its list. A list entry granting `DELETE_CHILD` does not lift it, because Linux applies the sticky rule to every removal and rename. Write access is read from the list as well as the mode, so a `1755` directory with an `EVERYONE@` write entry counts as shared.
 
-Group 0 counts as trusted, so the check does not guard against an account that belongs to group 0.
+No group counts as trusted unless you declare it in `TrustedGIDs`, group 0 included: a member of a group that can write a directory on the path could rename the tree within it. A `root:root 0775` directory above the root therefore needs `chmod g-w`.
 
 ### When custody fails
 

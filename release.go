@@ -168,7 +168,9 @@ type Config struct {
 	// because it is interpolated into both a URL and a filesystem path.
 	Version string
 	// Root is the persistent installation root: the only tree this package
-	// reads, writes or deletes.
+	// reads, writes or deletes. It must be absolute and hold no ".." component,
+	// so the directory the custody check judges is the one every later open
+	// reaches.
 	Root string
 	// GOARCH selects the architecture. Empty resolves it from runtime.GOARCH.
 	GOARCH string
@@ -181,7 +183,8 @@ type Config struct {
 	// into the environment. A link this manager published is retracted once
 	// the active version lacks its artifact or the artifact is no longer
 	// declared; an entry another owner put in LinkDir is never touched. Empty
-	// publishes none. Nothing in this package ever reads the links.
+	// publishes none. Nothing in this package ever reads the links. It is
+	// relative, with no ".." component.
 	LinkDir string
 	// Optional names artifacts installed when the archive provides them, and
 	// only warned about when it does not. It closes the pointer-bearing fields
