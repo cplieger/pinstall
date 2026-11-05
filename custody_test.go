@@ -36,13 +36,16 @@ func TestVerifyCustodyAcceptsATreeOnlyThisProcessCanWrite(t *testing.T) {
 	// The witness: the chain really does include a world-writable ancestor, so
 	// the sticky exemption is what let this pass rather than the absence of one.
 	sticky := false
-	for _, component := range ancestors(mustEval(t, dir)) {
+	for component := mustEval(t, dir); ; component = filepath.Dir(component) {
 		fi, err := os.Lstat(component)
 		if err != nil {
 			t.Fatalf("lstat %s: %v", component, err)
 		}
 		if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&os.ModeSticky != 0 {
 			sticky = true
+		}
+		if component == "/" {
+			break
 		}
 	}
 	if !sticky {
@@ -110,24 +113,22 @@ func TestVerifyCustodyRefusesAWritableComponent(t *testing.T) {
 	}
 }
 
-// TestVerifyCustodyAcceptsAGroupOnlyRootCanUse pins the precision the parsed writer set
-// buys, and it is a case the earlier mode-only rule refused for no reason: a directory at
-// 0775 owned by root:root is writable by the root group, whose only member is root, which
-// this check already trusts. Refusing it made the gate look arbitrary and taught operators
-// to reach for the waiver.
-func TestVerifyCustodyAcceptsAGroupOnlyRootCanUse(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("needs to run as root for the root group to be the fixture's group")
+// TestVerifyCustodyRefusesARootGroupWritableAncestor pins that group 0 is a stranger:
+// a non-root member could rename the tree within a root:root 0775 parent and plant its own.
+func TestVerifyCustodyRefusesARootGroupWritableAncestor(t *testing.T) {
+	if os.Geteuid() != 0 || os.Getegid() != 0 {
+		t.Skip("needs root for the fixture's group to be group 0")
 	}
-	root := filepath.Join(t.TempDir(), "pkg-versions")
+	parent := filepath.Join(t.TempDir(), "shared")
+	root := filepath.Join(parent, "pkg-versions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.Chmod(root, 0o775); err != nil {
+	if err := os.Chmod(parent, 0o775); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	if err := verifyCustody(root, trustedWriters{}); err != nil {
-		t.Fatalf("verifyCustody refused a directory writable only by the root group: %v", err)
+	if err := verifyCustody(root, trustedWriters{}); !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), "can be modified by gid 0") {
+		t.Fatalf("verifyCustody = %v, want the root-group writable ancestor refused", err)
 	}
 }
 
@@ -1366,23 +1367,11 @@ func TestInstallWithoutCustodyStillRefusesAPlantedVersion(t *testing.T) {
 	}
 }
 
-// TestVerifyCustodyRefusesThenAcceptsTheProcessOwnGroup is the UNPRIVILEGED witness for
-// the group half of the declaration, and for group-write refusal itself. Both properties
-// are otherwise covered only by tests that chown a fixture to a pinned stranger gid, which
-// no unprivileged process can do -- so on CI, where the gate actually runs, every one of
-// those skips and nothing fails if Config.TrustedGIDs stops reaching the writer set at all.
-//
-// The fixture's group is this process's own primary gid, which needs no chown and which
-// trustedWriters treats as a stranger for the same reason it treats any other ordinary
-// group as one: a group grant reaches every current and future member. The root group is
-// the exception the rule is built around -- its only member is root, which the check
-// already trusts -- so as root there is no stranger here to refuse and the test says so
-// instead of asserting whatever the environment happens to be.
+// TestVerifyCustodyRefusesThenAcceptsTheProcessOwnGroup is the unprivileged witness for
+// group-write refusal and for Config.TrustedGIDs: the runner's own primary gid needs no
+// chown, and no undeclared group is trusted, the root group included.
 func TestVerifyCustodyRefusesThenAcceptsTheProcessOwnGroup(t *testing.T) {
 	gid := os.Getgid()
-	if gid == 0 {
-		t.Skip("the root group is always trusted, so it cannot stand in for a stranger here; the pinned-gid tests cover this shape where privilege exists")
-	}
 	root := filepath.Join(t.TempDir(), "pkg-versions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -1766,25 +1755,16 @@ func TestPublishRefusesAWidenedSentinel(t *testing.T) {
 	}
 }
 
-// TestAllowsTrustsGroupZeroWithoutPrivilege is the unprivileged witness for the gid-0 rule.
-// The end-to-end test for it (TestVerifyCustodyAcceptsAGroupOnlyRootCanUse) skips unless the
-// runner is root, so the acceptance was pinned only where privilege exists — the same
-// root-only-green shape that let the trusted-writer knobs be disconnected with CI green.
-//
-// The rule is deliberate and its limit is stated on allows() itself: group-0 membership is
-// not root's privilege, so a host whose root GROUP has members is outside what this check
-// covers. It is kept because refusing gid 0 would refuse a single root:root 0775 ancestor
-// and turn an ordinary tree into a total install outage.
-func TestAllowsTrustsGroupZeroWithoutPrivilege(t *testing.T) {
+// TestAllowsTrustsOnlyDeclaredGroups is the unprivileged witness for the group rule:
+// a declared group is trusted, the root group is not, and everyone never is.
+func TestAllowsTrustsOnlyDeclaredGroups(t *testing.T) {
 	const euid = 1000
-	trust := trustedWriters{}
-
-	if !trust.allows(principal{kind: principalGroup, id: 0}, euid) {
-		t.Error("group 0 is not trusted; refusing it turns a root:root 0775 ancestor into an install outage")
+	trust := trustedWriters{gids: []int{4242}}
+	if !trust.allows(principal{kind: principalGroup, id: 4242}, euid) {
+		t.Error("a declared group is not trusted")
 	}
-	// The neighbouring rules, so a mutant that widens this one is caught here too.
-	if trust.allows(principal{kind: principalGroup, id: 1}, euid) {
-		t.Error("group 1 is trusted, but only group 0 is")
+	if trust.allows(principal{kind: principalGroup, id: 0}, euid) {
+		t.Error("group 0 is trusted, so a non-root member could replace the tree")
 	}
 	if trust.allows(principal{kind: principalEveryone}, euid) {
 		t.Error("everyone is trusted, which nothing may ever make true")
@@ -1930,5 +1910,64 @@ func TestFirstStartOnAStickySharedParentRunsTheOneShotPurge(t *testing.T) {
 	}
 	if !exists(filepath.Join(env.root, legacyMarker)) {
 		t.Error("the purge completion marker was not recorded, so the sweep never completed on the first start")
+	}
+}
+
+// TestVerifyCustodyFollowsDotDotAsTheKernelDoes pins that ".." moves to the parent of
+// the directory a symlink reached, not of the link's own name, in a link target, in the
+// path as given and in a relative path.
+func TestVerifyCustodyFollowsDotDotAsTheKernelDoes(t *testing.T) {
+	base := mustEval(t, t.TempDir())
+	open := filepath.Join(base, "home", "open")
+	opt := filepath.Join(base, "opt")
+	for _, d := range []string{filepath.Join(open, "deep", "dir"), filepath.Join(open, "deep", "safedir", "tb"), filepath.Join(opt, "safedir", "tb")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(open, "deep", "dir"), filepath.Join(opt, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a/../safedir", filepath.Join(opt, "link")); err != nil {
+		t.Fatal(err)
+	}
+	want := open + ", mode 0777"
+	for name, path := range map[string]string{
+		"in a link target":     filepath.Join(opt, "link", "tb"),
+		"in the path as given": opt + "/a/../safedir", // not Join, which cleans ".." away
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := filepath.EvalSymlinks(path); err != nil || !strings.HasPrefix(got, open+"/") {
+				t.Fatalf("INVALID: %s resolves to %q, %v; want a path under %s", path, got, err, open)
+			}
+			if err := verifyCustody(path, trustedWriters{}); !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), want) {
+				t.Errorf("verifyCustody = %v, want the directory the kernel passes through refused", err)
+			}
+		})
+	}
+	t.Run("in a relative path", func(t *testing.T) {
+		t.Chdir(opt)
+		if err := verifyCustody("a/../safedir", trustedWriters{}); !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), want) {
+			t.Errorf("verifyCustody(a/../safedir) = %v, want the directory the kernel passes through refused", err)
+		}
+	})
+}
+
+// TestVerifyCustodyRefusesAnEmptyPath pins that "" is refused, not read as the working
+// directory.
+func TestVerifyCustodyRefusesAnEmptyPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if err := verifyCustody(".", trustedWriters{}); err != nil {
+		t.Fatalf("INVALID: verifyCustody(.) = %v; the working directory must pass", err)
+	}
+	if err := verifyCustody("", trustedWriters{}); !errors.Is(err, ErrNoCustody) || !strings.Contains(err.Error(), "an empty path") {
+		t.Errorf("verifyCustody(\"\") = %v, want the empty path refused", err)
 	}
 }

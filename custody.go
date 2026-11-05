@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
+	"strings"
 	"syscall"
 )
 
@@ -35,20 +35,15 @@ import (
 //
 // # What is checked
 //
-// EVERY path the resolution visits, because each one is a different question. First the
-// components of the path AS WRITTEN, since every later operation in this package reaches
-// the tree through that string (MkdirTemp, CreateTemp, OpenRoot, Rename, RemoveAll), so a
-// component another principal can replace is a component that can be repointed after this
-// verdict. Then, for each symlink met on the way, the path that link points at, and so on
-// until nothing resolves further. The last of those is where the tree actually lives; the
-// ones in between are the directories that HOLD the links the resolution follows, and a
-// middle link's directory is exactly as load-bearing as the first one's — whoever can write
-// it repoints the chain, and the next MkdirTemp, OpenRoot or Rename lands in a tree of their
-// choosing. Handing the whole resolution to [filepath.EvalSymlinks] is what hid them: it
-// visits those directories internally and discards the fact, so a chain of more than one hop
-// had its middle judged by nobody.
+// EVERY directory the kernel passes through to reach dir, followed one component at a
+// time from "/": each symlink's target is taken in place, and ".." moves to the parent of
+// the directory actually reached, never cleaned lexically, so a ".." after a link cannot
+// steer the walk away from a directory a later open() goes through. A directory holding a
+// link the resolution follows is as load-bearing as the tree itself: whoever can write it
+// repoints the chain, and the next MkdirTemp, OpenRoot or Rename lands in a tree of their
+// choosing.
 //
-// For each component of each of those paths:
+// For each of those components:
 //
 //   - It is a directory, or a symlink (judged by [checkSymlink]). A non-directory
 //     component cannot hold the tree.
@@ -109,95 +104,101 @@ func verifyCustody(dir string, trust trustedWriters) error {
 // one-shot legacy purge, which is the one start it can run on; a later start, once the
 // versions directory existed, passed the very same directory as an ancestor.
 func verifyCustodyChain(dir string, trust trustedWriters, judgeLeafStrictly bool) error {
-	euid := os.Geteuid()
-	path := dir
-	for hop := 0; hop <= maxSymlinkHops; hop++ {
-		// The chain of the path as it currently reads. On the first pass that is the name
-		// the caller gave, which every later operation in this package reaches the tree
-		// through; on each pass after it, the path one more link has been resolved into,
-		// whose new components are the ones holding the rest of the chain.
-		if err := walkChain(path, euid, trust, judgeLeafStrictly); err != nil {
-			return err
-		}
-		next, expanded, err := expandFirstSymlink(path)
+	if dir == "" {
+		return fmt.Errorf("%w: an empty path", ErrNoCustody)
+	}
+	if !filepath.IsAbs(dir) {
+		wd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("%w: resolving %s: %w", ErrNoCustody, dir, err)
 		}
-		if !expanded {
-			// Nothing resolves further, so this pass judged where the tree actually
-			// lives and every pass before it judged a path the resolution went through.
-			return nil
-		}
-		path = next
+		dir = wd + "/" + dir // not Join: Join cleans ".." lexically
 	}
-	// A cycle, or a chain longer than any the kernel would follow. There is no resolved
-	// path to judge, so there is nothing to be told about: refusing is the only answer
-	// that does not amount to reporting custody of a tree nobody can reach.
-	return fmt.Errorf("%w: resolving %s: the chain has not resolved after %d symbolic links: %w",
-		ErrNoCustody, dir, maxSymlinkHops, syscall.ELOOP)
-}
-
-// maxSymlinkHops bounds how many links one resolution may follow, mirroring the kernel's
-// own limit (SYMLOOP_MAX, 40 on Linux) so a chain this refuses is one open() would refuse
-// too.
-const maxSymlinkHops = 40
-
-// expandFirstSymlink replaces the FIRST symlink component of path with what that link points
-// at, keeping whatever followed it, and reports whether it found one.
-//
-// One link per call, deliberately: the caller judges the path between each expansion, which
-// is what puts the directory holding every INTERMEDIATE link under the walk. Resolving them
-// all at once — which is what [filepath.EvalSymlinks] does — produces only the two endpoints
-// and silently discards every directory in between.
-//
-// The expansion is lexical after the link is read, matching EvalSymlinks: a relative target
-// is taken from the directory holding the link, and a ".." inside one is cleaned away rather
-// than resolved against the filesystem.
-func expandFirstSymlink(path string) (expanded string, found bool, err error) {
-	clean := filepath.Clean(path)
-	for _, component := range ancestors(clean) {
-		fi, err := os.Lstat(component)
+	w := &custodyWalk{trust: trust, euid: os.Geteuid(), at: "/"}
+	if err := checkComponent(w.at, w.euid, false, false, trust); err != nil {
+		return err
+	}
+	w.shared = sharedSticky(w.at, w.euid, trust)
+	pending := pathComponents(dir)
+	for len(pending) > 0 {
+		next, err := w.step(pending[0])
 		if err != nil {
-			return "", false, fmt.Errorf("examining %s: %w", component, err)
-		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			continue
-		}
-		target, readErr := os.Readlink(component)
-		if readErr != nil {
-			return "", false, fmt.Errorf("reading the symlink %s: %w", component, readErr)
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(component), target)
-		}
-		// Every ancestor is a prefix of the cleaned path, so what follows the link is the
-		// remainder of the string.
-		return filepath.Join(target, clean[len(component):]), true, nil
-	}
-	return clean, false, nil
-}
-
-// walkChain judges every component of an absolute path from the filesystem root
-// down to the path itself.
-//
-// judgeLeafStrictly says whether the last component is the installation root, which is
-// held to a stricter rule than its ancestors; see [verifyCustodyChain] for why that is the
-// caller's fact rather than something read off the position.
-//
-// It carries one fact forward between components: whether the PARENT was a sticky directory
-// some identity the caller has not accounted for can write. That is the only situation in
-// which a symlink's ownership matters — see [checkComponent].
-func walkChain(path string, euid int, trust trustedWriters, judgeLeafStrictly bool) error {
-	components := ancestors(path)
-	parentShared := false
-	last := len(components) - 1
-	for i, component := range components {
-		if err := checkComponent(component, euid, judgeLeafStrictly && i == last, parentShared, trust); err != nil {
 			return err
 		}
-		parentShared = sharedSticky(component, euid, trust)
+		pending = append(next, pending[1:]...)
+	}
+	if judgeLeafStrictly {
+		return checkComponent(w.at, w.euid, true, false, trust)
 	}
 	return nil
+}
+
+// custodyWalk is verifyCustodyChain's position, following the path as the kernel
+// resolves it: each symlink's target in place, and ".." to the parent of the
+// directory actually reached, never lexically. Every directory above at was judged
+// on the way down.
+type custodyWalk struct {
+	at     string
+	trust  trustedWriters
+	euid   int
+	hops   int
+	shared bool // at is a sticky directory a stranger can write
+}
+
+// step moves through one component, returning the components a symlink's target
+// puts in front of the rest of the path.
+func (w *custodyWalk) step(name string) ([]string, error) {
+	if name == ".." {
+		w.at = filepath.Dir(w.at)
+		w.shared = sharedSticky(w.at, w.euid, w.trust)
+		return nil, nil
+	}
+	next := filepath.Join(w.at, name) // one name, no "..": nothing to clean
+	fi, err := os.Lstat(next)
+	if err != nil {
+		return nil, fmt.Errorf("%w: examining %s: %w", ErrNoCustody, next, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		if cerr := checkComponent(next, w.euid, false, w.shared, w.trust); cerr != nil {
+			return nil, cerr
+		}
+		w.at = next
+		w.shared = sharedSticky(w.at, w.euid, w.trust)
+		return nil, nil
+	}
+	if cerr := checkComponent(next, w.euid, false, w.shared, w.trust); cerr != nil {
+		return nil, cerr // a symlink: checkComponent judges its owner (checkSymlink)
+	}
+	w.hops++
+	if w.hops > maxSymlinkHops {
+		return nil, fmt.Errorf("%w: resolving %s: the chain has not resolved after %d symbolic links: %w",
+			ErrNoCustody, next, maxSymlinkHops, syscall.ELOOP)
+	}
+	target, err := os.Readlink(next)
+	if err != nil {
+		return nil, fmt.Errorf("%w: reading the symlink %s: %w", ErrNoCustody, next, err)
+	}
+	if filepath.IsAbs(target) {
+		w.at = "/"
+		w.shared = sharedSticky(w.at, w.euid, w.trust)
+	}
+	return pathComponents(target), nil
+}
+
+// maxSymlinkHops is Linux's SYMLOOP_MAX, so a chain this refuses is one open()
+// would refuse too.
+const maxSymlinkHops = 40
+
+// pathComponents splits path into its names, dropping empty ones and ".", and
+// keeping "..", which only the walk can resolve.
+func pathComponents(path string) []string {
+	var out []string
+	for c := range strings.SplitSeq(path, "/") {
+		if c != "" && c != "." {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // sharedSticky reports whether path DENOTES a sticky directory that an identity the caller
@@ -250,22 +251,6 @@ func sharedSticky(path string, euid int, trust trustedWriters) bool {
 	}
 	_, shared := trust.firstStranger(writers, euid)
 	return shared
-}
-
-// ancestors returns every component of an absolute path from the filesystem root down
-// to the path itself, inclusive.
-func ancestors(path string) []string {
-	out := []string{path}
-	for {
-		parent := filepath.Dir(path)
-		if parent == path {
-			break
-		}
-		out = append(out, parent)
-		path = parent
-	}
-	slices.Reverse(out)
-	return out
 }
 
 // checkComponent judges one component of a path chain.
