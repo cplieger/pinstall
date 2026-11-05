@@ -74,9 +74,9 @@ var aclDialects = []aclDialect{{
 	ceiling:   posixACLHeaderSize + posixACLMaxEntries*posixACLEntrySize,
 	parse:     parsePOSIXACL,
 	modeFloor: false,
-	// POSIX.1e cannot grant WRITE_ACL or WRITE_OWNER: chmod and chown stay
-	// with the owner, whom every caller checks separately, and removal is the kernel's
-	// sticky rule with nothing in the list able to override it.
+	// POSIX.1e cannot grant WRITE_ACL or WRITE_OWNER: chmod and chown stay with the
+	// owner, whom every caller checks separately, and removal is the kernel's sticky
+	// rule with nothing in the list able to override it.
 	controls: nil,
 }, {
 	xattr:   xattrNFS4ACL,
@@ -237,7 +237,8 @@ const nfs4WriteMask = nfs4WriteData | nfs4AppendData | nfs4DeleteChild |
 // DELETE_CHILD is not in it: Linux applies the sticky rule to every removal and rename
 // whatever the list grants (may_delete_dentry and check_sticky in fs/namei.c), and so does
 // OpenZFS (zfs_zaccess_delete, case 2a). ZFS adds DELETE_CHILD to every mode-derived write
-// grant on a directory, so counting it refused every 1777 directory on an nfsv4 dataset.
+// grant on a directory, so counting it would refuse every 1777 directory on an nfsv4
+// dataset.
 const nfs4ControlMask = nfs4WriteACL | nfs4WriteOwner
 
 // ErrACLUnreadable reports that an access-control list is present but could not be

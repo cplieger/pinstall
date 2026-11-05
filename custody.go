@@ -60,9 +60,9 @@ import (
 //     carries the sticky bit, because sticky restricts removal and renaming to the
 //     owner of each entry, and that is what makes /tmp (1777 everywhere) usable. The
 //     exemption does not cover a grant that lets someone else clear the sticky bit:
-//     taking the directory, or rewriting its list. The
-//     installation root itself is not exempted at all: sticky says nothing about
-//     CREATE, and anyone who can create entries there can plant a version directory.
+//     taking the directory, or rewriting its list. The installation root itself is
+//     not exempted at all: sticky says nothing about CREATE, and anyone who can
+//     create entries there can plant a version directory.
 //   - It carries no access-control list of a dialect whose mode is not an upper
 //     bound on write access. See below.
 //
