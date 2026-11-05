@@ -122,7 +122,7 @@ func TestACLDialectsTableIsWellFormed(t *testing.T) {
 	}
 	// Only NFSv4 can express a control grant.
 	if byName[xattrPOSIXACL].controls != nil {
-		t.Error("the POSIX.1e row reports control grants; that dialect cannot express WRITE_ACL, WRITE_OWNER or DELETE_CHILD")
+		t.Error("the POSIX.1e row reports control grants; that dialect cannot express WRITE_ACL or WRITE_OWNER")
 	}
 	if byName[xattrNFS4XDR].controls == nil {
 		t.Error("the NFSv4 XDR row reports no control grants; the sticky-ancestor exemption depends on reading them")
