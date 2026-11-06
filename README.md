@@ -1,5 +1,8 @@
 # pinstall
 
+> Merged into [toolbelt](https://github.com/cplieger/toolbelt) as its [`pin`](https://github.com/cplieger/toolbelt/tree/dev/pin) package, `github.com/cplieger/toolbelt/v3/pin`.
+> **Archived 2026-11-06. This repository is read-only. The published Go module stays available.**
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/pinstall/v3.svg)](https://pkg.go.dev/github.com/cplieger/pinstall/v3) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/pinstall)](https://github.com/cplieger/pinstall/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/pinstall/badges/mutation.json)](https://github.com/cplieger/pinstall/issues?q=label%3Agremlins-tracker)
 
 pinstall installs a pinned version of another program from your Go code, refuses it unless its SHA-256 matches your pin, and tells your program when it is ready to run.
